@@ -1,6 +1,6 @@
--- pgvfs layout v1 (store::LAYOUT_VERSION). Installed by the writer under its
+-- pgvfs layout v2 (store::LAYOUT_VERSION). Installed by the writer under its
 -- advisory lock; any layout change requires a fresh database.
--- PostgreSQL 11+ (hash partitions, toast_tuple_target); no extensions.
+-- PostgreSQL 11+ (toast_tuple_target); no extensions.
 --
 -- Files are immutable: a write streams rows under a fresh file_id and
 -- publishes (volume, path) -> file_id when the file closes, replacing any
@@ -29,27 +29,17 @@ CREATE TABLE pgvfs.files (
     size BETWEEN 0 AND 2147483648::int8 * 8120)
 );
 
--- 32 hash partitions: each relation caps at 32 TiB, and every read is
--- `file_id = $1`, which prunes to one partition.
+-- One heap: a read is `file_id = $1 AND no BETWEEN ..`, a primary-key range.
+-- (A relation holds up to 32 TiB, about 31.7 TiB of file data here.)
 CREATE TABLE pgvfs.chunks (
   file_id int8  NOT NULL,
   no      int4  NOT NULL,
   data    bytea NOT NULL,
   PRIMARY KEY (file_id, no),
   CONSTRAINT chunk_shape CHECK (no >= 0 AND octet_length(data) BETWEEN 1 AND 8120)
-) PARTITION BY HASH (file_id);
+) WITH (toast_tuple_target = 8160);
 
-DO $$
-BEGIN
-  FOR i IN 0..31 LOOP
-    EXECUTE format(
-      'CREATE TABLE pgvfs.chunks_%s PARTITION OF pgvfs.chunks '
-      'FOR VALUES WITH (MODULUS 32, REMAINDER %s) WITH (toast_tuple_target = 8160)',
-      lpad(i::text, 2, '0'), i);
-  END LOOP;
-END $$;
-
--- Never compress or move payloads out of line (recurses to the partitions).
+-- Never compress or move payloads out of line.
 ALTER TABLE pgvfs.chunks ALTER COLUMN data SET STORAGE EXTERNAL;
 
 -- Unpublished files. Readers take no snapshot across statements, so rows

@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio_postgres::types::{ToSql, Type};
 
 pub const SCHEMA: &str = include_str!("../schema.sql");
-pub const LAYOUT_VERSION: i32 = 1;
+pub const LAYOUT_VERSION: i32 = 2;
 
 pub const ROW_BYTES: i64 = 8120;
 /// Rows per parallel read piece (8 MiB). Measured on full ClickBench heavy
@@ -60,8 +60,6 @@ pub async fn connect(url: &str) -> Result<Pool> {
                       SET tcp_keepalives_count = 3; \
                       SET idle_in_transaction_session_timeout = '5min';"
                 .into(),
-            range_sql: RANGE_SQL,
-            range_types: &[Type::INT8, Type::INT4, Type::INT4],
         },
     )
     .await
@@ -250,8 +248,10 @@ async fn read_piece(
     start: i64,
     out: &mut [u8],
 ) -> Result<()> {
-    let mut conn = pool.get().await?;
-    let stmt = conn.range().await?.clone();
+    let conn = pool.get().await?;
+    let stmt = conn
+        .prepare_typed_cached(RANGE_SQL, &[Type::INT8, Type::INT4, Type::INT4])
+        .await?;
     let (lo32, hi32) = (lo as i32, hi as i32);
     // Streamed: each row is copied into `out` as it arrives, not buffered.
     let params: [&(dyn ToSql + Sync); 3] = [&file_id, &lo32, &hi32];
@@ -320,19 +320,6 @@ pub async fn remove(pool: &Pool, volume: &str, path: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
-/// Unpublish every file under `prefix` (a directory removal). Returns count.
-pub async fn remove_prefix(pool: &Pool, volume: &str, prefix: &str) -> Result<u64> {
-    let conn = pool.get().await?;
-    Ok(conn
-        .execute_typed(
-            "WITH gone AS (DELETE FROM pgvfs.files WHERE volume = $1 \
-             AND left(path, length($2)) = $2 RETURNING file_id) \
-             INSERT INTO pgvfs.garbage (file_id) SELECT file_id FROM gone",
-            &[(&volume, Type::TEXT), (&prefix, Type::TEXT)],
-        )
-        .await?)
-}
-
 /// Rename within a volume, replacing any file at `to`.
 pub async fn rename(pool: &Pool, volume: &str, from: &str, to: &str) -> Result<()> {
     check_path(to)?;
@@ -343,7 +330,7 @@ pub async fn rename(pool: &Pool, volume: &str, from: &str, to: &str) -> Result<(
         };
     }
     let mut conn = pool.get().await?;
-    let tx = conn.client_mut().transaction().await?;
+    let tx = conn.transaction().await?;
     replace_garbage(&tx, volume, to).await?;
     let moved = tx
         .execute_typed(
@@ -407,7 +394,7 @@ async fn write_file(
     mut rx: mpsc::Receiver<WriteMsg>,
 ) -> Result<()> {
     let mut conn = pool.get().await?;
-    let tx = conn.client_mut().transaction().await?;
+    let tx = conn.transaction().await?;
     let file_id: i64 = tx
         .query_typed_one("SELECT nextval('pgvfs.file_ids')", &[])
         .await?

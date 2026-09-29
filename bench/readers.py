@@ -41,7 +41,8 @@ def text(value) -> str:
 
 def connect(args, threads: int | None = None, view: bool = True) -> duckdb.DuckDBPyConnection:
     u = urlsplit(args.url)
-    con = duckdb.connect(config={"allow_unsigned_extensions": "true", "enable_progress_bar": "false"})
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    con.execute("SET enable_progress_bar = false")
     if threads:
         con.execute(f"SET threads = {threads}")
     con.execute(f"SET memory_limit = {text(args.memory_limit)}")

@@ -13,6 +13,11 @@ on:
 permissions:
   contents: read
 
+# `bash` runs steps with -eo pipefail (the implicit default has no pipefail).
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: pages
   cancel-in-progress: false

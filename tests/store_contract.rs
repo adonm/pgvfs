@@ -192,7 +192,9 @@ async fn list_remove_rename() -> Result<()> {
     assert!(store::open(&pool, &vol, "ab").await?.is_none());
     assert!(store::rename(&pool, &vol, "missing", "x").await.is_err());
 
-    assert_eq!(store::remove_prefix(&pool, &vol, "a/").await?, 3);
+    for p in ["a/1", "a/2", "a/b/3"] {
+        assert!(store::remove(&pool, &vol, p).await?);
+    }
     assert!(store::list(&pool, &vol, "", "", 100).await?.is_empty());
     Ok(())
 }

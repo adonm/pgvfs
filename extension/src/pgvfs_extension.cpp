@@ -312,6 +312,8 @@ public:
 		return rc == 0;
 	}
 
+	// DuckDB's COPY overwrites an existing non-remote path by writing a temp
+	// file and moving it into place.
 	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) override {
 		auto from = ParseFile(source);
 		auto to = ParseFile(target);
@@ -325,6 +327,8 @@ public:
 	}
 
 	// Directories are key prefixes: they exist while they hold a file.
+	// DuckLake never removes directories, so RemoveDirectory stays
+	// unimplemented (DuckDB's base class throws).
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) override {
 		auto p = Parse(directory);
 		return !List(Conn(opener), p.volume, DirPrefix(p.path), 1).empty();
@@ -334,14 +338,6 @@ public:
 	}
 
 	void CreateDirectoriesRecursive(const string &, optional_ptr<FileOpener>) override {
-	}
-
-	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) override {
-		auto p = Parse(directory);
-		char *err = nullptr;
-		if (pgvfs_remove_prefix(Conn(opener), p.volume.c_str(), DirPrefix(p.path).c_str(), &err) < 0) {
-			Fail("remove directory", directory, err);
-		}
 	}
 
 	bool ListFiles(const string &directory, const std::function<void(const string &, bool)> &callback,

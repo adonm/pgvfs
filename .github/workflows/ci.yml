@@ -11,6 +11,11 @@ on:
 permissions:
   contents: read
 
+# `bash` runs steps with -eo pipefail (the implicit default has no pipefail).
+defaults:
+  run:
+    shell: bash
+
 jobs:
   check:
     runs-on: ubuntu-latest

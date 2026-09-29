@@ -55,8 +55,8 @@ is a namespace, so one database can hold several lakes.
   minutes, so queries that already opened the file can finish it. The writer
   reaps in the background, at most once a minute.
 
-Storage (`schema.sql`) is 8120-byte inline rows (one tuple per 8 KB page, no
-TOAST) in 32 hash partitions. It needs **PostgreSQL 11+** and **no
+Storage (`schema.sql`) is one table of 8120-byte inline rows (one tuple per
+8 KB page, no TOAST). It needs **PostgreSQL 11+** and **no
 extensions**: no pg_cron, no superuser. The contract tests run on 11, 13, 15,
 17 and 18.
 <!-- ANCHOR_END: model -->
@@ -127,7 +127,8 @@ on separate machines scale until PostgreSQL's I/O or CPU saturates.
 
 - `schema.sql`: storage layout.
 - `src/store.rs`: reads, the `COPY` writer, the writer lease and reaping.
-- `src/pg.rs`: the connection pool (most recently used first) and TLS.
+- `src/pg.rs`: the connection pool (deadpool-postgres, most recently used
+  first) and TLS.
 - `src/lib.rs`: the C ABI (`extension/src/include/pgvfs.h`).
 - `extension/`: the thin C++ DuckDB `FileSystem` adapter. The adapter has
   to be C++ because DuckDB's stable C API can use filesystems but cannot

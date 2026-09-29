@@ -34,8 +34,7 @@ int pgvfs_list(const PgvfsConn *conn, const char *volume, const char *prefix, in
                void *ctx, char **err);
 /* 0 removed, 1 not found, -1 error */
 int pgvfs_remove(const PgvfsConn *conn, const char *volume, const char *path, char **err);
-/* count removed, -1 error */
-int64_t pgvfs_remove_prefix(const PgvfsConn *conn, const char *volume, const char *prefix, char **err);
+/* replaces any file at `to`; 0 ok, -1 error */
 int pgvfs_rename(const PgvfsConn *conn, const char *volume, const char *from, const char *to, char **err);
 
 PgvfsWriter *pgvfs_writer_open(const PgvfsConn *conn, const char *volume, const char *path, char **err);
