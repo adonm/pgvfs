@@ -71,6 +71,11 @@ is a namespace, so one database can hold several lakes.
 - **Reads** are one primary-key range query per 8 MiB piece. A large read
   fetches its pieces in parallel on pooled connections, streaming rows
   straight into DuckDB's buffer.
+- **Opens** are cached per DuckDB database for 10 s (`PGVFS_OPEN_CACHE_S`, 0
+  off). DuckDB re-opens files to check them, e.g. DuckLake's delete files on
+  every query. This process's own writes, renames and removes drop the entry
+  at once; another process's rewrite of a path shows up within the TTL.
+  DuckLake never rewrites a path.
 - **Deletes** queue the old `file_id`. Its rows outlive the delete by 10
   minutes, so queries that already opened the file can finish it. The writer
   reaps in the background, at most once a minute.
@@ -159,7 +164,10 @@ times what it must decode in the rest.
    later scan merges in. `ducklake_rewrite_data_files` only rewrites files at
    least 95% deleted unless you pass a threshold:
    `CALL ducklake_rewrite_data_files('lake', delete_threshold => 0.05)`, then
-   expire and clean up as above.
+   expire and clean up as above. Without a rewrite, DuckDB also re-opens each
+   delete file on every query to check it. pgvfs answers those checks from its
+   open cache, which took 10% off warm latency for tables with deletes; the
+   rest of the cost is merging the deletes into each scan.
 7. **Don't bother splitting hot and cold columns.** Parquet is columnar: a
    query decodes only the columns it reads, so moving unread columns to a
    second table didn't change lookup speed.

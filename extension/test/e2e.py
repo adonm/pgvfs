@@ -62,9 +62,11 @@ assert one(con, f"SELECT count(*) FROM read_parquet('{root}/p/*.parquet')") == (
 assert one(con, f"SELECT count(*) FROM glob('{root}/**')") == (2,)
 assert one(con, f"SELECT count(*) FROM glob('{root}/q/*')") == (0,)
 
-# Overwrite replaces the file; a new connection must see the new bytes.
+# Overwrite replaces the file; a new connection must see the new bytes...
 con.execute(f"COPY (SELECT 42 AS i) TO '{root}/p/small.parquet'")
 assert one(connect(), f"SELECT i FROM '{root}/p/small.parquet'") == (42,)
+# ... and so must the connection that overwrote it (its file cache entry).
+assert one(con, f"SELECT i FROM '{root}/p/small.parquet'") == (42,)
 
 # Missing files fail cleanly.
 try:

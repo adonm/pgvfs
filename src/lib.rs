@@ -35,6 +35,48 @@ pub struct PgvfsConn {
     pool: Pool,
     writer: Mutex<Option<WriterLease>>,
     last_reap: AtomicU64,
+    files: FileCache,
+}
+
+/// (volume, path) -> file, for `open`. DuckDB re-opens files to check them,
+/// e.g. DuckLake delete files on every query, each a round trip. A path's
+/// file changes only when it is rewritten: this process's own writes, renames
+/// and removes drop the entry; another process's show up within the TTL
+/// (PGVFS_OPEN_CACHE_S, default 10, 0 off). DuckLake never rewrites a path.
+struct FileCache {
+    ttl: std::time::Duration,
+    map: Mutex<std::collections::HashMap<(String, String), (FileInfo, std::time::Instant)>>,
+}
+
+impl FileCache {
+    fn get(&self, volume: &str, path: &str) -> Option<FileInfo> {
+        let map = self.map.lock().unwrap();
+        map.get(&(volume.to_owned(), path.to_owned()))
+            .filter(|(_, at)| at.elapsed() < self.ttl)
+            .map(|(f, _)| *f)
+    }
+
+    fn put(&self, volume: &str, path: &str, file: FileInfo) {
+        if self.ttl.is_zero() {
+            return;
+        }
+        let mut map = self.map.lock().unwrap();
+        if map.len() >= 100_000 {
+            let ttl = self.ttl;
+            map.retain(|_, (_, at)| at.elapsed() < ttl);
+        }
+        map.insert(
+            (volume.to_owned(), path.to_owned()),
+            (file, std::time::Instant::now()),
+        );
+    }
+
+    fn forget(&self, volume: &str, path: &str) {
+        self.map
+            .lock()
+            .unwrap()
+            .remove(&(volume.to_owned(), path.to_owned()));
+    }
 }
 
 impl PgvfsConn {
@@ -72,6 +114,8 @@ impl PgvfsConn {
 
 pub struct PgvfsWriter {
     conn: *const PgvfsConn,
+    volume: String,
+    path: String,
     tx: Option<mpsc::Sender<WriteMsg>>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     buf: BytesMut,
@@ -109,6 +153,14 @@ fn conn<'a>(c: *const PgvfsConn) -> &'a PgvfsConn {
 /// Tokio workers drive every pooled connection's protocol I/O and the COPY
 /// writers: one per DuckDB thread (PGVFS_IO_THREADS overrides). Not one per
 /// core: hosts running several DuckDB readers would oversubscribe.
+fn env_num(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &i64| n >= 0)
+        .unwrap_or(default)
+}
+
 fn io_threads(threads: usize) -> usize {
     std::env::var("PGVFS_IO_THREADS")
         .ok()
@@ -147,6 +199,10 @@ pub unsafe extern "C" fn pgvfs_connect(
             pool,
             writer: Mutex::new(None),
             last_reap: AtomicU64::new(0),
+            files: FileCache {
+                ttl: std::time::Duration::from_secs(env_num("PGVFS_OPEN_CACHE_S", 10) as u64),
+                map: Mutex::default(),
+            },
         })
     };
     match run() {
@@ -186,7 +242,15 @@ pub unsafe extern "C" fn pgvfs_open(
     let run = || -> Result<Option<FileInfo>> {
         let (volume, path) = (text(volume)?, text(path)?);
         store::check_volume(volume)?;
-        c.rt.block_on(store::open(&c.pool, volume, path))
+        if let Some(f) = c.files.get(volume, path) {
+            store::STATS.open_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(f));
+        }
+        let found = c.rt.block_on(store::open(&c.pool, volume, path))?;
+        if let Some(f) = found {
+            c.files.put(volume, path, f);
+        }
+        Ok(found)
     };
     let t0 = std::time::Instant::now();
     let result = run();
@@ -259,8 +323,9 @@ pub extern "C" fn pgvfs_stats() -> *mut c_char {
     let s = &store::STATS;
     let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
     let json = format!(
-        "{{\"opens\": {}, \"open_ms\": {:.1}, \"reads\": {}, \"read_bytes\": {}, \"read_ms\": {:.1}, \"pieces\": {}}}",
+        "{{\"opens\": {}, \"open_hits\": {}, \"open_ms\": {:.1}, \"reads\": {}, \"read_bytes\": {}, \"read_ms\": {:.1}, \"pieces\": {}}}",
         get(&s.opens),
+        get(&s.open_hits),
         get(&s.open_ns) as f64 / 1e6,
         get(&s.reads),
         get(&s.read_bytes),
@@ -327,6 +392,7 @@ pub unsafe extern "C" fn pgvfs_remove(
         let (volume, path) = (text(volume)?, text(path)?);
         store::check_volume(volume)?;
         c.writer()?;
+        c.files.forget(volume, path);
         c.rt.block_on(store::remove(&c.pool, volume, path))
     };
     match run() {
@@ -359,6 +425,8 @@ pub unsafe extern "C" fn pgvfs_rename(
         let (volume, from, to) = (text(volume)?, text(from)?, text(to)?);
         store::check_volume(volume)?;
         c.writer()?;
+        c.files.forget(volume, from);
+        c.files.forget(volume, to);
         c.rt.block_on(store::rename(&c.pool, volume, from, to))
     };
     match run() {
@@ -387,6 +455,8 @@ pub unsafe extern "C" fn pgvfs_writer_open(
             store::spawn_writer(cr.rt.handle(), cr.pool.clone(), volume.into(), path.into())?;
         Ok(PgvfsWriter {
             conn: c,
+            volume: volume.into(),
+            path: path.into(),
             tx: Some(tx),
             task: Some(task),
             buf: BytesMut::with_capacity(WRITE_BATCH),
@@ -465,6 +535,7 @@ pub unsafe extern "C" fn pgvfs_writer_publish(w: *mut PgvfsWriter, err: *mut *mu
         w.join()
     };
     let result = run(&mut w);
+    conn(w.conn).files.forget(&w.volume, &w.path);
     conn(w.conn).maybe_reap();
     match result {
         Ok(()) => 0,

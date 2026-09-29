@@ -123,7 +123,7 @@ def pct(values: list[float], q: float) -> float:
 
 def pgvfs_summary(deltas: list[dict], query_ms: float) -> dict:
     total = {k: sum(d[k] for d in deltas) for k in deltas[0]}
-    return {"opens": total["opens"], "open_ms": round(total["open_ms"]),
+    return {"opens": total["opens"], "open_hits": total.get("open_hits", 0), "open_ms": round(total["open_ms"]),
             "reads": total["reads"], "read_mib": round(total["read_bytes"] / 2**20, 1),
             "read_ms": round(total["read_ms"]), "pieces": total["pieces"],
             # share of all query time spent inside pgvfs calls (reads can overlap

@@ -28,6 +28,8 @@ pub const ROW_BYTES: i64 = 8120;
 #[derive(Default)]
 pub struct Stats {
     pub opens: std::sync::atomic::AtomicU64,
+    /// Opens answered by the per-connection file cache (no round trip).
+    pub open_hits: std::sync::atomic::AtomicU64,
     pub open_ns: std::sync::atomic::AtomicU64,
     pub reads: std::sync::atomic::AtomicU64,
     pub read_bytes: std::sync::atomic::AtomicU64,
@@ -38,6 +40,7 @@ pub struct Stats {
 
 pub static STATS: Stats = Stats {
     opens: std::sync::atomic::AtomicU64::new(0),
+    open_hits: std::sync::atomic::AtomicU64::new(0),
     open_ns: std::sync::atomic::AtomicU64::new(0),
     reads: std::sync::atomic::AtomicU64::new(0),
     read_bytes: std::sync::atomic::AtomicU64::new(0),
