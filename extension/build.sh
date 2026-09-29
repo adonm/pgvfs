@@ -7,6 +7,7 @@
 # DUCKDB_SRC:  source tree of the release (headers, dummy loader, footer script)
 # STATIC_LIBS: unpacked static-libs-linux-amd64.zip of the same release
 # LIBPGVFS:    cargo build --release -p pgvfs (not stripped)
+# PGVFS_VERSION (env): the extension version recorded in the footer (git describe)
 # VERSION:     the loading DuckDB's extension version: the tag for a release
 #              (v1.5.6), the source id for a dev build (PRAGMA version)
 set -euo pipefail
@@ -33,6 +34,6 @@ strip --strip-unneeded "$work/pgvfs.duckdb_extension"
 
 printf linux_amd64 >"$work/platform"
 cmake -DABI_TYPE=CPP -DEXTENSION="$work/pgvfs.duckdb_extension" -DPLATFORM_FILE="$work/platform" \
-  -DVERSION_FIELD="$version" -DEXTENSION_VERSION=v0.1.0 -DNULL_FILE="$src/scripts/null.txt" \
+  -DVERSION_FIELD="$version" -DEXTENSION_VERSION="${PGVFS_VERSION:-dev}" -DNULL_FILE="$src/scripts/null.txt" \
   -P "$src/scripts/append_metadata.cmake"
 mv "$work/pgvfs.duckdb_extension" "$out"

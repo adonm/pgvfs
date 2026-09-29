@@ -2,10 +2,13 @@ name: Distribution
 
 # Builds and tests the extension for every platform with DuckDB's own
 # extension pipeline: the same one DuckDB's community-extensions repository
-# runs, so a green run here means the community build will work.
+# runs, so a green run here means the community build will work. It compiles
+# DuckDB for five platforms (~25 min), so it runs on tags, weekly and by hand.
 on:
   push:
-    branches: [main, community-build]
+    tags: ["v*"]
+  schedule:
+    - cron: "0 7 * * 1"
   workflow_dispatch:
 
 concurrency:

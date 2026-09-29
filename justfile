@@ -15,6 +15,7 @@ check:
 ext TARGET="release" WHEEL="":
     @dir=$(bash scripts/duckdb.sh {{ TARGET }} {{ WHEEL }}) \
     && docker buildx build -q -f extension/Containerfile --build-context duckdb="$dir" \
+         --build-arg PGVFS_VERSION="$(git describe --tags --always --dirty)" \
          --output type=local,dest=target/ext/{{ TARGET }} . >/dev/null \
     && cp "$dir/wheel" target/ext/{{ TARGET }}/DUCKDB_PY \
     && cp "$dir/version" target/ext/{{ TARGET }}/DUCKDB_VERSION \

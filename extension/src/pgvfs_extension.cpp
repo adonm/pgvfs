@@ -541,7 +541,11 @@ std::string PgvfsExtension::Name() {
 }
 
 std::string PgvfsExtension::Version() const {
-	return "0.1.0";
+#ifdef EXT_VERSION_PGVFS
+	return EXT_VERSION_PGVFS; // git describe, set by DuckDB's extension build
+#else
+	return "";
+#endif
 }
 
 } // namespace duckdb

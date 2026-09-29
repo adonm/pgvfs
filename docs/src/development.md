@@ -53,10 +53,21 @@ libraries, and the container only links (`extension/build.sh`, a few seconds).
 
 `target/ext/<target>/DUCKDB_PY` records the wheel a build loads into.
 
+**DuckDB's extension template.** The repository also builds the way DuckDB's
+community extensions do: `git submodule update --init`, then `make release`
+compiles DuckDB (once, about 7 minutes) and links the extension, with the
+Rust crate built by cargo through Corrosion (`CMakeLists.txt`,
+`extension_config.cmake`). `make test` runs `test/sql/`. The `Distribution`
+workflow runs this build for Linux (amd64, arm64), macOS (Intel, Apple
+Silicon) and Windows on tags, weekly and by hand. The container build above
+stays for fast local work and for 2.0 dev builds.
+
 ## CI and releases
 
 - **Each push** (`ci.yml`): `just check`, then the contract on PostgreSQL 18
   and end-to-end tests for the stable build.
+- **Tags, weekly and by hand** (`distribution.yml`): the five-platform build
+  with DuckDB's extension pipeline.
 - **Weekly, Monday** (`weekly.yml`, or by hand): the contract on PostgreSQL
   11; end-to-end tests for the stable and newest 2.0 dev builds; each build
   published as the pre-release `duckdb-<version>` (every stable build and the

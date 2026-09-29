@@ -20,6 +20,15 @@ a namespace, so one database can hold several lakes. The layout is
   for 10 minutes so queries that already opened it can finish, then the
   writer removes them in the background.
 
+### Storage layout versions
+
+The layout has a version, stored in `pgvfs.layout`; this release reads and
+writes **v2**. pgvfs refuses a database with any other version rather than
+misread it. Layout changes are listed in the [changelog](https://github.com/adonm/pgvfs/blob/main/CHANGELOG.md)
+and, during 0.x, bump the minor version. There is no in-place migration yet: to
+move a lake to a new layout, copy its tables with DuckDB into a lake in a new
+database (`CREATE TABLE new.t AS FROM old.t`).
+
 ## One writer, many readers
 
 - **The writer** is whichever process writes first (creates, deletes or

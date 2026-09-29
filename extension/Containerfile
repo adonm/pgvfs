@@ -25,7 +25,8 @@ COPY --from=duckdb libs/ /duckdb/libs/
 COPY --from=duckdb version /duckdb/version
 COPY extension/ /ext/
 COPY --from=rust /libpgvfs.a /libpgvfs.a
-RUN bash /ext/build.sh /duckdb/src /duckdb/libs /libpgvfs.a "$(cat /duckdb/version)" /pgvfs.duckdb_extension
+ARG PGVFS_VERSION=dev
+RUN PGVFS_VERSION="$PGVFS_VERSION" bash /ext/build.sh /duckdb/src /duckdb/libs /libpgvfs.a "$(cat /duckdb/version)" /pgvfs.duckdb_extension
 
 FROM scratch
 COPY --from=link /pgvfs.duckdb_extension /
