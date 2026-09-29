@@ -21,6 +21,9 @@ typedef struct {
 
 typedef void (*pgvfs_list_cb)(void *ctx, const char *path, size_t len);
 
+/* process-wide counters as JSON, cumulative; free with pgvfs_free_str */
+char *pgvfs_stats(void);
+
 PgvfsConn *pgvfs_connect(const char *url, char **err);
 void pgvfs_disconnect(PgvfsConn *conn);
 void pgvfs_free_str(char *s);

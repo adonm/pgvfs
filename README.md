@@ -34,6 +34,10 @@ took 10 ms (2,048 rows was slower again, at 12.5 ms). LZ4 decompresses faster
 than the default snappy. DuckLake takes no defaults from extensions, so both
 options have to be set on the lake; every tool in this repository sets them.
 
+`SELECT pgvfs_stats()` returns the process's pgvfs counters as JSON: opens,
+reads, bytes, time spent in pgvfs, and range queries sent. They are cumulative,
+so diff two samples.
+
 Loading pgvfs does the rest automatically: it turns on DuckDB's Parquet
 footer cache (`parquet_metadata_cache`, off by default), which is safe
 because pgvfs files never change in place. On the Houston benchmark, LZ4 and

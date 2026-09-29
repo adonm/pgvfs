@@ -23,6 +23,27 @@ pub const SCHEMA: &str = include_str!("../schema.sql");
 pub const LAYOUT_VERSION: i32 = 2;
 
 pub const ROW_BYTES: i64 = 8120;
+
+/// Process-wide counters, reported by `pgvfs_stats()` (lib.rs).
+#[derive(Default)]
+pub struct Stats {
+    pub opens: std::sync::atomic::AtomicU64,
+    pub open_ns: std::sync::atomic::AtomicU64,
+    pub reads: std::sync::atomic::AtomicU64,
+    pub read_bytes: std::sync::atomic::AtomicU64,
+    pub read_ns: std::sync::atomic::AtomicU64,
+    /// Range queries sent to PostgreSQL (a read is one or more pieces).
+    pub pieces: std::sync::atomic::AtomicU64,
+}
+
+pub static STATS: Stats = Stats {
+    opens: std::sync::atomic::AtomicU64::new(0),
+    open_ns: std::sync::atomic::AtomicU64::new(0),
+    reads: std::sync::atomic::AtomicU64::new(0),
+    read_bytes: std::sync::atomic::AtomicU64::new(0),
+    read_ns: std::sync::atomic::AtomicU64::new(0),
+    pieces: std::sync::atomic::AtomicU64::new(0),
+};
 /// Rows per parallel read piece (8 MiB). Measured on full ClickBench heavy
 /// scans, 2 MiB pieces were 3-4% slower (4x the range queries) and 32 MiB no
 /// faster.
@@ -235,6 +256,9 @@ pub async fn read_at(pool: &Pool, file: &FileInfo, pos: i64, buf: &mut [u8]) -> 
         pieces.push(read_piece(pool, file.file_id, lo, hi, start, piece));
         lo = hi + 1;
     }
+    STATS
+        .pieces
+        .fetch_add(pieces.len() as u64, std::sync::atomic::Ordering::Relaxed);
     futures::future::try_join_all(pieces).await?;
     Ok(())
 }

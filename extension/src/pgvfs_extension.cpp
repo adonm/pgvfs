@@ -495,6 +495,15 @@ private:
 	string conn_target;
 };
 
+// pgvfs_stats(): JSON of process-wide counters (opens, reads, bytes, time
+// spent in pgvfs, range queries). Cumulative; diff two samples.
+void StatsFunction(DataChunk &, ExpressionState &, Vector &result) {
+	char *json = pgvfs_stats();
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::GetData<string_t>(result)[0] = StringVector::AddString(result, json);
+	pgvfs_free_str(json);
+}
+
 void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
@@ -509,6 +518,9 @@ void LoadInternal(ExtensionLoader &loader) {
 		config.SetOption("parquet_metadata_cache", Value::BOOLEAN(true));
 	}
 	db.GetFileSystem().RegisterSubSystem(make_uniq<PgvfsFileSystem>());
+	ScalarFunction stats("pgvfs_stats", vector<LogicalType> {}, LogicalType::VARCHAR, StatsFunction);
+	stats.SetVolatile();
+	loader.RegisterFunction(stats);
 }
 
 } // namespace

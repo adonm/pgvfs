@@ -8,6 +8,7 @@ one default postgres secret that serves both pgvfs and the DuckLake catalog
 volume, so reruns never collide.
 """
 
+import json
 import os
 import sys
 import time
@@ -45,6 +46,7 @@ def one(con, sql, *args):
 
 con = connect()
 assert one(con, "SELECT current_setting('parquet_metadata_cache')") == (True,), "footer cache not on"
+stats0 = json.loads(one(con, "SELECT pgvfs_stats()")[0])
 
 # Parquet round trip, including a multi-row-group file larger than a read piece.
 con.execute(
@@ -111,4 +113,6 @@ con2.execute(
 )
 assert one(con2, "SELECT count(*) FROM lake.t") == one(con, "SELECT count(*) FROM lake.t")
 
+stats = json.loads(one(con, "SELECT pgvfs_stats()")[0])
+assert stats["reads"] > stats0["reads"] and stats["read_bytes"] > 0, stats
 print(f"pgvfs e2e ok: volume {vol}, lake files {files} -> {after}")

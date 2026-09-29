@@ -182,7 +182,13 @@ pub unsafe extern "C" fn pgvfs_open(
         store::check_volume(volume)?;
         c.rt.block_on(store::open(&c.pool, volume, path))
     };
-    match run() {
+    let t0 = std::time::Instant::now();
+    let result = run();
+    store::STATS.opens.fetch_add(1, Ordering::Relaxed);
+    store::STATS
+        .open_ns
+        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    match result {
         Ok(Some(f)) => {
             unsafe {
                 *out = PgvfsFile {
@@ -223,13 +229,39 @@ pub unsafe extern "C" fn pgvfs_read(
         created_at: UNIX_EPOCH,
     };
     let out = unsafe { std::slice::from_raw_parts_mut(buf, len as usize) };
-    match c.rt.block_on(store::read_at(&c.pool, &info, pos, out)) {
+    let t0 = std::time::Instant::now();
+    let result = c.rt.block_on(store::read_at(&c.pool, &info, pos, out));
+    let stats = &store::STATS;
+    stats.reads.fetch_add(1, Ordering::Relaxed);
+    stats.read_bytes.fetch_add(len as u64, Ordering::Relaxed);
+    stats
+        .read_ns
+        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    match result {
         Ok(()) => 0,
         Err(e) => {
             set_err(err, &e);
             -1
         }
     }
+}
+
+/// Process-wide counters as JSON (free with `pgvfs_free_str`). Cumulative:
+/// callers diff two samples.
+#[no_mangle]
+pub extern "C" fn pgvfs_stats() -> *mut c_char {
+    let s = &store::STATS;
+    let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    let json = format!(
+        "{{\"opens\": {}, \"open_ms\": {:.1}, \"reads\": {}, \"read_bytes\": {}, \"read_ms\": {:.1}, \"pieces\": {}}}",
+        get(&s.opens),
+        get(&s.open_ns) as f64 / 1e6,
+        get(&s.reads),
+        get(&s.read_bytes),
+        get(&s.read_ns) as f64 / 1e6,
+        get(&s.pieces)
+    );
+    CString::new(json).unwrap_or_default().into_raw()
 }
 
 pub type ListCb = extern "C" fn(ctx: *mut c_void, path: *const c_char, len: usize);

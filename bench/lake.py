@@ -95,11 +95,13 @@ def reader(args, i: int, threads: int, sync, out) -> None:
         for p in range(args.passes + 1):
             sync.wait()
             times, rows = [], 0
+            before = stats(con)
             for kind, sql in queries if p < args.passes else fresh:
                 t0 = time.perf_counter()
                 rows += fetch(con, sql, args.arrow)
                 times.append((kind, (time.perf_counter() - t0) * 1000))
-            passes.append((times, rows))
+            after = stats(con)
+            passes.append((times, rows, {k: after[k] - before[k] for k in after}))
         sync.wait()
         out.put(passes)
     except BaseException:
@@ -107,9 +109,24 @@ def reader(args, i: int, threads: int, sync, out) -> None:
         raise
 
 
+def stats(con) -> dict:
+    """pgvfs's process-wide counters (cumulative)."""
+    return json.loads(con.execute("SELECT pgvfs_stats()").fetchone()[0])
+
+
 def pct(values: list[float], q: float) -> float:
     values = sorted(values)
     return round(values[int(q * (len(values) - 1))], 1)
+
+
+def pgvfs_summary(deltas: list[dict], query_ms: float) -> dict:
+    total = {k: sum(d[k] for d in deltas) for k in deltas[0]}
+    return {"opens": total["opens"], "open_ms": round(total["open_ms"]),
+            "reads": total["reads"], "read_mib": round(total["read_bytes"] / 2**20, 1),
+            "read_ms": round(total["read_ms"]), "pieces": total["pieces"],
+            # share of all query time spent inside pgvfs calls (reads can overlap
+            # within a query, so this is an upper bound)
+            "share": round((total["open_ms"] + total["read_ms"]) / query_ms, 2) if query_ms else 0}
 
 
 def run(ds, args) -> None:
@@ -145,6 +162,7 @@ def run(ds, args) -> None:
             "queries": len(times), "wall_s": round(wall, 1), "qps": round(len(times) / wall, 1),
             "p50_ms": pct(times, .5), "p95_ms": pct(times, .95), "max_ms": pct(times, 1),
             "rows": sum(r[p][1] for r in results),
+            "pgvfs": pgvfs_summary([r[p][2] for r in results], sum(times)),
             "pg_util": round((marks[p + 1][1] - marks[p][1]) / wall / pg_cores, 2) if pg_cores else None,
         }), flush=True)
     print(json.dumps({"p50_ms_by_kind": {k: {label: pct(v, .5) for label, v in by.items()}
