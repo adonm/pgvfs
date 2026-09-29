@@ -137,6 +137,16 @@ const WRITER_LOCK: i64 = 0x7067_7666; // "pgvf"
 
 pub async fn acquire_writer(pool: &Pool) -> Result<WriterLease> {
     let mut client = pool.dedicated().await?;
+    // A standby would grant its own, separate advisory lock, then refuse
+    // every write: say so up front.
+    let standby: bool = client
+        .query_typed_one("SELECT pg_is_in_recovery()", &[])
+        .await?
+        .try_get(0)?;
+    anyhow::ensure!(
+        !standby,
+        "this PostgreSQL is a read-only standby: the pgvfs writer must connect to the primary"
+    );
     let got: bool = client
         .query_typed_one(
             "SELECT pg_try_advisory_lock($1)",
@@ -215,7 +225,24 @@ pub struct FileInfo {
     pub created_at: SystemTime,
 }
 
+/// Whether an error came from a connection that died (PostgreSQL restarted,
+/// the network dropped). The pool may hand out such a connection once before
+/// noticing, so reads, which are safe to repeat, retry once.
+fn lost_connection(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<tokio_postgres::Error>()
+            .is_some_and(|e| e.is_closed())
+    })
+}
+
 pub async fn open(pool: &Pool, volume: &str, path: &str) -> Result<Option<FileInfo>> {
+    match open_once(pool, volume, path).await {
+        Err(e) if lost_connection(&e) => open_once(pool, volume, path).await,
+        r => r,
+    }
+}
+
+async fn open_once(pool: &Pool, volume: &str, path: &str) -> Result<Option<FileInfo>> {
     let conn = pool.get().await?;
     let row = match conn
         .query_typed_opt(
@@ -281,6 +308,20 @@ async fn read_piece(
     start: i64,
     out: &mut [u8],
 ) -> Result<()> {
+    match read_piece_once(pool, file_id, lo, hi, start, out).await {
+        Err(e) if lost_connection(&e) => read_piece_once(pool, file_id, lo, hi, start, out).await,
+        r => r,
+    }
+}
+
+async fn read_piece_once(
+    pool: &Pool,
+    file_id: i64,
+    lo: i64,
+    hi: i64,
+    start: i64,
+    out: &mut [u8],
+) -> Result<()> {
     let conn = pool.get().await?;
     let stmt = conn
         .prepare_typed_cached(RANGE_SQL, &[Type::INT8, Type::INT4, Type::INT4])
@@ -314,6 +355,19 @@ async fn read_piece(
 
 /// Keys under `prefix`, in byte order, after `after`, at most `limit`.
 pub async fn list(
+    pool: &Pool,
+    volume: &str,
+    prefix: &str,
+    after: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    match list_once(pool, volume, prefix, after, limit).await {
+        Err(e) if lost_connection(&e) => list_once(pool, volume, prefix, after, limit).await,
+        r => r,
+    }
+}
+
+async fn list_once(
     pool: &Pool,
     volume: &str,
     prefix: &str,

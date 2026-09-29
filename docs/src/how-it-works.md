@@ -31,6 +31,29 @@ a namespace, so one database can hold several lakes. The layout is
   roles and on read replicas. Before the schema exists they see an empty
   store.
 
+## Operations
+
+- **Reaping.** Deleted files' rows are removed by the writer, at most once a
+  minute while it writes and when it first connects. If writes stop for a
+  long time, reap from cron or a scheduler, as the writer's role:
+  `SELECT pgvfs.reap();` (up to 65,536 rows, about 512 MB, per call; files
+  deleted in the last 10 minutes are kept for readers that still have them
+  open).
+- **Vacuum.** Reaping deletes whole files' rows, so new databases set
+  `pgvfs.chunks` to autovacuum at 1% dead rows instead of 20%. Databases
+  created before this setting existed can apply it themselves:
+  `ALTER TABLE pgvfs.chunks SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_vacuum_threshold = 1000);`
+- **Read replicas.** Readers (pgvfs and DuckLake's catalog) work on streaming
+  standbys; attach with `READ_ONLY`. Catalog and data share one database, so
+  a replica never sees a snapshot that names files it doesn't have yet. When
+  the primary reaps, a long query on a standby can be cancelled by a recovery
+  conflict: set `hot_standby_feedback = on` on the standby. A writer that
+  connects to a standby is refused.
+- **Connection loss.** A read that hits a connection which died (a
+  PostgreSQL restart, a network drop) retries once on a fresh one. A write
+  that loses its connection fails and publishes nothing, and a writer that
+  loses its lock stops writing; reconnect to write again.
+
 ## Caching
 
 - **DuckDB's file cache.** `file_id` is the cache's version tag, so DuckDB

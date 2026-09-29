@@ -12,7 +12,11 @@ just bench [city|hits]       # benchmarks (see Performance)
 just site                    # this site from local builds -> .tmp/site/
 ```
 
-Docker is needed for builds and tests.
+Docker is needed for builds and tests. `just contract` starts a primary, a
+streaming standby and a TLS-only server with a throwaway CA, and tests
+against all three: exact reads, one writer at a time, readers with `SELECT`
+only and on the standby, TLS verification, lost connections, interrupted
+writes, a lost writer lock, readers during writes, and offsets past 4 GiB.
 
 ## Layout
 

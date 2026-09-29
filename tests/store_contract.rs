@@ -5,6 +5,9 @@
 //! PGVFS_TEST_EMPTY_DB_URL a database with no pgvfs layout (optional)
 //! PGVFS_TEST_READER_URL   PGVFS_TEST_DB_URL as a SELECT-only role (optional)
 //! PGVFS_TEST_S3_DB_URL    a database holding an `s3p` schema (optional)
+//! PGVFS_TEST_STANDBY_URL  PGVFS_TEST_DB_URL's database on a streaming standby (optional)
+//! PGVFS_TEST_TLS_URL      a TLS-only server (sslmode=require), and
+//! PGVFS_TEST_TLS_CA       the CA that signed its certificate (optional)
 
 use anyhow::Result;
 use pgvfs::pg::Pool;
@@ -255,6 +258,245 @@ async fn readers_need_no_layout_and_no_write_access() -> Result<()> {
             "reader must not delete"
         );
     }
+    Ok(())
+}
+
+/// Terminate other backends of the pool's database matching `query_like`.
+async fn kill_backends(pool: &Pool, query_like: &str) -> Result<i64> {
+    let conn = pool.get().await?;
+    Ok(conn
+        .query_typed_one(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() AND query LIKE $1",
+            &[(&query_like, Type::TEXT)],
+        )
+        .await?
+        .try_get(0)?)
+}
+
+#[tokio::test]
+#[ignore]
+async fn reads_survive_lost_connections() -> Result<()> {
+    let (pool, _lease) = writer().await?;
+    let vol = volume("lost");
+    let data = bytes(3 * ROW_BYTES as usize, 3);
+    write(&pool, &vol, "f", &data).await?;
+    let f = store::open(&pool, &vol, "f").await?.unwrap();
+    for _ in 0..3 {
+        assert_eq!(store::read_all(&pool, &f).await?, data);
+        // Every pooled reader connection dies (as in a PostgreSQL restart
+        // or a network blip); the next open, list and read must still work.
+        kill_backends(&pool, "SELECT%").await?;
+        assert!(store::open(&pool, &vol, "f").await?.is_some());
+        assert_eq!(store::list(&pool, &vol, "", "", 10).await?, ["f"]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn interrupted_write_publishes_nothing() -> Result<()> {
+    let (pool, _lease) = writer().await?;
+    let vol = volume("cut");
+    let (tx, task) = store::spawn_writer(
+        &tokio::runtime::Handle::current(),
+        pool.clone(),
+        vol.clone(),
+        "x".into(),
+    )?;
+    tx.send(WriteMsg::Data(bytes(WRITE_BATCH, 1).into()))
+        .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(kill_backends(&pool, "COPY pgvfs.chunks%").await?, 1);
+    let _ = tx.send(WriteMsg::Data(bytes(WRITE_BATCH, 2).into())).await;
+    let _ = tx.send(WriteMsg::Publish).await;
+    assert!(
+        task.await?.is_err(),
+        "a write whose connection died must fail"
+    );
+    assert!(store::open(&pool, &vol, "x").await?.is_none());
+    let conn = pool.get().await?;
+    let orphans: i64 = conn
+        .query_typed_one(
+            "SELECT count(*) FROM pgvfs.chunks c WHERE NOT EXISTS \
+             (SELECT 1 FROM pgvfs.files f WHERE f.file_id = c.file_id) \
+             AND NOT EXISTS (SELECT 1 FROM pgvfs.garbage g WHERE g.file_id = c.file_id)",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    assert_eq!(orphans, 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn lost_writer_lock_stops_writes() -> Result<()> {
+    let (pool, lease) = writer().await?;
+    lease.check()?;
+    let conn = pool.get().await?;
+    let killed: i64 = conn
+        .query_typed_one(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_locks \
+             WHERE locktype = 'advisory' AND granted AND pid <> pg_backend_pid()",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    assert_eq!(killed, 1, "the writer holds exactly one advisory lock");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(lease.check().is_err(), "a lost lock must be noticed");
+    drop(lease);
+    // Once lost, another writer can take over.
+    let again = store::acquire_writer(&pool).await?;
+    again.check()?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn readers_see_consistent_files_while_writing() -> Result<()> {
+    let (pool, _lease) = writer().await?;
+    let vol = volume("mix");
+    let len = |i: usize| (i * 7919) % (5 * ROW_BYTES as usize) + 1;
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for r in 0..4 {
+        let (pool, vol, done) = (pool.clone(), vol.clone(), done.clone());
+        readers.push(tokio::spawn(async move {
+            let mut checked = 0;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) || checked == 0 {
+                for path in store::list(&pool, &vol, "", "", 1000).await? {
+                    let i: usize = path[1..].parse()?;
+                    // Removed between list and open: fine, as long as what
+                    // is there is exactly what was written.
+                    let Some(f) = store::open(&pool, &vol, &path).await? else {
+                        continue;
+                    };
+                    let got = store::read_all(&pool, &f).await?;
+                    anyhow::ensure!(got == bytes(len(i), i as u8), "reader {r}: {path} corrupt");
+                    checked += 1;
+                }
+            }
+            Ok::<_, anyhow::Error>(checked)
+        }));
+    }
+    for i in 0..40 {
+        write(&pool, &vol, &format!("f{i}"), &bytes(len(i), i as u8)).await?;
+        if i % 5 == 4 {
+            assert!(store::remove(&pool, &vol, &format!("f{}", i - 2)).await?);
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    for r in readers {
+        assert!(r.await?? > 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn offsets_beyond_4_gib() -> Result<()> {
+    // Rows around byte 4.5 GiB of a 5 GiB file, without writing 5 GiB: the
+    // offset arithmetic must not wrap anywhere in 32 bits.
+    let (pool, _lease) = writer().await?;
+    let vol = volume("big");
+    let row = ROW_BYTES as usize;
+    let first = (4_500_000_000i64 / ROW_BYTES) as i32;
+    let size = 5_000_000_000i64;
+    let conn = pool.get().await?;
+    let id: i64 = conn
+        .query_typed_one("SELECT nextval('pgvfs.file_ids')", &[])
+        .await?
+        .try_get(0)?;
+    let data = bytes(3 * row, 7);
+    for k in 0..3i32 {
+        let chunk = &data[k as usize * row..(k as usize + 1) * row];
+        let no = first + k;
+        conn.execute_typed(
+            "INSERT INTO pgvfs.chunks (file_id, no, data) VALUES ($1, $2, $3)",
+            &[(&id, Type::INT8), (&no, Type::INT4), (&chunk, Type::BYTEA)],
+        )
+        .await?;
+    }
+    conn.execute_typed(
+        "INSERT INTO pgvfs.files (volume, path, file_id, size) VALUES ($1, 'big', $2, $3)",
+        &[(&vol, Type::TEXT), (&id, Type::INT8), (&size, Type::INT8)],
+    )
+    .await?;
+    let f = store::open(&pool, &vol, "big").await?.unwrap();
+    assert_eq!(f.size, size);
+    let at = first as i64 * ROW_BYTES + ROW_BYTES / 2;
+    let mut buf = vec![0; row];
+    store::read_at(&pool, &f, at, &mut buf).await?;
+    assert_eq!(buf, data[row / 2..row / 2 + row]);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn readers_work_on_a_standby() -> Result<()> {
+    let Ok(url) = std::env::var("PGVFS_TEST_STANDBY_URL") else {
+        return Ok(());
+    };
+    let vol = volume("sb");
+    let data = bytes(4 * ROW_BYTES as usize + 9, 5);
+    {
+        let (pool, _lease) = writer().await?;
+        write(&pool, &vol, "f", &data).await?;
+    }
+    let standby = store::connect(&url, 2).await?;
+    store::verify(&standby).await?;
+    let mut found = None;
+    for _ in 0..100 {
+        found = store::open(&standby, &vol, "f").await?;
+        if found.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let f = found.expect("the file replicated to the standby");
+    assert_eq!(store::read_all(&standby, &f).await?, data);
+    assert_eq!(store::list(&standby, &vol, "", "", 10).await?, ["f"]);
+    let err = store::acquire_writer(&standby)
+        .await
+        .err()
+        .expect("no writer on a standby");
+    assert!(format!("{err:#}").contains("standby"), "{err:#}");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn tls_verifies_the_server() -> Result<()> {
+    let (Ok(url), Ok(ca)) = (
+        std::env::var("PGVFS_TEST_TLS_URL"),
+        std::env::var("PGVFS_TEST_TLS_CA"),
+    ) else {
+        return Ok(());
+    };
+    // Tests run serially, so the process environment is ours.
+    std::env::set_var("PGVFS_DB_CA_FILE", &ca);
+    let pool = store::connect(&url, 2).await?;
+    let conn = pool.get().await?;
+    let ssl: bool = conn
+        .query_typed_one(
+            "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    assert!(ssl, "sslmode=require must use TLS");
+    drop(conn);
+    std::env::remove_var("PGVFS_DB_CA_FILE");
+    let err = store::connect(&url, 2)
+        .await
+        .err()
+        .expect("an unknown CA must be refused");
+    assert!(
+        format!("{err:#}").to_lowercase().contains("certificate"),
+        "{err:#}"
+    );
     Ok(())
 }
 

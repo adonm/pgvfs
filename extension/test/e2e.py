@@ -27,7 +27,7 @@ def sql_text(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def connect():
+def connect(url=url):
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{ext}'")
     con.execute("INSTALL postgres")
@@ -118,4 +118,21 @@ assert one(con2, "SELECT count(*) FROM lake.t") == one(con, "SELECT count(*) FRO
 
 stats = json.loads(one(con, "SELECT pgvfs_stats()")[0])
 assert stats["reads"] > stats0["reads"] and stats["read_bytes"] > 0, stats
+# Readers on a streaming standby: DuckLake attaches read-only, and sees the
+# lake once replication catches up (catalog and data share one database, so
+# a snapshot never names files the standby lacks).
+standby = os.environ.get("PGVFS_TEST_STANDBY_URL")
+if standby:
+    con3 = connect(urlsplit(standby))
+    con3.execute(f"ATTACH 'ducklake:postgres:' AS lake (METADATA_SCHEMA '{schema}', READ_ONLY)")
+    want = one(con, "SELECT count(*) FROM lake.t")
+    for _ in range(100):
+        try:
+            if one(con3, "SELECT count(*) FROM lake.t") == want:
+                break
+        except duckdb.Error:
+            pass  # not replicated yet
+        time.sleep(0.1)
+    assert one(con3, "SELECT count(*) FROM lake.t") == want, "standby never caught up"
+
 print(f"pgvfs e2e ok: volume {vol}, lake files {files} -> {after}")

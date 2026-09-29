@@ -42,6 +42,11 @@ CREATE TABLE pgvfs.chunks (
 -- Never compress or move payloads out of line.
 ALTER TABLE pgvfs.chunks ALTER COLUMN data SET STORAGE EXTERNAL;
 
+-- Reaping deletes whole files' rows at once: vacuum early so their pages
+-- are reused rather than growing the table (the default waits for 20% dead).
+ALTER TABLE pgvfs.chunks SET (autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_analyze_scale_factor = 0.02, autovacuum_vacuum_threshold = 1000);
+
 -- Unpublished files. Readers take no snapshot across statements, so rows
 -- outlive the unpublish by a grace period for queries that already opened
 -- the file. Only the writer reaps.

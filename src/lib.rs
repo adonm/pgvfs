@@ -85,6 +85,8 @@ impl PgvfsConn {
         let mut lease = self.writer.lock().unwrap();
         if lease.is_none() {
             *lease = Some(self.rt.block_on(store::acquire_writer(&self.pool))?);
+            // A new writer catches up on garbage left while none was writing.
+            self.maybe_reap();
         }
         lease.as_ref().unwrap().check()
     }
