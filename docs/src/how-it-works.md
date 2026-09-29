@@ -91,7 +91,8 @@ options pgvfs's client doesn't support (`passfile`, `sslrootcert`,
 `service`, RDS IAM) are rejected rather than ignored.
 
 TLS: a remote server needs `sslmode=require`. Certificates are checked against
-the system CAs plus `PGVFS_DB_CA_FILE`. `PGVFS_DB_ALLOW_PLAINTEXT=true` allows
+the system CAs (on Alpine, install `ca-certificates`) plus
+`PGVFS_DB_CA_FILE`. `PGVFS_DB_ALLOW_PLAINTEXT=true` allows
 plaintext on an isolated network; local servers may always use it.
 
 ## Roles

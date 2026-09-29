@@ -58,7 +58,8 @@ community extensions do: `git submodule update --init`, then `make release`
 compiles DuckDB (once, about 7 minutes) and links the extension, with the
 Rust crate built by cargo through Corrosion (`CMakeLists.txt`,
 `extension_config.cmake`). `make test` runs `test/sql/`. The `Distribution`
-workflow runs this build for Linux (amd64, arm64) and Windows on tags,
+workflow runs this build for Linux (amd64, arm64, glibc and musl) and
+Windows on tags,
 weekly and by hand. macOS builds too (it passed at v0.2.0-beta.1) but is
 left out for now. The container build above
 stays for fast local work and for 2.0 dev builds.
@@ -68,7 +69,8 @@ stays for fast local work and for 2.0 dev builds.
 - **Each push** (`ci.yml`): `just check`, then the contract on PostgreSQL 18
   and end-to-end tests for the stable build.
 - **Tags, weekly and by hand** (`distribution.yml`): the multi-platform build
-  with DuckDB's extension pipeline (Linux amd64 and arm64, Windows).
+  with DuckDB's extension pipeline (Linux amd64 and arm64, glibc and musl;
+  Windows).
 - **Weekly, Monday** (`weekly.yml`, or by hand): the contract on PostgreSQL
   11; end-to-end tests for the stable and newest 2.0 dev builds; each build
   published as the pre-release `duckdb-<version>` (every stable build and the
