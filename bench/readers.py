@@ -71,6 +71,7 @@ def load(args) -> None:
             subprocess.run(["curl", "-fsSL", "-o", dest, HITS.format(i)], check=True)
         files.append(dest)
     con = connect(args, view=False)
+    con.execute(f"CALL lake.set_option('parquet_row_group_size', {args.row_group_size})")
     t0 = time.perf_counter()
     con.execute("DROP TABLE IF EXISTS lake.hits")
     con.execute(f"CREATE TABLE lake.hits AS SELECT {SELECT} "
@@ -125,6 +126,7 @@ def main() -> None:
     ap.add_argument("--volume", default="bench")
     ap.add_argument("--parts", type=int, default=10, help="ClickBench 1%% slices (100 = full)")
     ap.add_argument("--readers", default="1,2,4,8")
+    ap.add_argument("--row-group-size", type=int, default=8192, help="lake parquet_row_group_size")
     ap.add_argument("--memory-limit", default="4GiB", help="per DuckDB process")
     ap.add_argument("--data", default=".tmp/data")
     ap.add_argument("--reuse", action="store_true", help="skip the load")

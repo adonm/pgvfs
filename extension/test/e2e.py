@@ -77,6 +77,7 @@ con.execute(
     f"ATTACH 'ducklake:postgres:' AS lake "
     f"(DATA_PATH '{root}/lake/', METADATA_SCHEMA '{schema}')"
 )
+con.execute("CALL lake.set_option('parquet_row_group_size', 8192)")
 con.execute("CREATE TABLE lake.t AS SELECT i, i % 7 AS k FROM range(100000) t(i)")
 con.execute("INSERT INTO lake.t SELECT i, i % 7 FROM range(100000, 150000) t(i)")
 assert one(con, "SELECT count(*), sum(k) FROM lake.t") == (
