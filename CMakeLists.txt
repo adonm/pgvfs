@@ -46,6 +46,9 @@ corrosion_import_crate(
   CRATES pgvfs
   CRATE_TYPES staticlib
   PROFILE release)
+# On Windows the crate's pgvfs.lib would collide with the extension's import
+# library of the same name: build it into its own directory.
+set_target_properties(pgvfs PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/rust")
 
 include_directories(extension/src/include)
 set(EXTENSION_SOURCES extension/src/pgvfs_extension.cpp)
