@@ -1,0 +1,23 @@
+# name: test/sql/pgvfs.test
+# description: pgvfs loads and fails cleanly without PostgreSQL (the storage
+#   itself is tested against real PostgreSQL by scripts/contract.sh)
+# group: [pgvfs]
+
+require parquet
+
+require pgvfs
+
+query I
+SELECT pgvfs_stats() LIKE '{"opens": %"reads": %}'
+----
+true
+
+query I
+SELECT current_setting('parquet_metadata_cache')
+----
+true
+
+statement error
+SELECT * FROM 'pgvfs://lake/missing.parquet'
+----
+pgvfs needs PostgreSQL credentials
