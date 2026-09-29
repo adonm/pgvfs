@@ -72,6 +72,7 @@ def load(args) -> None:
         files.append(dest)
     con = connect(args, view=False)
     con.execute(f"CALL lake.set_option('parquet_row_group_size', {args.row_group_size})")
+    con.execute("CALL lake.set_option('parquet_compression', 'lz4')")
     t0 = time.perf_counter()
     con.execute("DROP TABLE IF EXISTS lake.hits")
     con.execute(f"CREATE TABLE lake.hits AS SELECT {SELECT} "

@@ -61,6 +61,7 @@ def load(args) -> None:
     con = connect(args)
     # The low-latency default (README): persisted in the lake's catalog.
     con.execute(f"CALL lake.set_option('parquet_row_group_size', {args.row_group_size})")
+    con.execute("CALL lake.set_option('parquet_compression', 'lz4')")
     t0 = time.perf_counter()
     con.execute("DROP TABLE IF EXISTS lake.geo")
     con.execute(f"""CREATE TABLE lake.geo AS

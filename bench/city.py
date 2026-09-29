@@ -10,9 +10,9 @@ warm, and a final pass uses new random areas (warm caches, unseen queries).
     city.py run  --ext EXT --url URL [--readers N --reader-cpus 3-15 --pg-container C --pg-cpus 0-2]
     city.py profile --ext EXT --url URL   where one warm query of each kind spends its time
 
---compression (load) sets the lake's Parquet codec; --metadata-cache caches
-Parquet footers across queries; --arrow fetches results as Arrow tables
-instead of Python tuples.
+--compression (load) overrides the lake's Parquet codec (default lz4);
+--arrow fetches results as Arrow tables instead of Python tuples. Loading
+pgvfs turns on DuckDB's Parquet footer cache.
 """
 
 import argparse
@@ -38,8 +38,6 @@ def connect(args) -> duckdb.DuckDBPyConnection:
     u = urlsplit(args.url)
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute("SET enable_progress_bar = false")
-    if getattr(args, "metadata_cache", False):
-        con.execute("SET parquet_metadata_cache = true")
     con.execute(f"LOAD '{args.ext}'")
     for ext in ("postgres", "ducklake", "spatial"):
         con.execute(f"INSTALL {ext}")
@@ -77,6 +75,7 @@ def download(_args) -> None:
 def load(args) -> None:
     con = connect(args)
     con.execute("CALL lake.set_option('parquet_row_group_size', 8192)")
+    con.execute("CALL lake.set_option('parquet_compression', 'lz4')")
     if args.compression:
         con.execute(f"CALL lake.set_option('parquet_compression', '{args.compression}')")
     for name in THEMES:
@@ -257,8 +256,7 @@ def main() -> None:
     ap.add_argument("--passes", type=int, default=10)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--readers", type=int, default=1)
-    ap.add_argument("--compression", help="load: the lake's parquet_compression (e.g. lz4)")
-    ap.add_argument("--metadata-cache", action="store_true", help="SET parquet_metadata_cache = true")
+    ap.add_argument("--compression", help="load: override the lake's parquet_compression (default lz4)")
     ap.add_argument("--arrow", action="store_true", help="fetch Arrow tables, not Python tuples")
     ap.add_argument("--reader-cpus", help="pin readers, e.g. 3-15")
     ap.add_argument("--pg-cpus", help="Postgres's cores, for utilisation")

@@ -5,7 +5,7 @@
 # restarted between load and run, so pass 1 starts with its buffers cold
 # (the OS page cache stays warm). COMPRESSION sets the lake's Parquet codec;
 # MODE=profile times where one warm query of each kind goes; extra args go
-# to city.py (e.g. --metadata-cache --arrow).
+# to city.py (e.g. --arrow).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cores=$(nproc)

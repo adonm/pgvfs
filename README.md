@@ -23,15 +23,22 @@ LOAD pgvfs;
 -- one secret for the DuckLake catalog and the pgvfs data
 CREATE SECRET (TYPE postgres, HOST 'db', USER 'lake', PASSWORD '...', DATABASE 'lake');
 ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 'pgvfs://lake/');
--- once per lake (persisted in the catalog): small row groups for low latency
+-- once per lake (persisted in the catalog): low-latency Parquet
 CALL lake.set_option('parquet_row_group_size', 8192);
+CALL lake.set_option('parquet_compression', 'lz4');
 ```
 
 A lookup reads whole row groups, so their size sets its latency. DuckDB's
 default of 122,880 rows made a 1,000-row lookup take 41 ms; with 8,192 rows it
-took 10 ms (2,048 rows was slower again, at 12.5 ms). DuckLake takes no default
-from extensions, so the option has to be set on the lake. Every tool in this
-repository sets it.
+took 10 ms (2,048 rows was slower again, at 12.5 ms). LZ4 decompresses faster
+than the default snappy. DuckLake takes no defaults from extensions, so both
+options have to be set on the lake; every tool in this repository sets them.
+
+Loading pgvfs does the rest automatically: it turns on DuckDB's Parquet
+footer cache (`parquet_metadata_cache`, off by default), which is safe
+because pgvfs files never change in place. On the Houston benchmark, LZ4 and
+the footer cache together took 13 readers from 292 to 415 queries/s
+(p50 28.5 → 18.4 ms).
 
 In Python: `duckdb.connect(config={"allow_unsigned_extensions": "true"})`.
 The builds and their matching wheels are listed at

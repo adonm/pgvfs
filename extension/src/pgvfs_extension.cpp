@@ -501,6 +501,13 @@ void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("pgvfs_secret",
 	                          "postgres secret for pgvfs:// (else $PGVFS_URL, else the default postgres secret)",
 	                          LogicalType::VARCHAR);
+	// Cache Parquet footers across queries (off by default in DuckDB). Safe:
+	// the cache is keyed by path and last-modified time, and a pgvfs path's
+	// bytes change only with a new file_id and created_at. With small row
+	// groups the footer is large; re-parsing it was half of a small query.
+	if (config.HasExtensionOption("parquet_metadata_cache")) {
+		config.SetOption("parquet_metadata_cache", Value::BOOLEAN(true));
+	}
 	db.GetFileSystem().RegisterSubSystem(make_uniq<PgvfsFileSystem>());
 }
 
