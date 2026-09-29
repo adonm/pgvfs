@@ -26,6 +26,7 @@ ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 'pgvfs://lake/');
 -- once per lake (persisted in the catalog): low-latency Parquet
 CALL lake.set_option('parquet_row_group_size', 8192);
 CALL lake.set_option('parquet_compression', 'lz4');
+CALL lake.set_option('target_file_size', '64MB');
 ```
 
 A lookup reads whole row groups, so their size sets its latency. DuckDB's
@@ -116,6 +117,7 @@ times what it must decode in the rest.
    ```sql
    CALL lake.set_option('parquet_row_group_size', 8192);  -- see the table below
    CALL lake.set_option('parquet_compression', 'lz4');    -- decodes faster than snappy
+   CALL lake.set_option('target_file_size', '64MB');      -- see below
    ```
 2. **Declare a sort order that matches your filters,** before inserting.
    DuckLake then sorts every insert and compaction by it:
@@ -125,7 +127,9 @@ times what it must decode in the rest.
    Put the column queries filter on most first, then the next. For
    geometry, insert in space-filling-curve order,
    `ORDER BY ST_Hilbert(geometry, <extent>)`, so an area of interest touches
-   few row groups.
+   few row groups. A single-coordinate sort was about 15% slower on Houston.
+   Data that already arrives spatially clustered, like Overture's, needs no
+   re-sort: its source order tied with Hilbert.
 3. **Load big tables in key-range batches.** One `INSERT` of 100M wide rows
    sorts all of them at once, and that can exhaust memory. Instead, insert
    disjoint ranges of the leading sort key in order, e.g. `WHERE CounterID >= lo
@@ -159,6 +163,14 @@ a mix of per-site dashboard queries, PostgreSQL on 3 cores
 | Source order, 8K row groups | 62 s | ~all 27 | 16 q/s, p50 337 ms | 40 q/s, p50 140 ms | 25 q/s |
 | Sorted in key-range batches, 8K | 139 s | 1 (max 4) | 30 q/s, p50 163 ms | 76 q/s, p50 46 ms | 36 q/s |
 | Sorted in key-range batches, 64K | 213 s | 1 (max 4) | 40 q/s, p50 134 ms | 89 q/s, p50 47 ms | 47 q/s |
+
+**Files of 64 MB beat DuckLake's 512 MB default** on the sorted table (3
+alternating runs each, same load time): 223 files instead of 40, cold p50
+176–192 ms vs 229–250 ms, warm p50 52–65 vs 62–76 ms, and new-parameter
+p50 121–142 vs 149–169 ms. DuckLake prunes whole files from its catalog
+statistics before opening any, so smaller files leave less to read in the
+files a query does open. A site's rows then span 2 files instead of 1, which
+costs less than it saves.
 
 Sorting doubled read throughput for about twice the load time, and the load
 never used more than about 4 GiB. **Row-group size is a trade-off:** on this large

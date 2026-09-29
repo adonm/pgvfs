@@ -41,15 +41,18 @@ def download() -> None:
         print(f"downloaded {name} in {time.perf_counter() - t0:.0f}s", flush=True)
 
 
-def load(con, _args) -> None:
+def load(con, args) -> None:
+    # Hilbert order (default): an area query touches few row groups. "x"
+    # sorts by one coordinate; "source" keeps Overture's order.
+    order = {"hilbert": f"ORDER BY ST_Hilbert(geometry, {BOX})", "x": "ORDER BY bbox.xmin",
+             "source": ""}[args.order]
     for name in THEMES:
         t0 = time.perf_counter()
         con.execute(f"DROP TABLE IF EXISTS lake.{name}")
-        # Hilbert order: an area query touches few row groups.
-        con.execute(f"CREATE TABLE lake.{name} AS SELECT * FROM '{DATA}/{name}.parquet' "
-                    f"ORDER BY ST_Hilbert(geometry, {BOX})")
+        con.execute(f"CREATE TABLE lake.{name} AS SELECT * FROM '{DATA}/{name}.parquet' {order}")
         rows = con.execute(f"SELECT count(*) FROM lake.{name}").fetchone()[0]
-        print(json.dumps({"table": name, "rows": rows, "load_s": round(time.perf_counter() - t0, 1)}), flush=True)
+        print(json.dumps({"table": name, "rows": rows, "order": args.order,
+                          "load_s": round(time.perf_counter() - t0, 1)}), flush=True)
 
 
 def batch(con, n: int, seed: int) -> list[tuple[str, str]]:

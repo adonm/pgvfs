@@ -82,6 +82,7 @@ con.execute(
 )
 con.execute("CALL lake.set_option('parquet_row_group_size', 8192)")
 con.execute("CALL lake.set_option('parquet_compression', 'lz4')")
+con.execute("CALL lake.set_option('target_file_size', '64MB')")
 con.execute("CREATE TABLE lake.t AS SELECT i, i % 7 AS k FROM range(100000) t(i)")
 con.execute("INSERT INTO lake.t SELECT i, i % 7 FROM range(100000, 150000) t(i)")
 assert one(con, "SELECT count(*), sum(k) FROM lake.t") == (

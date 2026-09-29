@@ -57,6 +57,7 @@ def load(ds, args) -> None:
     con.execute("SET temp_directory = '.tmp/duckdb-temp'")
     con.execute(f"CALL lake.set_option('parquet_row_group_size', {args.row_group_size})")
     con.execute(f"CALL lake.set_option('parquet_compression', '{args.compression}')")
+    con.execute(f"CALL lake.set_option('target_file_size', '{args.target_file_size}')")
     ds.load(con, args)
 
 
@@ -220,6 +221,9 @@ def main() -> None:
     ap.add_argument("--compression", default="lz4", help="load: the lake's parquet_compression")
     ap.add_argument("--row-group-size", type=int, default=8192, help="load: the lake's parquet_row_group_size")
     ap.add_argument("--no-sort", dest="sort", action="store_false", help="load: keep source order")
+    ap.add_argument("--target-file-size", default="64MB", help="load: the lake's target_file_size")
+    ap.add_argument("--order", default="hilbert", choices=["hilbert", "x", "source"],
+                    help="load (city): spatial row order")
     ap.add_argument("--load-memory", default="4GiB", help="load: DuckDB memory_limit (sorts spill beyond it)")
     ap.add_argument("--batch-rows", type=int, default=5_000_000, help="load: rows per sorted insert")
     ap.add_argument("--arrow", action="store_true", help="fetch Arrow tables, not Python tuples")
