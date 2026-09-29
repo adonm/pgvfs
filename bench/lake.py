@@ -29,10 +29,12 @@ from urllib.parse import unquote, urlsplit
 import duckdb
 
 
-def connect(ds, args) -> duckdb.DuckDBPyConnection:
+def connect(ds, args, threads: int | None = None) -> duckdb.DuckDBPyConnection:
     u = urlsplit(args.url)
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute("SET enable_progress_bar = false")
+    if threads:  # before pgvfs connects: it sizes its I/O threads and pool from this
+        con.execute(f"SET threads = {threads}")
     if args.memory_limit:
         con.execute(f"SET memory_limit = '{args.memory_limit}'")
     con.execute(f"LOAD '{args.ext}'")  # also turns on the Parquet footer cache
@@ -86,8 +88,7 @@ def reader(args, i: int, threads: int, sync, out) -> None:
         ds = importlib.import_module(args.dataset)  # modules do not pickle
         if args.reader_cpus:
             os.sched_setaffinity(0, cpus(args.reader_cpus))
-        con = connect(ds, args)
-        con.execute(f"SET threads = {threads}")
+        con = connect(ds, args, threads)
         seed = args.seed * 1000 + i
         queries = ds.batch(con, args.queries, seed)
         fresh = ds.batch(con, args.queries, seed + 500)  # the new-parameters pass
@@ -132,8 +133,6 @@ def pgvfs_summary(deltas: list[dict], query_ms: float) -> dict:
 def run(ds, args) -> None:
     reader_cores = len(cpus(args.reader_cpus)) or os.cpu_count()
     threads = max(1, reader_cores // args.readers)
-    os.environ.update(PGVFS_IO_THREADS=str(threads), PGVFS_POOL_MIN="1",
-                      PGVFS_POOL_MAX=str(max(2, 2 * threads)))
     ctx = mp.get_context("spawn")
     # Lockstep: every reader starts each pass together.
     sync, out = ctx.Barrier(args.readers + 1, timeout=1800), ctx.Queue()

@@ -107,32 +107,38 @@ fn conn<'a>(c: *const PgvfsConn) -> &'a PgvfsConn {
 }
 
 /// Tokio workers drive every pooled connection's protocol I/O and the COPY
-/// writers, for all of DuckDB's threads at once: one per core by default
-/// (PGVFS_IO_THREADS overrides).
-fn io_threads() -> usize {
+/// writers: one per DuckDB thread (PGVFS_IO_THREADS overrides). Not one per
+/// core: hosts running several DuckDB readers would oversubscribe.
+fn io_threads(threads: usize) -> usize {
     std::env::var("PGVFS_IO_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .unwrap_or(threads)
 }
 
-/// Connect and verify the layout (read access suffices). NULL + `*err` on
-/// failure.
+/// Connect and verify the layout (read access suffices), sized for a DuckDB
+/// with `threads` threads (<= 0: one per core). NULL + `*err` on failure.
 #[no_mangle]
 pub unsafe extern "C" fn pgvfs_connect(
     url: *const c_char,
+    threads: i64,
     err: *mut *mut c_char,
 ) -> *mut PgvfsConn {
     let run = || -> Result<PgvfsConn> {
         let url = text(url)?;
+        let threads = if threads > 0 {
+            threads as usize
+        } else {
+            store::default_threads()
+        };
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(io_threads())
+            .worker_threads(io_threads(threads))
             .thread_name("pgvfs")
             .enable_all()
             .build()?;
         let pool = rt.block_on(async {
-            let pool = store::connect(url).await?;
+            let pool = store::connect(url, threads).await?;
             store::verify(&pool).await?;
             Ok::<_, anyhow::Error>(pool)
         })?;

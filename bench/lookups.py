@@ -108,9 +108,6 @@ def pg_cpu_s(container: str | None) -> float:
 def run(args) -> dict:
     reader_cores = len(cpus(args.reader_cpus)) or os.cpu_count()
     threads = max(1, reader_cores // args.readers)
-    # Per reader: as many pgvfs I/O threads and pooled connections as it needs.
-    os.environ.update(PGVFS_IO_THREADS=str(threads), PGVFS_POOL_MIN="1",
-                      PGVFS_POOL_MAX=str(max(2, 2 * threads)))
     ctx = mp.get_context("spawn")
     # A reader that dies before the barrier must fail the run, not hang it.
     start, out = ctx.Barrier(args.readers + 1, timeout=300), ctx.Queue()

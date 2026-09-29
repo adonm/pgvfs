@@ -24,7 +24,8 @@ typedef void (*pgvfs_list_cb)(void *ctx, const char *path, size_t len);
 /* process-wide counters as JSON, cumulative; free with pgvfs_free_str */
 char *pgvfs_stats(void);
 
-PgvfsConn *pgvfs_connect(const char *url, char **err);
+/* sized for a DuckDB with `threads` threads (<= 0: one per core) */
+PgvfsConn *pgvfs_connect(const char *url, int64_t threads, char **err);
 void pgvfs_disconnect(PgvfsConn *conn);
 void pgvfs_free_str(char *s);
 

@@ -64,11 +64,17 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// One pool per DuckDB database. Small warm set (PGVFS_POOL_MIN, default 4):
-/// every DuckDB process holds these backends open. PGVFS_POOL_MAX (default
-/// 32) bounds parallel pieces across DuckDB's threads.
-pub async fn connect(url: &str) -> Result<Pool> {
-    let max = env_usize("PGVFS_POOL_MAX", 32).max(1);
+/// The machine's cores: the default thread count outside DuckDB.
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+/// One pool per DuckDB database, sized to its `threads` (each can wait on a
+/// read, and a large read fans out into pieces): PGVFS_POOL_MAX defaults to
+/// max(8, 2 x threads). Small warm set (PGVFS_POOL_MIN, default 4): every
+/// DuckDB process holds these backends open.
+pub async fn connect(url: &str, threads: usize) -> Result<Pool> {
+    let max = env_usize("PGVFS_POOL_MAX", (2 * threads).max(8)).max(1);
     Pool::connect(
         url,
         Options {

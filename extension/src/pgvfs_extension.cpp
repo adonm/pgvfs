@@ -17,6 +17,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include <cstdlib>
@@ -417,8 +418,14 @@ private:
 			    "pgvfs needs PostgreSQL credentials: CREATE SECRET (TYPE postgres, ...), SET pgvfs_secret, "
 			    "or PGVFS_URL");
 		}
+		// Size pgvfs's I/O threads and pool to this database's DuckDB threads.
+		int64_t threads = 0;
+		auto db = FileOpener::TryGetDatabase(opener);
+		if (db) {
+			threads = int64_t(TaskScheduler::GetScheduler(*db).NumberOfThreads());
+		}
 		char *err = nullptr;
-		conn = pgvfs_connect(target.c_str(), &err);
+		conn = pgvfs_connect(target.c_str(), threads, &err);
 		if (!conn) {
 			Fail("connect to", "PostgreSQL", err);
 		}

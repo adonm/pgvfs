@@ -14,7 +14,11 @@ use tokio_postgres::types::Type;
 
 /// A pool plus this test's writer lease (which installs the layout).
 async fn writer() -> Result<(Pool, WriterLease)> {
-    let pool = store::connect(&std::env::var("PGVFS_TEST_DB_URL")?).await?;
+    let pool = store::connect(
+        &std::env::var("PGVFS_TEST_DB_URL")?,
+        store::default_threads(),
+    )
+    .await?;
     store::verify(&pool).await?;
     let lease = store::acquire_writer(&pool).await?;
     Ok((pool, lease))
@@ -227,7 +231,7 @@ async fn one_writer_at_a_time() -> Result<()> {
 #[ignore]
 async fn readers_need_no_layout_and_no_write_access() -> Result<()> {
     if let Ok(url) = std::env::var("PGVFS_TEST_EMPTY_DB_URL") {
-        let pool = store::connect(&url).await?;
+        let pool = store::connect(&url, store::default_threads()).await?;
         store::verify(&pool).await?;
         assert!(store::open(&pool, "lake", "x").await?.is_none());
         assert!(store::list(&pool, "lake", "", "", 10).await?.is_empty());
@@ -238,7 +242,7 @@ async fn readers_need_no_layout_and_no_write_access() -> Result<()> {
             let (pool, _lease) = writer().await?;
             write(&pool, &vol, "f", &bytes(3 * ROW_BYTES as usize, 7)).await?;
         }
-        let pool = store::connect(&url).await?;
+        let pool = store::connect(&url, store::default_threads()).await?;
         store::verify(&pool).await?;
         assert_eq!(store::list(&pool, &vol, "", "", 10).await?, ["f"]);
         let f = store::open(&pool, &vol, "f").await?.unwrap();
@@ -260,7 +264,7 @@ async fn refuses_an_s3_gateway_database() -> Result<()> {
     let Ok(url) = std::env::var("PGVFS_TEST_S3_DB_URL") else {
         return Ok(());
     };
-    let pool = store::connect(&url).await?;
+    let pool = store::connect(&url, store::default_threads()).await?;
     let err = store::verify(&pool).await.unwrap_err();
     assert!(format!("{err:#}").contains("S3 gateway"), "{err:#}");
     Ok(())

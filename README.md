@@ -205,6 +205,25 @@ cache:
 Throughput holds as readers are added, and latency follows each reader's CPU
 share. On one machine the cores are the limit, not the storage layer. Readers
 on separate machines scale until PostgreSQL's I/O or CPU saturates.
+**Sizing readers.** DuckDB gives a query at most one thread per row group it
+reads, and each thread fetches its row group's columns one after another.
+So on a host with N cores for readers, the choice is between N single-threaded
+readers (the most throughput) and fewer readers with more threads each (lower
+latency). pgvfs sizes its I/O threads and connection pool from each DuckDB's
+`threads` setting, so several readers per host don't oversubscribe. Measured
+with PostgreSQL on 3 cores and 13 reader cores (`READERS=... scripts/lake.sh`):
+
+| Readers × threads | Houston warm q/s | p50 | p95 | 100M hits warm q/s | p50 | p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 13 × 1 | 371 | 21 ms | 88 ms | 76 | 46 ms | 440 ms |
+| 6 × 2 | 346 | 11 ms | 40 ms | 49 | 36 ms | 202 ms |
+| 4 × 3 | 302 | 9 ms | 28 ms | | | |
+| 1 × 13 | 137 | 6 ms | 11 ms | | | |
+
+For many small lookups, 2 threads per reader halves latency for about 7% less
+throughput. For wide scans the cost is higher (about 35%). Size PostgreSQL at
+about one core per four reader cores: it served all of these at 3–50% busy.
+
 <!-- ANCHOR_END: performance -->
 
 ## Layout

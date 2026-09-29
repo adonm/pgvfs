@@ -3,8 +3,10 @@
 # PostgreSQL. The load uses every core; then PostgreSQL is pinned to PG_CPUS
 # (default 0-2: three fast cores, ~1/5 of the CPU work per the core sweep)
 # and restarted, so pass 1 starts with its buffers cold (the OS page cache
-# stays warm). READERS single-threaded readers share READER_CPUS (default
-# the rest). MODE=profile times one warm query of each kind instead.
+# stays warm). READERS readers (default one per reader core, 1 thread each;
+# fewer readers get more threads: see README, Sizing readers) share
+# READER_CPUS (default the rest).
+# MODE=profile times one warm query of each kind instead.
 # Extra args go to lake.py run (e.g. --passes 5 --queries 21 --arrow);
 # LOAD_ARGS to lake.py load (e.g. "--no-sort --row-group-size 65536").
 # Memory stays bounded: the load's DuckDB gets LOAD_MEMORY (default 4GiB,
@@ -18,6 +20,8 @@ shift
 cores=$(nproc)
 pg_cpus=${PG_CPUS:-0-2}
 reader_cpus=${READER_CPUS:-3-$((cores - 1))}
+reader_cores=$(( $(echo "$reader_cpus" | sed 's/.*-//') - $(echo "$reader_cpus" | sed 's/-.*//') + 1 ))
+readers=$reader_cores
 ext=${EXT:-target/ext/release/pgvfs.duckdb_extension}
 container="pgvfs-$dataset-$$"
 trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
@@ -50,6 +54,6 @@ if [ "${MODE:-run}" = profile ]; then
     python bench/lake.py "$dataset" profile --ext "$ext" --url "$(url)" "$@"
   exit
 fi
-echo "== PostgreSQL on cores $pg_cpus, ${READERS:-13} readers on $reader_cpus =="
-lake run --ext "$ext" --url "$(url)" --readers "${READERS:-13}" --reader-cpus "$reader_cpus" \
+echo "== PostgreSQL on cores $pg_cpus, ${READERS:-$readers} readers on $reader_cpus =="
+lake run --ext "$ext" --url "$(url)" --readers "${READERS:-$readers}" --reader-cpus "$reader_cpus" \
   --pg-cpus "$pg_cpus" --pg-container "$container" "$@"
