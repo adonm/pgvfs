@@ -10,13 +10,14 @@ DuckDB readers query it directly, with no object store, gateway or HTTP.
 ## Install
 <!-- ANCHOR: install -->
 
-Builds are published weekly to a DuckDB extension repository on GitHub
-Pages, for the stable DuckDB release and recent 2.0 dev builds (linux_amd64).
+Builds are published weekly for the stable DuckDB release and recent 2.0 dev
+builds (linux_amd64). Each is a GitHub pre-release, `duckdb-<version>`, and
+<https://pgvfs.adonm.dev> serves them as a DuckDB extension repository, so
 DuckDB fetches the build that matches its own version:
 
 ```sql
 -- start DuckDB with allow_unsigned_extensions = true (CLI: duckdb -unsigned)
-INSTALL pgvfs FROM 'https://adonm.github.io/pgvfs';
+INSTALL pgvfs FROM 'https://pgvfs.adonm.dev';
 LOAD pgvfs;
 
 -- one secret for the DuckLake catalog and the pgvfs data
@@ -26,7 +27,9 @@ ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 'pgvfs://lake/');
 
 In Python: `duckdb.connect(config={"allow_unsigned_extensions": "true"})`.
 The builds and their matching wheels are listed at
-<https://adonm.github.io/pgvfs>, along with the weekly benchmark.
+<https://pgvfs.adonm.dev/install.html>. You can also install one straight
+from its release:
+`INSTALL 'https://github.com/adonm/pgvfs/releases/download/duckdb-v1.5.6/pgvfs.duckdb_extension'`.
 
 Paths are `pgvfs://<volume>/<path>`. A volume (`[a-z0-9][a-z0-9._-]{0,62}`)
 is a namespace, so one database can hold several lakes.
@@ -175,14 +178,14 @@ CI (`.github/workflows/`):
 - **Weekly (Monday), or by hand:**
   - the contract on PostgreSQL 11;
   - e2e for the stable and newest 2.0 dev builds;
-  - publishing both to GitHub Pages (`scripts/site.py`, keeping every stable
-    build and the last 4 dev builds). The site is also this documentation,
-    an mdbook (`docs/`) whose pages include this README's sections;
-    preview it with `just site`;
-  - a 10M-row, 1–4-reader benchmark appended to `bench/history.jsonl` there.
+  - publishing each build as the pre-release `duckdb-<version>`
+    (`scripts/release.sh`, keeping every stable build and the last 4 dev
+    builds);
+  - a 10M-row, 1–4-reader benchmark appended to the `bench` pre-release's
+    `history.jsonl`.
+- **Pages** (`pages.yml`: weekly and on docs changes): <https://pgvfs.adonm.dev>
+  is assembled from the releases by `scripts/site.py`. It is an mdbook
+  (`docs/`) whose pages include this README's sections, plus the
+  `INSTALL ... FROM` tree. Preview it with `just site`.
 
-Pool sizing: `PGVFS_POOL_MIN` (default 4) and `PGVFS_POOL_MAX` (default 32)
-per DuckDB database. `PGVFS_IO_THREADS` defaults to one per core.
-
-Alpha: layout changes require a fresh database, and there are no releases.
 <!-- ANCHOR_END: build -->

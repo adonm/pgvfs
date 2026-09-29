@@ -1,8 +1,8 @@
 name: Weekly
 
-# Build, test and publish the extension for the stable DuckDB release and
-# the newest 2.0 dev wheel to GitHub Pages (a DuckDB extension repository),
-# then record a small concurrent-readers benchmark there. Weekly keeps
+# Build and test the extension for the stable DuckDB release and the newest
+# 2.0 dev wheel, publish both as pre-releases (the build store), record a
+# small concurrent-readers benchmark, then redeploy Pages (pages.yml). Weekly keeps
 # Actions use low; run it by hand after a change worth publishing.
 on:
   schedule:
@@ -65,22 +65,27 @@ jobs:
     if: ${{ !cancelled() && needs.compat.result == 'success' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write  # releases are the build store
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/checkout@v5
-        with:
-          ref: gh-pages
-          path: site
-      - uses: jdx/mise-action@v3  # python, mdbook
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
       - run: |
-          python3 scripts/site.py site --ext artifacts/ext-release artifacts/ext-nightly \
-            --bench artifacts/bench/bench.jsonl
-          cd site
-          git config user.name github-actions
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          git commit -qm "Publish ${GITHUB_SHA::12}" && git push || echo "nothing to publish"
+          for target in release nightly; do
+            bash scripts/release.sh publish "artifacts/ext-$target"
+          done
+          if [ -f artifacts/bench/bench.jsonl ]; then
+            bash scripts/release.sh bench artifacts/bench/bench.jsonl
+          fi
+          bash scripts/release.sh prune
+
+  pages:
+    needs: publish
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml

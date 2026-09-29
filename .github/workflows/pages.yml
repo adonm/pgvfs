@@ -1,0 +1,41 @@
+name: Pages
+
+# Assemble the site (mdbook docs + the DuckDB extension repository) from the
+# release assets and deploy it. Runs when the docs change, and after each
+# weekly publish (called from weekly.yml).
+on:
+  push:
+    branches: [main]
+    paths: [README.md, docs/**, scripts/site.py, .github/workflows/pages.yml]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3  # python, mdbook
+      - run: bash scripts/release.sh fetch releases
+      - run: python3 scripts/site.py site --releases releases
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -8,4 +8,4 @@ src = "src"
 [output.html]
 git-repository-url = "https://github.com/adonm/pgvfs"
 edit-url-template = "https://github.com/adonm/pgvfs/edit/main/{path}"
-site-url = "/pgvfs/"
+site-url = "/"

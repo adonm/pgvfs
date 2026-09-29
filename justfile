@@ -33,9 +33,17 @@ e2e TARGET="release" WHEEL="": (ext TARGET WHEEL)
 compat:
     for v in 11 13 15 17 18; do PG_IMAGE=postgres:$v bash scripts/contract.sh; done
 
-# The Pages site (docs + extension repository) from local builds -> .tmp/site/.
+# The Pages site from local builds (laid out like release assets) -> .tmp/site/.
 site:
-    mise exec -- python3 scripts/site.py .tmp/site --ext target/ext/release target/ext/nightly
+    rm -rf .tmp/site .tmp/releases
+    for t in release nightly; do \
+      [ -f target/ext/$t/pgvfs.duckdb_extension ] || continue; \
+      v=$(cat target/ext/$t/DUCKDB_VERSION); mkdir -p .tmp/releases/$v; \
+      cp target/ext/$t/pgvfs.duckdb_extension .tmp/releases/$v/; \
+      printf '{"duckdb_version": "%s", "wheel": "%s", "commit": "local", "date": "%s"}\n' \
+        "$v" "$(cat target/ext/$t/DUCKDB_PY)" "$(date +%F)" >.tmp/releases/$v/build.json; \
+    done
+    mise exec -- python3 scripts/site.py .tmp/site --releases .tmp/releases
     @echo "preview: python3 -m http.server -d .tmp/site"
 
 # Concurrent DuckLake readers on a disposable PostgreSQL (bench/readers.py).
