@@ -12,7 +12,7 @@ First beta. Highlights since the project split out of pgvs3:
 
 - **Install** from <https://pgvfs.adonm.dev> for DuckDB 1.5.6 and recent 2.0
   dev builds (linux_amd64); DuckDB's extension pipeline also builds it for
-  Linux arm64, macOS (Intel and Apple Silicon) and Windows.
+  Linux arm64 and Windows. macOS builds but is not published yet.
 - **One writer, many readers:** an advisory-lock writer lease; readers need
   only `SELECT` and work on streaming standbys (a writer there is refused).
 - **Credentials** from a `postgres` secret shared with DuckLake's catalog.
