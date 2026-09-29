@@ -73,7 +73,10 @@ gateway ([pgvs3](../pgvs3)) was compared with pgvfs. Fresh DuckDB per query:
 | Warm geomean | 229 ms | 229 ms |
 
 Short queries gain most, because the HTTP hop and HEAD revalidation are gone.
-The heaviest string scans remain 2–7% slower.
+The heaviest string scans remain 2–7% slower. The run is from pgvs3 `abcdb09`,
+before the split. It used identical data (checked by whole-table checksum),
+the two stacks alternated run by run, and each figure is the median of 5.
+Records: [`docs/results/vs-s3-gateway.jsonl`](docs/results/vs-s3-gateway.jsonl).
 
 **Concurrent readers** (`just bench --parts 20 --readers 1,2,4,8,16`). 20M
 rows, PostgreSQL 18 and every DuckDB reader on one 16-core machine, each
