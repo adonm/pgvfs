@@ -148,7 +148,12 @@ on separate machines scale until PostgreSQL's I/O or CPU saturates.
 - `extension/`: the thin C++ DuckDB `FileSystem` adapter. The adapter has
   to be C++ because DuckDB's stable C API can use filesystems but cannot
   register one.
-- `bench/`: the concurrent-readers benchmark.
+- `bench/`: benchmarks. `lake.py` is the harness (lockstep readers, cold,
+  warm and new-parameter passes, per-query profiling), with two datasets:
+  `city.py` (Overture Houston, 1M rows) and `hits.py` (ClickBench, 100M rows,
+  105 columns). `readers.py` (the weekly ClickBench run) and `lookups.py`
+  (1,000-geometry lookups, used by `scripts/sweep.sh` to split cores between
+  PostgreSQL and readers) are standalone.
 - `scripts/`: DuckDB input fetching, runners using disposable PostgreSQL
   containers, and the Pages site builder.
 - `docs/`: the mdbook site, built from this README plus generated build and
@@ -166,6 +171,9 @@ just contract                # storage contract on a disposable PostgreSQL (PG_I
 just compat                  # the contract on every supported major
 just e2e [release|nightly]   # contract + DuckDB end-to-end through the built extension
 just bench --parts 20 --readers 1,4,16
+scripts/lake.sh city                # Houston: 13 readers, 10 passes (~1 min incl. download)
+scripts/lake.sh hits --passes 5     # 100M rows (14 GB download, cached)
+MODE=profile scripts/lake.sh city   # where one warm query of each kind goes
 ```
 
 A C++ DuckDB extension must be statically linked against `duckdb_static` of
