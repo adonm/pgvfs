@@ -1,0 +1,86 @@
+name: Weekly
+
+# Build, test and publish the extension for the stable DuckDB release and
+# the newest 2.0 dev wheel to GitHub Pages (a DuckDB extension repository),
+# then record a small concurrent-readers benchmark there. Weekly keeps
+# Actions use low; run it by hand after a change worth publishing.
+on:
+  schedule:
+    - cron: "30 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3
+      - run: PG_IMAGE=postgres:11 just contract
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [release, nightly]
+    # A DuckDB nightly break must not stop the stable build publishing.
+    continue-on-error: ${{ matrix.target == 'nightly' }}
+    env:
+      GH_TOKEN: ${{ github.token }}  # reads DuckDB's CI artifacts (nightly libs)
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - run: just e2e ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ext-${{ matrix.target }}
+          path: target/ext/${{ matrix.target }}/
+
+  bench:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: ext-release
+          path: target/ext/release
+      # 10M rows, up to 4 readers: minutes, and within a runner's 16 GB.
+      - run: |
+          DUCKDB_PY=$(cat target/ext/release/DUCKDB_PY) \
+            EXT=target/ext/release/pgvfs.duckdb_extension \
+            bash scripts/bench.sh --parts 10 --readers 1,2,4 --memory-limit 2GiB | tee bench.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: bench.jsonl
+
+  publish:
+    needs: [compat, build, bench]
+    if: ${{ !cancelled() && needs.compat.result == 'success' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          ref: gh-pages
+          path: site
+      - uses: jdx/mise-action@v3  # python, mdbook
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - run: |
+          python3 scripts/site.py site --ext artifacts/ext-release artifacts/ext-nightly \
+            --bench artifacts/bench/bench.jsonl
+          cd site
+          git config user.name github-actions
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -qm "Publish ${GITHUB_SHA::12}" && git push || echo "nothing to publish"

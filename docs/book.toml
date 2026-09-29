@@ -1,0 +1,11 @@
+[book]
+title = "pgvfs"
+description = "DuckLake on PostgreSQL: a DuckDB pgvfs:// filesystem for one writer and many readers"
+authors = ["Adon Metcalfe"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/adonm/pgvfs"
+edit-url-template = "https://github.com/adonm/pgvfs/edit/main/{path}"
+site-url = "/pgvfs/"

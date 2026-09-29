@@ -17,6 +17,7 @@ ext TARGET="release" WHEEL="":
     && docker buildx build -q -f extension/Containerfile --build-context duckdb="$dir" \
          --output type=local,dest=target/ext/{{ TARGET }} . >/dev/null \
     && cp "$dir/wheel" target/ext/{{ TARGET }}/DUCKDB_PY \
+    && cp "$dir/version" target/ext/{{ TARGET }}/DUCKDB_VERSION \
     && echo "target/ext/{{ TARGET }}/pgvfs.duckdb_extension for duckdb==$(cat "$dir/wheel") ($(cat "$dir/version"))"
 
 # Storage contract on a disposable PostgreSQL (PG_IMAGE=postgres:11 ... :18).
@@ -31,6 +32,11 @@ e2e TARGET="release" WHEEL="": (ext TARGET WHEEL)
 # The contract on every supported PostgreSQL major.
 compat:
     for v in 11 13 15 17 18; do PG_IMAGE=postgres:$v bash scripts/contract.sh; done
+
+# The Pages site (docs + extension repository) from local builds -> .tmp/site/.
+site:
+    mise exec -- python3 scripts/site.py .tmp/site --ext target/ext/release target/ext/nightly
+    @echo "preview: python3 -m http.server -d .tmp/site"
 
 # Concurrent DuckLake readers on a disposable PostgreSQL (bench/readers.py).
 bench *ARGS: ext

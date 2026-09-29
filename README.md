@@ -1,20 +1,39 @@
 # pgvfs: DuckLake on PostgreSQL, many readers
 
+<!-- ANCHOR: intro -->
 `pgvfs://` is a DuckDB filesystem that keeps DuckLake's data files as rows in
 PostgreSQL. With the DuckLake catalog in the same database, one PostgreSQL
 is the whole lake: one secret, one backup, one set of roles. Any number of
 DuckDB readers query it directly, with no object store, gateway or HTTP.
+<!-- ANCHOR_END: intro -->
+
+## Install
+<!-- ANCHOR: install -->
+
+Builds are published weekly to a DuckDB extension repository on GitHub
+Pages, for the stable DuckDB release and recent 2.0 dev builds (linux_amd64).
+DuckDB fetches the build that matches its own version:
 
 ```sql
-LOAD 'pgvfs.duckdb_extension';            -- allow_unsigned_extensions = true
+-- start DuckDB with allow_unsigned_extensions = true (CLI: duckdb -unsigned)
+INSTALL pgvfs FROM 'https://adonm.github.io/pgvfs';
+LOAD pgvfs;
+
+-- one secret for the DuckLake catalog and the pgvfs data
 CREATE SECRET (TYPE postgres, HOST 'db', USER 'lake', PASSWORD '...', DATABASE 'lake');
 ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 'pgvfs://lake/');
 ```
 
+In Python: `duckdb.connect(config={"allow_unsigned_extensions": "true"})`.
+The builds and their matching wheels are listed at
+<https://adonm.github.io/pgvfs>, along with the weekly benchmark.
+
 Paths are `pgvfs://<volume>/<path>`. A volume (`[a-z0-9][a-z0-9._-]{0,62}`)
 is a namespace, so one database can hold several lakes.
+<!-- ANCHOR_END: install -->
 
 ## Model
+<!-- ANCHOR: model -->
 
 - **One writer, any number of readers.** The first write (a file create,
   delete or rename) takes a session advisory lock on a dedicated connection.
@@ -37,8 +56,10 @@ Storage (`schema.sql`) is 8120-byte inline rows (one tuple per 8 KB page, no
 TOAST) in 32 hash partitions. It needs **PostgreSQL 11+** and **no
 extensions**: no pg_cron, no superuser. The contract tests run on 11, 13, 15,
 17 and 18.
+<!-- ANCHOR_END: model -->
 
 ## Credentials
+<!-- ANCHOR: credentials -->
 
 pgvfs finds its credentials the same way DuckDB's `postgres` extension does,
 and so the same way DuckLake's catalog does. One secret can serve both:
@@ -60,12 +81,14 @@ Roles:
   (`ALTER DEFAULT PRIVILEGES` can grant these ahead of the schema).
 - **The writer:** `CREATE` on the database the first time, to install the
   schema, then ownership of it.
+<!-- ANCHOR_END: credentials -->
 
 ## Performance
+<!-- ANCHOR: performance -->
 
 **Against an S3 gateway.** Full ClickBench (100M rows), DuckDB 1.5.6, local
 kind. The same DuckLake read through DuckDB httpfs and a PostgreSQL-backed S3
-gateway ([pgvs3](../pgvs3)) was compared with pgvfs. Fresh DuckDB per query:
+gateway ([pgvs3](https://github.com/adonm/pgvs3)) was compared with pgvfs. Fresh DuckDB per query:
 
 | | S3 gateway | pgvfs |
 | --- | ---: | ---: |
@@ -76,7 +99,7 @@ Short queries gain most, because the HTTP hop and HEAD revalidation are gone.
 The heaviest string scans remain 2–7% slower. The run is from pgvs3 `abcdb09`,
 before the split. It used identical data (checked by whole-table checksum),
 the two stacks alternated run by run, and each figure is the median of 5.
-Records: [`docs/results/vs-s3-gateway.jsonl`](docs/results/vs-s3-gateway.jsonl).
+Records: [`docs/results/vs-s3-gateway.jsonl`](https://github.com/adonm/pgvfs/blob/main/docs/results/vs-s3-gateway.jsonl).
 
 **Concurrent readers** (`just bench --parts 20 --readers 1,2,4,8,16`). 20M
 rows, PostgreSQL 18 and every DuckDB reader on one 16-core machine, each
@@ -94,8 +117,10 @@ cache:
 Throughput holds as readers are added, and latency follows each reader's CPU
 share. On one machine the cores are the limit, not the storage layer. Readers
 on separate machines scale until PostgreSQL's I/O or CPU saturates.
+<!-- ANCHOR_END: performance -->
 
 ## Layout
+<!-- ANCHOR: layout -->
 
 - `schema.sql`: storage layout.
 - `src/store.rs`: reads, the `COPY` writer, the writer lease and reaping.
@@ -105,9 +130,14 @@ on separate machines scale until PostgreSQL's I/O or CPU saturates.
   to be C++ because DuckDB's stable C API can use filesystems but cannot
   register one.
 - `bench/`: the concurrent-readers benchmark.
-- `scripts/`: runners using disposable PostgreSQL containers.
+- `scripts/`: DuckDB input fetching, runners using disposable PostgreSQL
+  containers, and the Pages site builder.
+- `docs/`: the mdbook site, built from this README plus generated build and
+  benchmark tables.
+<!-- ANCHOR_END: layout -->
 
 ## Build and test
+<!-- ANCHOR: build -->
 
 ```sh
 just check                   # fmt, clippy, unit tests
@@ -136,10 +166,23 @@ headers and prebuilt static libraries, and the container only links
   (`gh auth login` or `GH_TOKEN`). The extension footer carries DuckDB's
   version tag, or the commit id for `-dev` builds.
 
-`target/ext/<target>/DUCKDB_PY` records the wheel each build loads into.
-CI runs both targets, and rebuilds nightly against the newest dev wheel.
+`target/ext/<target>/DUCKDB_PY` and `DUCKDB_VERSION` record the wheel each
+build loads into and its extension-repository directory.
+
+CI (`.github/workflows/`):
+- **Each push:** fmt, clippy, unit tests, then the contract on PostgreSQL 18
+  and e2e for the stable build.
+- **Weekly (Monday), or by hand:**
+  - the contract on PostgreSQL 11;
+  - e2e for the stable and newest 2.0 dev builds;
+  - publishing both to GitHub Pages (`scripts/site.py`, keeping every stable
+    build and the last 4 dev builds). The site is also this documentation,
+    an mdbook (`docs/`) whose pages include this README's sections;
+    preview it with `just site`;
+  - a 10M-row, 1–4-reader benchmark appended to `bench/history.jsonl` there.
 
 Pool sizing: `PGVFS_POOL_MIN` (default 4) and `PGVFS_POOL_MAX` (default 32)
 per DuckDB database. `PGVFS_IO_THREADS` defaults to one per core.
 
 Alpha: layout changes require a fresh database, and there are no releases.
+<!-- ANCHOR_END: build -->
