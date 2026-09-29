@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # DuckDB 2.0 dev wheels change daily: rebuild against the newest one.
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3
+      - run: just check
+
+  contract:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        postgres: [11, 18]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3
+      - run: PG_IMAGE=postgres:${{ matrix.postgres }} just contract
+
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [release, nightly]
+    # A DuckDB nightly break should be visible, not block the stable build.
+    continue-on-error: ${{ matrix.target == 'nightly' }}
+    env:
+      # Reading DuckDB's CI artifacts (nightly static libs) needs a token.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - run: just e2e ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgvfs-${{ matrix.target }}-linux_amd64
+          path: target/ext/${{ matrix.target }}/

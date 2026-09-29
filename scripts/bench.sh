@@ -17,5 +17,5 @@ done
 docker exec "$container" psql -U postgres -qc 'CREATE DATABASE lake'
 addr=$(docker port "$container" 5432/tcp)
 echo "== $image, $(nproc) cores =="
-uv run --quiet --with "duckdb==${DUCKDB_PY:-1.5.6}" python bench/readers.py \
-  --ext target/ext/pgvfs.duckdb_extension --url "postgres://postgres:postgres@$addr/lake" "$@"
+uv run --quiet --no-project --with "duckdb==${DUCKDB_PY:-1.5.6}" python bench/readers.py \
+  --ext "${EXT:-target/ext/release/pgvfs.duckdb_extension}" --url "postgres://postgres:postgres@$addr/lake" "$@"

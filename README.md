@@ -110,20 +110,34 @@ on separate machines scale until PostgreSQL's I/O or CPU saturates.
 ## Build and test
 
 ```sh
-just check            # fmt, clippy, unit tests
-just ext              # container build -> target/ext/pgvfs.duckdb_extension
-just contract         # storage contract on a disposable PostgreSQL (PG_IMAGE=postgres:11..18)
-just compat           # the contract on every supported major
-just e2e              # contract + DuckDB end-to-end through the built extension
+just check                   # fmt, clippy, unit tests
+just ext                     # stable DuckDB (1.5.6) -> target/ext/release/pgvfs.duckdb_extension
+just ext nightly [WHEEL]     # DuckDB 2.0 dev wheel (default: newest on PyPI) -> target/ext/nightly/
+just contract                # storage contract on a disposable PostgreSQL (PG_IMAGE=postgres:11..18)
+just compat                  # the contract on every supported major
+just e2e [release|nightly]   # contract + DuckDB end-to-end through the built extension
 just bench --parts 20 --readers 1,4,16
 ```
 
-The extension is statically linked against `duckdb_static` of the exact
-DuckDB release that loads it (v1.5.6). Like DuckDB's own extensions, it
-needs that because Python loads DuckDB with `RTLD_LOCAL`. The link uses the
-release's prebuilt static libraries and source headers, both pinned by
-SHA-256 in `extension/Containerfile`, so DuckDB is never compiled. To change
-DuckDB versions, update the version and both digests together.
+A C++ DuckDB extension must be statically linked against `duckdb_static` of
+the exact DuckDB build that loads it. Python loads DuckDB with `RTLD_LOCAL`,
+so the host's symbols are out of reach, and DuckDB's own extensions are built
+the same way. DuckDB is never compiled here. `scripts/duckdb.sh` fetches its
+headers and prebuilt static libraries, and the container only links
+(`extension/build.sh`, a few seconds):
+
+- **release:** the release's `static-libs-linux-amd64.zip` and source
+  tarball, pinned by SHA-256 in `scripts/duckdb.sh`. To change versions,
+  update the version and both digests together.
+- **nightly:** each 2.0 dev wheel is cut by a manual run of DuckDB's `Main`
+  CI on its exact commit (`PRAGMA version`). That run keeps
+  `duckdb-static-libs-linux-amd64.tar.gz` for 90 days, and the download is
+  checked against GitHub's recorded digest. Fetching it needs a GitHub token
+  (`gh auth login` or `GH_TOKEN`). The extension footer carries DuckDB's
+  version tag, or the commit id for `-dev` builds.
+
+`target/ext/<target>/DUCKDB_PY` records the wheel each build loads into.
+CI runs both targets, and rebuilds nightly against the newest dev wheel.
 
 Pool sizing: `PGVFS_POOL_MIN` (default 4) and `PGVFS_POOL_MAX` (default 32)
 per DuckDB database. `PGVFS_IO_THREADS` defaults to one per core.
