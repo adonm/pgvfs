@@ -8,6 +8,11 @@ warm, and a final pass uses new random areas (warm caches, unseen queries).
     city.py download                  Overture -> .tmp/data/houston/ (once, cached)
     city.py load --ext EXT --url URL  into DuckLake on pgvfs
     city.py run  --ext EXT --url URL [--readers N --reader-cpus 3-15 --pg-container C --pg-cpus 0-2]
+    city.py profile --ext EXT --url URL   where one warm query of each kind spends its time
+
+--compression (load) sets the lake's Parquet codec; --metadata-cache caches
+Parquet footers across queries; --arrow fetches results as Arrow tables
+instead of Python tuples.
 """
 
 import argparse
@@ -33,6 +38,8 @@ def connect(args) -> duckdb.DuckDBPyConnection:
     u = urlsplit(args.url)
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute("SET enable_progress_bar = false")
+    if getattr(args, "metadata_cache", False):
+        con.execute("SET parquet_metadata_cache = true")
     con.execute(f"LOAD '{args.ext}'")
     for ext in ("postgres", "ducklake", "spatial"):
         con.execute(f"INSTALL {ext}")
@@ -70,6 +77,8 @@ def download(_args) -> None:
 def load(args) -> None:
     con = connect(args)
     con.execute("CALL lake.set_option('parquet_row_group_size', 8192)")
+    if args.compression:
+        con.execute(f"CALL lake.set_option('parquet_compression', '{args.compression}')")
     for name in THEMES:
         t0 = time.perf_counter()
         con.execute(f"DROP TABLE IF EXISTS lake.{name}")
@@ -106,6 +115,57 @@ def batch(con, n: int, seed: int) -> list[str]:
                  f"WHERE {window(.02, .05)} GROUP BY class ORDER BY 2 DESC"),
     ]
     return [templates[i % len(templates)]() for i in range(n)]
+
+
+def fetch(con, sql: str, arrow: bool) -> int:
+    if arrow:
+        return con.execute(sql).fetch_arrow_table().num_rows
+    return len(con.execute(sql).fetchall())
+
+
+KINDS = ["buildings in view", "places in view", "tall buildings", "places by category", "area summary"]
+
+
+def profile(args) -> None:
+    con = connect(args)
+    path = con.execute("SELECT data_file FROM ducklake_list_files('lake', 'buildings') LIMIT 1").fetchone()[0]
+    codecs = con.execute(f"SELECT DISTINCT compression FROM parquet_metadata('{path}')").fetchall()
+    queries = batch(con, args.queries, args.seed)
+    for _ in range(2):  # warm the caches
+        for sql in queries:
+            fetch(con, sql, False)
+    out = f"/tmp/pgvfs-profile-{os.getpid()}.json"
+    for kind, sql in zip(KINDS, queries):
+        timing = {}
+        for mode in ("fetchall", "arrow"):
+            samples = []
+            for _ in range(5):
+                t0 = time.perf_counter()
+                fetch(con, sql, mode == "arrow")
+                samples.append((time.perf_counter() - t0) * 1000)
+            timing[mode] = round(statistics.median(samples), 1)
+        con.execute(f"SET enable_profiling = 'json'; SET profiling_output = '{out}'")
+        rows = fetch(con, sql, True)
+        con.execute("SET enable_profiling = 'no_output'")
+        tree = json.load(open(out))
+        ops = {}
+
+        def walk(node):
+            name = node.get("operator_name") or node.get("operator_type") or "?"
+            ops[name] = ops.get(name, 0) + node.get("operator_timing", 0) * 1000
+            for child in node.get("children", []):
+                walk(child)
+        for child in tree.get("children", []):
+            walk(child)
+        latency = tree.get("latency", 0) * 1000
+        print(json.dumps({
+            "kind": kind, "rows": rows, "codec": [c[0] for c in codecs],
+            "fetchall_ms": timing["fetchall"], "arrow_ms": timing["arrow"],
+            "profiled_ms": round(latency, 1),
+            # time outside operators: binding and planning, incl. DuckLake's catalog queries
+            "plan_ms": round(latency - sum(ops.values()), 1),
+            "operators_ms": {k: round(v, 1) for k, v in sorted(ops.items(), key=lambda kv: -kv[1]) if v >= 0.1},
+        }), flush=True)
 
 
 def cpus(spec: str | None) -> list[int]:
@@ -147,7 +207,7 @@ def read(args, i: int, threads: int, sync, out) -> None:
         times, rows = [], 0
         for sql in queries if p < args.passes else fresh:
             t0 = time.perf_counter()
-            rows += len(con.execute(sql).fetchall())
+            rows += fetch(con, sql, args.arrow)
             times.append((time.perf_counter() - t0) * 1000)
         passes.append((times, rows))
     sync.wait()
@@ -190,18 +250,21 @@ def run(args) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["download", "load", "run"])
+    ap.add_argument("command", choices=["download", "load", "run", "profile"])
     ap.add_argument("--ext")
     ap.add_argument("--url", help="PostgreSQL URL (becomes a postgres secret)")
     ap.add_argument("--queries", type=int, default=30)
     ap.add_argument("--passes", type=int, default=10)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--readers", type=int, default=1)
+    ap.add_argument("--compression", help="load: the lake's parquet_compression (e.g. lz4)")
+    ap.add_argument("--metadata-cache", action="store_true", help="SET parquet_metadata_cache = true")
+    ap.add_argument("--arrow", action="store_true", help="fetch Arrow tables, not Python tuples")
     ap.add_argument("--reader-cpus", help="pin readers, e.g. 3-15")
     ap.add_argument("--pg-cpus", help="Postgres's cores, for utilisation")
     ap.add_argument("--pg-container", help="Postgres container, for its CPU use")
     args = ap.parse_args()
-    {"download": download, "load": load, "run": run}[args.command](args)
+    {"download": download, "load": load, "run": run, "profile": profile}[args.command](args)
 
 
 if __name__ == "__main__":
