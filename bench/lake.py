@@ -224,6 +224,9 @@ def main() -> None:
     ap.add_argument("--target-file-size", default="64MB", help="load: the lake's target_file_size")
     ap.add_argument("--order", default="hilbert", choices=["hilbert", "x", "source"],
                     help="load (city): spatial row order")
+    ap.add_argument("--variant", default="base",
+                    choices=["base", "trickle", "compacted", "deleted", "rewritten", "split"],
+                    help="load (city): layout variant")
     ap.add_argument("--load-memory", default="4GiB", help="load: DuckDB memory_limit (sorts spill beyond it)")
     ap.add_argument("--batch-rows", type=int, default=5_000_000, help="load: rows per sorted insert")
     ap.add_argument("--arrow", action="store_true", help="fetch Arrow tables, not Python tuples")

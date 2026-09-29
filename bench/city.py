@@ -41,18 +41,58 @@ def download() -> None:
         print(f"downloaded {name} in {time.perf_counter() - t0:.0f}s", flush=True)
 
 
+# Columns the batch reads; the "split" variant keeps only these in the
+# queried tables and the rest in <table>_cold.
+HOT = {"buildings": "id, names, class, height, num_floors, geometry, bbox",
+       "places": "id, names, taxonomy, confidence, geometry, bbox"}
+
+
 def load(con, args) -> None:
-    # Hilbert order (default): an area query touches few row groups. "x"
-    # sorts by one coordinate; "source" keeps Overture's order.
-    order = {"hilbert": f"ORDER BY ST_Hilbert(geometry, {BOX})", "x": "ORDER BY bbox.xmin",
-             "source": ""}[args.order]
+    """Variants of one layout, all with a declared Hilbert sort (so inserts,
+    merges and rewrites sort): base, trickle (100 small unsorted-across-the-
+    city inserts), compacted (trickle, then merge + expire + cleanup),
+    deleted (10% of rows, spread), rewritten (deleted, then rewrite + expire
+    + cleanup), split (hot columns only in the queried tables)."""
+    v = args.variant
     for name in THEMES:
         t0 = time.perf_counter()
+        src = f"'{DATA}/{name}.parquet'"
+        cols = HOT[name] if v == "split" else "*"
         con.execute(f"DROP TABLE IF EXISTS lake.{name}")
-        con.execute(f"CREATE TABLE lake.{name} AS SELECT * FROM '{DATA}/{name}.parquet' {order}")
-        rows = con.execute(f"SELECT count(*) FROM lake.{name}").fetchone()[0]
-        print(json.dumps({"table": name, "rows": rows, "order": args.order,
+        con.execute(f"CREATE TABLE lake.{name} AS SELECT {cols} FROM {src} LIMIT 0")
+        if args.order == "hilbert":
+            con.execute(f"ALTER TABLE lake.{name} SET SORTED BY (ST_Hilbert(geometry, {BOX}))")
+        elif args.order == "x":
+            con.execute(f"ALTER TABLE lake.{name} SET SORTED BY (bbox.xmin)")
+        if v in ("trickle", "compacted"):
+            for i in range(100):  # arrival order: each insert spans the city
+                con.execute(f"INSERT INTO lake.{name} SELECT {cols} FROM {src} WHERE hash(id) % 100 = {i}")
+        else:
+            con.execute(f"INSERT INTO lake.{name} SELECT {cols} FROM {src}")
+        if v == "split":
+            con.execute(f"CREATE OR REPLACE TABLE lake.{name}_cold AS SELECT * EXCLUDE (names, geometry, bbox"
+                        f"{', class, height, num_floors' if name == 'buildings' else ', taxonomy, confidence'}) "
+                        f"FROM {src}")
+        if v in ("deleted", "rewritten"):
+            con.execute(f"DELETE FROM lake.{name} WHERE hash(id) % 10 = 0")
+        print(json.dumps({"table": name, "variant": v, "order": args.order,
                           "load_s": round(time.perf_counter() - t0, 1)}), flush=True)
+    t0 = time.perf_counter()
+    if v == "compacted":
+        con.execute("CALL ducklake_merge_adjacent_files('lake')")
+    if v == "rewritten":
+        # The default threshold (0.95) would leave 10%-deleted files alone.
+        con.execute("CALL ducklake_rewrite_data_files('lake', delete_threshold => 0.05)")
+    if v in ("compacted", "rewritten"):
+        con.execute("CALL ducklake_expire_snapshots('lake', older_than => now())")
+        con.execute("CALL ducklake_cleanup_old_files('lake', cleanup_all => true)")
+    for name in THEMES:
+        files, deletes = con.execute(
+            f"SELECT count(*), count(delete_file) FROM ducklake_list_files('lake', '{name}')").fetchone()
+        rows = con.execute(f"SELECT count(*) FROM lake.{name}").fetchone()[0]
+        snaps = con.execute("SELECT count(*) FROM ducklake_snapshots('lake')").fetchone()[0]
+        print(json.dumps({"table": name, "rows": rows, "files": files, "delete_files": deletes,
+                          "snapshots": snaps, "maintenance_s": round(time.perf_counter() - t0, 1)}), flush=True)
 
 
 def batch(con, n: int, seed: int) -> list[tuple[str, str]]:

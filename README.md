@@ -144,15 +144,44 @@ times what it must decode in the rest.
 4. **Keep columns typed.** Convert dates, timestamps and numbers from strings
    or epochs at load time (`make_date`, `epoch_ms`, casts). Statistics and
    comparisons on typed columns prune; on strings they mostly don't.
-5. **Prefer few big inserts to many small ones.** Each insert writes its own
-   files and a catalog snapshot. For trickles, let DuckLake inline small
-   inserts (`data_inlining_row_limit`), then periodically run
-   `CALL ducklake_merge_adjacent_files('lake')` and
-   `ducklake_flush_inlined_data`.
-6. **Partition only on low-cardinality columns** (a month, a region) that
+5. **Prefer few big inserts, and compact after trickles.** Each insert writes
+   its own files and a catalog snapshot, and files from separate inserts
+   overlap, so statistics prune less. After small or streaming inserts, run:
+   ```sql
+   CALL ducklake_merge_adjacent_files('lake');
+   CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL 1 HOUR);
+   CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL 1 HOUR);
+   ```
+   Merging recovered most, but not all, of a single sorted load: merged files
+   keep each insert's rows together, so they are not globally sorted. To get
+   it all back, reload into a fresh sorted table.
+6. **Rewrite after deletes and updates.** Deletes go to delete files that every
+   later scan merges in. `ducklake_rewrite_data_files` only rewrites files at
+   least 95% deleted unless you pass a threshold:
+   `CALL ducklake_rewrite_data_files('lake', delete_threshold => 0.05)`, then
+   expire and clean up as above.
+7. **Don't bother splitting hot and cold columns.** Parquet is columnar: a
+   query decodes only the columns it reads, so moving unread columns to a
+   second table didn't change lookup speed.
+8. **Partition only on low-cardinality columns** (a month, a region) that
    nearly every query filters on. Each partition value gets its own files, so
    partitioning on a high-cardinality key makes many tiny files, which is
    worse than a sort.
+9. **Drop statistics on wide, unfiltered columns** (`skip_stats_columns`,
+   in newer DuckLake only) to keep the catalog small. Untested: not in the
+   DuckLake builds for DuckDB 1.5 or the current 2.0 dev.
+
+Maintenance on Houston (Overture, 1M rows; recommended setup, 13 readers, 2
+alternating runs each; `LOAD_ARGS="--variant ..." scripts/lake.sh city`):
+
+| Layout | Files | Snapshots | Warm q/s | Warm p50 | Cold p50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| One sorted load | 4 | 7 | 389–398 | 20 ms | 29–36 ms |
+| 100 small inserts | 200 | 205 | 77–82 | 144–153 ms | 133–153 ms |
+| … then merge, expire, clean up | 4 | 1 | 284–288 | 30–31 ms | 61–66 ms |
+| 10% of rows deleted | 4 (+4 delete files) | 9 | 299–308 | 30 ms | 44–50 ms |
+| … then rewrite, expire, clean up | 2 | 1 | 319–348 | 24–27 ms | 43–48 ms |
+| Hot/cold column split | 3 (+ cold tables) | 9 | 380–399 | 19–20 ms | 35–38 ms |
 
 Measured on ClickBench `hits` (100M rows, 105 columns), 13 readers each running
 a mix of per-site dashboard queries, PostgreSQL on 3 cores
