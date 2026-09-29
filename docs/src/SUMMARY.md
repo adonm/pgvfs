@@ -3,8 +3,7 @@
 [pgvfs](intro.md)
 
 - [Install](install.md)
-- [How it works](model.md)
-- [Credentials](credentials.md)
 - [Loading data](loading.md)
+- [How it works](how-it-works.md)
 - [Performance](performance.md)
 - [Development](development.md)

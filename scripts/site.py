@@ -45,21 +45,26 @@ def fragments(found: list[dict], history: list[dict]) -> None:
         url = f"https://github.com/adonm/pgvfs/releases/download/duckdb-{b['duckdb_version']}/pgvfs.duckdb_extension"
         rows.append(f"| `{b['duckdb_version']}` | `duckdb=={b['wheel']}` | {b['date']} | `{b['commit']}` | [file]({url}) |")
     open(os.path.join(gen, "builds.md"), "w").write("\n".join(rows) + "\n" if found else "No builds published yet.\n")
+    history = [r for r in history if "pass" in r]  # older formats: skipped
     if not history:
         open(os.path.join(gen, "bench.md"), "w").write("No benchmark runs yet.\n")
         return
-    latest = [r for r in history if r["date"] == history[-1]["date"]]
+    latest = [r for r in history if (r["date"], r["commit"]) == (history[-1]["date"], history[-1]["commit"])]
     first = latest[0]
+    warm = sorted((r for r in latest if r["kind"] == "warm"), key=lambda r: r["qps"])
+    shown = [latest[0], warm[len(warm) // 2], latest[-1]] if warm else latest
     lines = [
-        f"Run {first['date']} at commit `{first['commit']}`: {first['queries'] // first['readers']} ClickBench "
-        f"queries per reader, each reader a cold DuckDB with `{first['cores']} / readers` threads, on a "
-        f"{first['cores']}-core GitHub runner. Shared hardware, so read it as a trend, not a score. Full history: "
+        f"Run {first['date']} at commit `{first['commit']}` (`scripts/bench.sh city`): Overture "
+        f"Houston, {first['readers']} readers each running {first['queries'] // first['readers']} "
+        f"area and attribute queries per pass, on a {first['cores']}-core GitHub runner. Shared "
+        "hardware, so read it as a trend, not a score. Full history: "
         "[history.jsonl](https://github.com/adonm/pgvfs/releases/download/bench/history.jsonl).",
         "",
-        "| Readers | Queries/s | p50 | p95 | Geomean |",
-        "| ---: | ---: | ---: | ---: | ---: |",
-    ] + [f"| {r['readers']} | {r['qps']} | {r['p50_ms']} ms | {r['p95_ms']} ms | {r['geomean_ms']} ms |"
-         for r in latest]
+        "| Pass | Queries/s | p50 | p95 | PostgreSQL busy |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ] + [f"| {r['kind']}{' (median)' if r['kind'] == 'warm' else ''} | {r['qps']} | {r['p50_ms']} ms | "
+         f"{r['p95_ms']} ms | {round(100 * r['pg_util']) if r.get('pg_util') is not None else '-'}% |"
+         for r in shown]
     open(os.path.join(gen, "bench.md"), "w").write("\n".join(lines) + "\n")
 
 

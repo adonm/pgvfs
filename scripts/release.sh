@@ -41,14 +41,14 @@ INSTALL pgvfs FROM 'https://pgvfs.adonm.dev';   -- picks this build for DuckDB $
   ;;
 bench)
   bench=${2:?BENCH_JSONL}
-  grep -q '^{' "$bench" || { echo "no benchmark results in $bench" >&2; exit 1; }
+  grep -q '^{"pass' "$bench" || { echo "no benchmark results in $bench" >&2; exit 1; }
   work=$(mktemp -d)
   if ! gh release view bench >/dev/null 2>&1; then
     gh release create bench --prerelease --title "Weekly benchmark history" \
-      --notes "Concurrent-readers benchmark (bench/readers.py), one line per reader count per run."
+      --notes "Weekly benchmark (scripts/bench.sh city): one line per pass per run."
   fi
   gh release download bench --pattern history.jsonl --dir "$work" 2>/dev/null || true
-  grep '^{' "$bench" | python3 -c '
+  grep '^{"pass' "$bench" | python3 -c '
 import json, os, sys
 for line in sys.stdin:
     record = json.loads(line)

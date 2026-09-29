@@ -6,7 +6,7 @@ name: Pages
 on:
   push:
     branches: [main]
-    paths: [README.md, docs/**, scripts/site.py, .github/workflows/pages.yml]
+    paths: [docs/**, scripts/site.py, .github/workflows/pages.yml]
   workflow_call:
   workflow_dispatch:
 

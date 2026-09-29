@@ -9,7 +9,7 @@ batch(con, n, seed) -> [(kind, sql)].
     lake.py DATASET profile --ext EXT --url URL
 
 run: READERS processes each run their own fixed batch PASSES times in
-lockstep. Pass 1 is cold (new DuckDBs; scripts/lake.sh restarts PostgreSQL
+lockstep. Pass 1 is cold (new DuckDBs; scripts/bench.sh restarts PostgreSQL
 first), later passes warm, and a final pass uses new random parameters (warm
 caches, unseen queries). One JSON line per pass, then per-kind latencies.
 profile: one warm query of each kind, split into planning (binding, DuckLake

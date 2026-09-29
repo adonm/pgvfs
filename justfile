@@ -46,7 +46,6 @@ site:
     mise exec -- python3 scripts/site.py .tmp/site --releases .tmp/releases
     @echo "preview: python3 -m http.server -d .tmp/site"
 
-# Concurrent DuckLake readers on a disposable PostgreSQL (bench/readers.py).
-bench *ARGS: ext
-    DUCKDB_PY=$(cat target/ext/release/DUCKDB_PY) EXT=target/ext/release/pgvfs.duckdb_extension \
-      bash scripts/bench.sh {{ ARGS }}
+# Benchmark DuckLake on pgvfs: `city` (1M rows, ~1 min) or `hits` (100M rows, ~4 min).
+bench DATASET="city" *ARGS: ext
+    bash scripts/bench.sh {{ DATASET }} {{ ARGS }}
