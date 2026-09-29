@@ -29,13 +29,29 @@ def download() -> None:
     assert os.path.getsize(SRC) == BYTES, "truncated hits.parquet"
 
 
-def load(con, _args) -> None:
+def load(con, args) -> None:
+    src = f"SELECT {TYPED} FROM read_parquet('{SRC}', binary_as_string = true)"
     t0 = time.perf_counter()
     con.execute("DROP TABLE IF EXISTS lake.hits")
-    # The source is in ClickHouse's key order (CounterID, EventDate, ...), so
-    # site and date filters skip files and row groups without a re-sort.
-    con.execute(f"CREATE TABLE lake.hits AS SELECT {TYPED} "
-                f"FROM read_parquet('{SRC}', binary_as_string = true)")
+    if args.sort:
+        # DuckLake sorts each insert by the declared key. Inserting disjoint
+        # CounterID ranges in order keeps every sort small (bounded memory)
+        # and still puts each site's rows in one run of files. The source's
+        # row-group stats let each range read only its own row groups.
+        con.execute(f"CREATE TABLE lake.hits AS {src} LIMIT 0")
+        con.execute("ALTER TABLE lake.hits SET SORTED BY (CounterID, EventDate, UserID, EventTime)")
+        total = con.execute(f"SELECT count(*) FROM read_parquet('{SRC}')").fetchone()[0]
+        n = max(1, round(total / args.batch_rows))
+        cuts = con.execute(f"SELECT approx_quantile(CounterID, {[i / n for i in range(1, n)]}) "
+                           f"FROM read_parquet('{SRC}')").fetchone()[0] if n > 1 else []
+        bounds = [None, *sorted(set(cuts)), None]
+        for lo, hi in zip(bounds, bounds[1:]):
+            where = " AND ".join(c for c in (lo is not None and f"CounterID >= {lo}",
+                                             hi is not None and f"CounterID < {hi}") if c)
+            con.execute(f"INSERT INTO lake.hits {src} WHERE {where or 'true'}")
+    else:
+        # Source order: nine concatenated sorted runs (ClickHouse parts).
+        con.execute(f"CREATE TABLE lake.hits AS {src}")
     load_s = time.perf_counter() - t0
     # Query parameters from real rows, traffic-weighted: busy sites get
     # queried more. Stored once so readers need not scan 100M rows.
@@ -43,10 +59,19 @@ def load(con, _args) -> None:
     con.execute("CREATE TABLE lake.hits_params AS SELECT CounterID, UserID, EventDate "
                 "FROM lake.hits USING SAMPLE 2000 ROWS (reservoir, 1)")
     rows = con.execute("SELECT count(*) FROM lake.hits").fetchone()[0]
-    files = con.execute("SELECT count(*), sum(data_file_size_bytes) // 1048576 "
-                        "FROM ducklake_list_files('lake', 'hits')").fetchone()
-    print(json.dumps({"table": "hits", "rows": rows, "load_s": round(load_s, 1),
-                      "files": files[0], "mib": files[1]}), flush=True)
+    files = [f[0] for f in con.execute(
+        "SELECT data_file FROM ducklake_list_files('lake', 'hits')").fetchall()]
+    ranges = con.execute(f"""SELECT file_name, min(stats_min_value::BIGINT), max(stats_max_value::BIGINT),
+        count(*) FROM parquet_metadata({files!r}) WHERE path_in_schema = 'CounterID' GROUP BY 1""").fetchall()
+    sites = [r[0] for r in con.execute("SELECT DISTINCT CounterID FROM lake.hits_params").fetchall()]
+    per_site = sorted(sum(lo <= c <= hi for _, lo, hi, _ in ranges) for c in sites)
+    mib = con.execute("SELECT sum(data_file_size_bytes) // 1048576 FROM ducklake_list_files('lake', 'hits')").fetchone()[0]
+    print(json.dumps({"table": "hits", "rows": rows, "sorted": args.sort, "load_s": round(load_s, 1),
+                      "row_group_size": args.row_group_size, "files": len(files), "mib": mib,
+                      "row_groups": sum(r[3] for r in ranges),
+                      # how many files a sampled site's rows can be in (by min/max)
+                      "files_per_site_p50": per_site[len(per_site) // 2], "files_per_site_max": per_site[-1]}),
+          flush=True)
 
 
 def batch(con, n: int, seed: int) -> list[tuple[str, str]]:

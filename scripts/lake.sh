@@ -5,7 +5,10 @@
 # and restarted, so pass 1 starts with its buffers cold (the OS page cache
 # stays warm). READERS single-threaded readers share READER_CPUS (default
 # the rest). MODE=profile times one warm query of each kind instead.
-# Extra args go to lake.py (e.g. --passes 5 --queries 21 --arrow).
+# Extra args go to lake.py run (e.g. --passes 5 --queries 21 --arrow);
+# LOAD_ARGS to lake.py load (e.g. "--no-sort --row-group-size 65536").
+# Memory stays bounded: the load's DuckDB gets LOAD_MEMORY (default 4GiB,
+# spilling to .tmp/duckdb-temp), PostgreSQL PG_MEMORY (default 6g).
 #
 #   scripts/lake.sh hits --passes 5
 set -euo pipefail
@@ -33,10 +36,10 @@ url() { echo "postgres://postgres:postgres@$(docker port "$container" 5432/tcp)/
 
 lake download
 docker run -d --name "$container" -e POSTGRES_PASSWORD=postgres --shm-size=2g \
-  -p 127.0.0.1::5432 "${PG_IMAGE:-postgres:18}" -c shared_buffers=2GB -c max_connections=500 >/dev/null
+  --memory "${PG_MEMORY:-6g}" -p 127.0.0.1::5432 "${PG_IMAGE:-postgres:18}" -c shared_buffers=2GB -c max_connections=500 >/dev/null
 ready
 docker exec "$container" psql -U postgres -qc 'CREATE DATABASE lake'
-lake load --ext "$ext" --url "$(url)"
+lake load --ext "$ext" --url "$(url)" --load-memory "${LOAD_MEMORY:-4GiB}" ${LOAD_ARGS:-}
 docker update --cpuset-cpus "$pg_cpus" "$container" >/dev/null
 docker restart "$container" >/dev/null  # also re-maps the host port
 ready

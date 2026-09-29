@@ -48,7 +48,12 @@ def connect(ds, args) -> duckdb.DuckDBPyConnection:
 
 def load(ds, args) -> None:
     con = connect(ds, args)
-    con.execute("CALL lake.set_option('parquet_row_group_size', 8192)")
+    # Bounded, whatever the dataset: sorts that do not fit spill to disk.
+    con.execute(f"SET memory_limit = '{args.load_memory}'")
+    con.execute(f"SET threads = {min(8, os.cpu_count())}")
+    con.execute("SET preserve_insertion_order = false")
+    con.execute("SET temp_directory = '.tmp/duckdb-temp'")
+    con.execute(f"CALL lake.set_option('parquet_row_group_size', {args.row_group_size})")
     con.execute(f"CALL lake.set_option('parquet_compression', '{args.compression}')")
     ds.load(con, args)
 
@@ -196,6 +201,10 @@ def main() -> None:
     ap.add_argument("--readers", type=int, default=1)
     ap.add_argument("--memory-limit", help="per DuckDB, e.g. 2GiB")
     ap.add_argument("--compression", default="lz4", help="load: the lake's parquet_compression")
+    ap.add_argument("--row-group-size", type=int, default=8192, help="load: the lake's parquet_row_group_size")
+    ap.add_argument("--no-sort", dest="sort", action="store_false", help="load: keep source order")
+    ap.add_argument("--load-memory", default="4GiB", help="load: DuckDB memory_limit (sorts spill beyond it)")
+    ap.add_argument("--batch-rows", type=int, default=5_000_000, help="load: rows per sorted insert")
     ap.add_argument("--arrow", action="store_true", help="fetch Arrow tables, not Python tuples")
     ap.add_argument("--reader-cpus", help="pin readers, e.g. 3-15")
     ap.add_argument("--pg-cpus", help="Postgres's cores, for utilisation")
