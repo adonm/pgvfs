@@ -1,0 +1,28 @@
+[package]
+name = "pgvfs"
+version = "0.1.0"
+edition = "2021"
+description = "DuckDB pgvfs:// filesystem: DuckLake data files as PostgreSQL rows"
+license = "Apache-2.0"
+repository = "https://github.com/adonm/pgvfs"
+
+[lib]
+# rlib for the contract tests; staticlib for the DuckDB extension (extension/).
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+futures = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-postgres = "0.7.18"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
+# The staticlib keeps its symbols; extension/build.sh strips the final
+# extension after linking.
+[profile.release]
+lto = "fat"
+codegen-units = 1

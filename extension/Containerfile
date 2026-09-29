@@ -1,0 +1,44 @@
+# The pgvfs DuckDB extension, linked the way DuckDB's own loadable
+# extensions are: statically against duckdb_static of the exact release that
+# will load it (DuckDB's Python module loads with RTLD_LOCAL, so an extension
+# cannot rely on the host's C++ symbols). The release's prebuilt static libs
+# are used, so DuckDB itself is never compiled. Build context: the repo root.
+#
+#   just ext   # -> target/ext/pgvfs.duckdb_extension
+#
+# DUCKDB_VERSION must equal the loading DuckDB's version (PRAGMA version);
+# bump both digests with it. linux_amd64 only.
+ARG DUCKDB_VERSION=v1.5.6
+ARG DUCKDB_SRC_SHA256=1fadcbe9e69e1470f9093b6bcde08daf477d729c449e59a807f45c346622099b
+ARG DUCKDB_LIBS_SHA256=ab3d1d33951b8cb8bdcae740d8e06adf66bfb7ee880a3f7052d7a35088e16d2d
+
+FROM rust:1-bookworm AS rust
+WORKDIR /src
+COPY Cargo.toml Cargo.lock schema.sql ./
+COPY src/ src/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --locked --lib \
+ && cp target/release/libpgvfs.a /libpgvfs.a
+
+FROM debian:bookworm AS duckdb
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends binutils ca-certificates cmake curl g++ unzip \
+ && rm -rf /var/lib/apt/lists/*
+ARG DUCKDB_VERSION
+ARG DUCKDB_SRC_SHA256
+ARG DUCKDB_LIBS_SHA256
+RUN curl -fsSL -o /src.tar.gz \
+      "https://github.com/duckdb/duckdb/archive/refs/tags/$DUCKDB_VERSION.tar.gz" \
+ && curl -fsSL -o /libs.zip \
+      "https://github.com/duckdb/duckdb/releases/download/$DUCKDB_VERSION/static-libs-linux-amd64.zip" \
+ && printf '%s  /src.tar.gz\n%s  /libs.zip\n' "$DUCKDB_SRC_SHA256" "$DUCKDB_LIBS_SHA256" | sha256sum -c - \
+ && mkdir /duckdb /libs \
+ && tar xzf /src.tar.gz -C /duckdb --strip-components 1 \
+ && unzip -q /libs.zip -d /libs \
+ && rm /src.tar.gz /libs.zip
+COPY extension/ /ext/
+COPY --from=rust /libpgvfs.a /libpgvfs.a
+RUN bash /ext/build.sh /duckdb /libs /libpgvfs.a "$DUCKDB_VERSION" /pgvfs.duckdb_extension
+
+FROM scratch
+COPY --from=duckdb /pgvfs.duckdb_extension /

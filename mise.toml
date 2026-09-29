@@ -1,0 +1,6 @@
+# Toolchain pins: `mise install` before just recipes.
+[tools]
+just = "1"
+rust = "stable"
+uv = "0.12"
+python = "3.12"

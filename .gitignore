@@ -1,0 +1,5 @@
+/target
+/.tmp/
+__pycache__/
+*.duckdb
+*.duckdb.wal
