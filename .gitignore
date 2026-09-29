@@ -4,3 +4,4 @@ __pycache__/
 *.duckdb
 *.duckdb.wal
 /build
+/.cache
