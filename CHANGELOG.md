@@ -4,6 +4,11 @@ pgvfs is in beta: the SQL interface and configuration are expected to stay,
 but storage layout changes are still possible (see "Storage layout" in the
 docs). Each release lists its layout version.
 
+## Unreleased
+
+- Restore Intel and Apple Silicon macOS targets in the distribution workflow
+  and community submission.
+
 ## 0.2.0-beta.2
 
 Storage layout: **v2** (unchanged).

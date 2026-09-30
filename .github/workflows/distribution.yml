@@ -1,9 +1,9 @@
 name: Distribution
 
-# Builds and tests the extension for every platform with DuckDB's own
+# Builds and tests the extension for supported platforms with DuckDB's own
 # extension pipeline: the same one DuckDB's community-extensions repository
 # runs, so a green run here means the community build will work. It compiles
-# DuckDB for three platforms (~25 min), so it runs on tags, weekly and by hand.
+# DuckDB, so it runs on tags, weekly and by hand.
 on:
   push:
     tags: ["v*"]
@@ -24,7 +24,6 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: pgvfs
       extra_toolchains: rust
-      # No sockets in WebAssembly; MinGW is not a supported target;
-      # macOS is left out for now (DuckDB's macOS runners queue for hours).
-      exclude_archs: "osx_amd64;osx_arm64;wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools"
+      # No sockets in WebAssembly; MinGW is not a supported target.
+      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools"
       opt_in_archs: "linux_amd64_musl;linux_arm64_musl"
