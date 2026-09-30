@@ -39,9 +39,10 @@ C API can use filesystems but cannot register one.
 
 A C++ DuckDB extension must be statically linked against the exact DuckDB
 build that loads it, as DuckDB's own extensions are (Python loads DuckDB with
-`RTLD_LOCAL`, so the host's symbols are out of reach). DuckDB is never
-compiled here: `scripts/duckdb.sh` fetches headers and prebuilt static
-libraries, and the container only links (`extension/build.sh`, a few seconds).
+`RTLD_LOCAL`, so the host's symbols are out of reach). The fast container
+build does not compile DuckDB: `scripts/duckdb.sh` fetches headers and
+prebuilt static libraries, and the container only links (`extension/build.sh`,
+a few seconds).
 
 - **release:** the release's `static-libs-linux-amd64.zip` and source tarball,
   pinned by SHA-256 in `scripts/duckdb.sh`. To move to a new release, update
@@ -64,6 +65,11 @@ container build above stays for fast local work and for 2.0 dev builds.
 
 ## CI and releases
 
+- **Community releases:** DuckDB builds and signs pgvfs for `INSTALL pgvfs
+  FROM community`. Updates are submitted to
+  [duckdb/community-extensions](https://github.com/duckdb/community-extensions/tree/main/extensions/pgvfs),
+  pinning the release commit in `description.yml`. Our weekly unsigned
+  builds remain available for 2.0 dev versions.
 - **Each push** (`ci.yml`): `just check`, then the contract on PostgreSQL 18
   and end-to-end tests for the stable build.
 - **Tags, weekly and by hand** (`distribution.yml`): the multi-platform build

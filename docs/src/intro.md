@@ -18,14 +18,14 @@ It suits lakes that fit comfortably in one PostgreSQL (tested to 100M rows,
 queries: map layers, per-customer analytics, APIs over DuckLake.
 
 ```sql
-INSTALL pgvfs FROM 'https://pgvfs.adonm.dev';  -- allow_unsigned_extensions
+INSTALL pgvfs FROM community;
 LOAD pgvfs;
-CREATE SECRET (TYPE postgres, HOST 'db', USER 'lake', PASSWORD '...', DATABASE 'lake');
-ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 'pgvfs://lake/');
 ```
 
-Start with [Install](install.md), then [Loading data](loading.md): how a lake
-is laid out decides most of its read speed.
+Signed builds need no `-unsigned` flag. Start with [Install](install.md) for
+a runnable DuckLake example, then [Loading data](loading.md): how a lake is
+laid out decides most of its read speed.
 
-Source: <https://github.com/adonm/pgvfs> (Apache-2.0). Alpha: layout changes
-need a fresh database, and there are no versioned releases yet.
+Source: <https://github.com/adonm/pgvfs> (Apache-2.0). Beta, storage layout v2;
+see the [changelog](https://github.com/adonm/pgvfs/blob/main/CHANGELOG.md) and
+[layout compatibility policy](how-it-works.md#storage-layout-versions).

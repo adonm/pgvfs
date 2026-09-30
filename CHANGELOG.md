@@ -8,6 +8,8 @@ docs). Each release lists its layout version.
 
 - Restore Intel and Apple Silicon macOS targets in the distribution workflow
   and community submission.
+- Document signed community installation and a self-contained DuckLake quick
+  start, with separate instructions for unsigned 2.0 dev builds.
 
 ## 0.2.0-beta.2
 
