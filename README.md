@@ -23,7 +23,8 @@ updating an older installation, and 2.0 dev builds.
 ## Quick start
 
 Use an existing PostgreSQL database and a writer role that can create
-schemas, or start the [local demo](https://pgvfs.adonm.dev/install.html#quick-start).
+schemas and catalog tables, or start the
+[local demo](https://pgvfs.adonm.dev/install.html#quick-start).
 The credentials below are for that demo; replace them for your own server.
 
 ```sql

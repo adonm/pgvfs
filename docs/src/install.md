@@ -37,8 +37,9 @@ Run the same quick-start SQL below with `con.execute(...)`.
 ## Quick start
 
 The PostgreSQL database must already exist. Use a writer role that can
-create schemas there. The first write creates pgvfs's schema automatically;
-see [roles](how-it-works.md#roles) for production permissions.
+create schemas and DuckLake catalog tables there; a database owner role
+suffices. The first write creates pgvfs's schema automatically; see
+[roles](how-it-works.md#roles) for production permissions.
 
 For an optional **throwaway local demo**, start PostgreSQL with Docker:
 
@@ -102,9 +103,10 @@ ATTACH 'ducklake:postgres:' AS lake (READ_ONLY);
 SELECT count(*) FROM lake.events; -- 3
 ```
 
-The reader role needs `USAGE` and `SELECT` on both the DuckLake catalog and
-pgvfs schemas. The same attach works on a streaming read replica. A writer
-can attach without `READ_ONLY`, but only one process may write at a time.
+The reader role needs `USAGE` on both the DuckLake catalog and pgvfs schemas,
+and `SELECT` on their tables. The same attach works on a streaming read
+replica. A writer can attach without `READ_ONLY`, but only one process may
+write at a time.
 
 ## Switch from an unsigned installation
 
