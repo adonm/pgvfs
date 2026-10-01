@@ -3,8 +3,9 @@
 `pgvfs://` is a DuckDB filesystem that stores DuckLake's data files as rows in
 PostgreSQL. Put the DuckLake catalog in the same database and one PostgreSQL
 is the whole lake: one secret, one backup, one set of roles. Any number of
-DuckDB readers query it directly, with no object store, gateway or HTTP. One
-process writes.
+DuckDB readers query it directly, with no object store, gateway or HTTP, so
+lookups take milliseconds. One process writes. Works on any PostgreSQL 11+,
+including Amazon Aurora.
 
 Documentation: **<https://pgvfs.adonm.dev>**
 

@@ -11,7 +11,8 @@ docs). Each release lists its layout version.
 - Document signed community installation and a self-contained DuckLake quick
   start, with separate instructions for unsigned 2.0 dev builds.
 - Docs: tested on Amazon Aurora PostgreSQL; a "Related projects" section
-  (Aurora direct querying, pg_duckdb, pg_lake).
+  (Aurora direct querying, pg_duckdb, pg_lake) and how pgvfs's millisecond
+  lookups compare.
 
 ## 0.2.0-beta.2
 

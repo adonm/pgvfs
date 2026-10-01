@@ -8,9 +8,10 @@ is the whole lake:
   credentials, no gateway.
 - **Many readers, one writer.** Readers need only `SELECT`, take no locks and
   can run on read replicas. One process writes at a time.
-- **Fast reads.** Files are immutable, so DuckDB caches them without
+- **Millisecond reads.** Files are immutable, so DuckDB caches them without
   revalidating. Reads are primary-key range queries straight into DuckDB's
-  buffers.
+  buffers: a block read takes about 0.1–0.2 ms, and lookups on a well-laid-out
+  lake take single-digit milliseconds (see [Performance](performance.md)).
 - **Plain PostgreSQL 11+.** No extensions and no superuser needed, so managed
   services work too; tested on Amazon Aurora PostgreSQL (with password
   authentication; RDS IAM tokens aren't supported).
@@ -41,6 +42,12 @@ PostgreSQL clients, use one of these instead:
   PostgreSQL, reading Parquet, Iceberg and Delta files.
 - [pg_lake](https://github.com/Snowflake-Labs/pg_lake): Iceberg tables and
   data lake files in PostgreSQL, using DuckDB to execute queries.
+
+They suit scans and analytics over large lakes, but not millisecond lookups.
+In our testing, only pgvfs served lake queries in milliseconds: the others read
+from object storage, where each request takes tens of milliseconds. Aurora's
+announcement likewise recommends copying lake data into native tables when a
+query needs single-digit-millisecond latency.
 
 Source: <https://github.com/adonm/pgvfs> (Apache-2.0). Beta, storage layout v2;
 see the [changelog](https://github.com/adonm/pgvfs/blob/main/CHANGELOG.md) and
