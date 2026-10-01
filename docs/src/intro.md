@@ -11,7 +11,9 @@ is the whole lake:
 - **Fast reads.** Files are immutable, so DuckDB caches them without
   revalidating. Reads are primary-key range queries straight into DuckDB's
   buffers.
-- **Plain PostgreSQL 11+.** No extensions and no superuser needed.
+- **Plain PostgreSQL 11+.** No extensions and no superuser needed, so managed
+  services work too; tested on Amazon Aurora PostgreSQL (with password
+  authentication; RDS IAM tokens aren't supported).
 
 It suits lakes that fit comfortably in one PostgreSQL (tested to 100M rows,
 14 GB) with many concurrent readers doing lookups and dashboard-style
@@ -25,6 +27,20 @@ LOAD pgvfs;
 Signed builds need no `-unsigned` flag. Start with [Install](install.md) for
 a runnable DuckLake example, then [Loading data](loading.md): how a lake is
 laid out decides most of its read speed.
+
+## Related projects
+
+pgvfs keeps the lake inside PostgreSQL and reads it from DuckDB. To go the
+other way, querying Parquet or Iceberg files in object storage from
+PostgreSQL clients, use one of these instead:
+
+- [Aurora PostgreSQL direct querying](https://aws.amazon.com/blogs/aws/amazon-aurora-postgresql-now-supports-direct-querying-of-apache-iceberg-and-parquet-data-in-your-data-lake/)
+  (`aurora_analytics`): DuckDB inside Aurora, reading S3, S3 Tables and Glue
+  or Iceberg REST catalogs as foreign tables.
+- [pg_duckdb](https://github.com/duckdb/pg_duckdb): DuckDB inside any
+  PostgreSQL, reading Parquet, Iceberg and Delta files.
+- [pg_lake](https://github.com/Snowflake-Labs/pg_lake): Iceberg tables and
+  data lake files in PostgreSQL, using DuckDB to execute queries.
 
 Source: <https://github.com/adonm/pgvfs> (Apache-2.0). Beta, storage layout v2;
 see the [changelog](https://github.com/adonm/pgvfs/blob/main/CHANGELOG.md) and
