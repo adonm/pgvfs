@@ -4,7 +4,9 @@ pgvfs is in beta: the SQL interface and configuration are expected to stay,
 but storage layout changes are still possible (see "Storage layout" in the
 docs). Each release lists its layout version.
 
-## Unreleased
+## 0.2.0-beta.3
+
+Storage layout: **v2** (unchanged).
 
 - Restore Intel and Apple Silicon macOS targets in the distribution workflow
   and community submission.
@@ -13,6 +15,19 @@ docs). Each release lists its layout version.
 - Docs: tested on Amazon Aurora PostgreSQL; a "Related projects" section
   (Aurora direct querying, pg_duckdb, pg_lake) and how pgvfs's millisecond
   lookups compare.
+- Docs: the recommended layout is now zstd and Parquet V2. LZ4 stores 55–58%
+  more but serves 25–35% more queries/s to CPU-bound readers; the guide
+  covers when to pick it. Loading data adds registering pre-written
+  files for big loads, commit sizing, JSON over VARIANT payloads, snapshot
+  retention, why to keep positional delete files, and how to check pruning.
+- `pgvfs_stats` has a function description, so `duckdb_functions()` and the
+  community extension page describe it.
+- Benchmarks load with zstd and Parquet V2 (was LZ4, V1). Weekly results
+  drop accordingly (Houston warm throughput about 30% lower on the same
+  machine) and are not comparable with earlier runs. Each benchmark record
+  now includes the lake's layout.
+- The end-to-end test covers copying finished Parquet into pgvfs with
+  `FORMAT blob` and registering it with `ducklake_add_data_files`.
 
 ## 0.2.0-beta.2
 

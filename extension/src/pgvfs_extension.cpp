@@ -19,6 +19,7 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 
 #include <cstdlib>
 #include <mutex>
@@ -515,7 +516,8 @@ void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 	config.AddExtensionOption("pgvfs_secret",
-	                          "postgres secret for pgvfs:// (else $PGVFS_URL, else the default postgres secret)",
+	                          "Name of the postgres secret pgvfs:// connects with. Unset: $PGVFS_URL, else the "
+	                          "unnamed default postgres secret (the one DuckLake's catalog uses)",
 	                          LogicalType::VARCHAR);
 	// Cache Parquet footers across queries (off by default in DuckDB). Safe:
 	// the cache is keyed by path and last-modified time, and a pgvfs path's
@@ -527,7 +529,13 @@ void LoadInternal(ExtensionLoader &loader) {
 	db.GetFileSystem().RegisterSubSystem(make_uniq<PgvfsFileSystem>());
 	ScalarFunction stats("pgvfs_stats", vector<LogicalType> {}, LogicalType::VARCHAR, StatsFunction);
 	stats.SetVolatile();
-	loader.RegisterFunction(stats);
+	CreateScalarFunctionInfo stats_info(stats);
+	FunctionDescription stats_doc;
+	stats_doc.description = "This process's pgvfs counters as JSON: file opens and open-cache hits, reads, bytes, "
+	                        "time spent in pgvfs and range queries sent to PostgreSQL. Cumulative; diff two samples.";
+	stats_doc.examples = {"pgvfs_stats()::JSON"};
+	stats_info.descriptions.push_back(std::move(stats_doc));
+	loader.RegisterFunction(std::move(stats_info));
 }
 
 } // namespace

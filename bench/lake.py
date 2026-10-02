@@ -57,8 +57,22 @@ def load(ds, args) -> None:
     con.execute("SET temp_directory = '.tmp/duckdb-temp'")
     con.execute(f"CALL lake.set_option('parquet_row_group_size', {args.row_group_size})")
     con.execute(f"CALL lake.set_option('parquet_compression', '{args.compression}')")
+    con.execute(f"CALL lake.set_option('parquet_version', {args.parquet_version})")
     con.execute(f"CALL lake.set_option('target_file_size', '{args.target_file_size}')")
     ds.load(con, args)
+
+
+def layout(ds, args) -> str:
+    """The lake's file layout, e.g. "zstd V2, 8192-row groups, 64MB files"."""
+    con = connect(ds, args)
+    opts = dict(con.execute("SELECT option_name, value FROM lake.options() WHERE option_name IN "
+                            "('parquet_compression', 'parquet_version', 'parquet_row_group_size', "
+                            "'target_file_size')").fetchall())
+    con.close()
+    size = opts.get("target_file_size", "512MB")
+    size = f"{int(size) // 10**6}MB" if size.isdigit() else size  # stored in bytes
+    return (f"{opts.get('parquet_compression', 'snappy')} {opts.get('parquet_version', 'V1')}, "
+            f"{opts.get('parquet_row_group_size', '122880')}-row groups, {size} files")
 
 
 def fetch(con, sql: str, arrow: bool = False) -> int:
@@ -132,6 +146,7 @@ def pgvfs_summary(deltas: list[dict], query_ms: float) -> dict:
 
 
 def run(ds, args) -> None:
+    lake_layout = layout(ds, args)
     reader_cores = len(cpus(args.reader_cpus)) or os.cpu_count()
     threads = max(1, reader_cores // args.readers)
     ctx = mp.get_context("spawn")
@@ -164,6 +179,7 @@ def run(ds, args) -> None:
             "rows": sum(r[p][1] for r in results),
             "pgvfs": pgvfs_summary([r[p][2] for r in results], sum(times)),
             "pg_util": round((marks[p + 1][1] - marks[p][1]) / wall / pg_cores, 2) if pg_cores else None,
+            "layout": lake_layout,
         }), flush=True)
     print(json.dumps({"p50_ms_by_kind": {k: {label: pct(v, .5) for label, v in by.items()}
                                          for k, by in kinds.items()}}), flush=True)
@@ -218,7 +234,8 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--readers", type=int, default=1)
     ap.add_argument("--memory-limit", help="per DuckDB, e.g. 2GiB")
-    ap.add_argument("--compression", default="lz4", help="load: the lake's parquet_compression")
+    ap.add_argument("--compression", default="zstd", help="load: the lake's parquet_compression")
+    ap.add_argument("--parquet-version", type=int, default=2, choices=[1, 2], help="load: the lake's parquet_version")
     ap.add_argument("--row-group-size", type=int, default=8192, help="load: the lake's parquet_row_group_size")
     ap.add_argument("--no-sort", dest="sort", action="store_false", help="load: keep source order")
     ap.add_argument("--target-file-size", default="64MB", help="load: the lake's target_file_size")

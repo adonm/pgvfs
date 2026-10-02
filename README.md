@@ -42,8 +42,9 @@ CREATE SECRET (
 ATTACH 'ducklake:postgres:' AS lake (DATA_PATH 'pgvfs://lake/');
 
 -- once per lake, before the first insert: the fast layout
+CALL lake.set_option('parquet_compression', 'zstd');
+CALL lake.set_option('parquet_version', 2);
 CALL lake.set_option('parquet_row_group_size', 8192);
-CALL lake.set_option('parquet_compression', 'lz4');
 CALL lake.set_option('target_file_size', '64MB');
 
 CREATE TABLE lake.events (site_id INTEGER, day DATE, value DOUBLE);
@@ -67,7 +68,7 @@ and pgvfs tables. Only one process writes. For remote PostgreSQL, add
 
 - [Install](https://pgvfs.adonm.dev/install.html): builds, versions, Python.
 - [Loading data](https://pgvfs.adonm.dev/loading.html): lay out a lake for
-  fast reads, and keep it fast.
+  fast reads, load at scale, and keep it fast.
 - [How it works](https://pgvfs.adonm.dev/how-it-works.html): storage, one
   writer and many readers, credentials, configuration.
 - [Performance](https://pgvfs.adonm.dev/performance.html): benchmarks and

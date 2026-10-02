@@ -40,8 +40,13 @@ Absolute numbers moved by up to 1.7× with the laptop's other load (warm
 Houston ran at 390–660 queries/s on the same day), so compare rows within a
 table: those runs alternated under the same conditions.
 
-**Automatic defaults.** LZ4 plus the Parquet footer cache took 13 Houston
-readers from 292 to 415 queries/s (p50 28.5 → 18.4 ms).
+**Compression and the footer cache.** LZ4 instead of snappy, plus the
+Parquet footer cache pgvfs now turns on, took 13 Houston readers from 292 to
+415 queries/s (p50 28.5 → 18.4 ms). The benchmarks now load with
+[zstd and Parquet V2](loading.md#1-set-the-lake-options-before-the-first-insert),
+which read 36% fewer bytes but served 25–35% fewer queries/s than LZ4 on
+Houston. The weekly history records each run's layout; the other results on
+this page used LZ4.
 
 **Against an S3 gateway.** Full ClickBench (100M rows) through DuckDB's httpfs
 and [pgvs3](https://github.com/adonm/pgvs3), a PostgreSQL-backed S3 gateway,

@@ -56,7 +56,8 @@ def fragments(found: list[dict], history: list[dict]) -> None:
     lines = [
         f"Run {first['date']} at commit `{first['commit']}` (`scripts/bench.sh city`): Overture "
         f"Houston, {first['readers']} readers each running {first['queries'] // first['readers']} "
-        f"area and attribute queries per pass, on a {first['cores']}-core GitHub runner. Shared "
+        f"area and attribute queries per pass, on a {first['cores']}-core GitHub runner"
+        f"{'; lake layout ' + first['layout'] if first.get('layout') else ''}. Shared "
         "hardware, so read it as a trend, not a score. Full history: "
         "[history.jsonl](https://github.com/adonm/pgvfs/releases/download/bench/history.jsonl).",
         "",

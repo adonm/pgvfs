@@ -11,6 +11,7 @@ volume, so reruns never collide.
 import json
 import os
 import sys
+import tempfile
 import time
 from urllib.parse import unquote, urlsplit
 
@@ -83,7 +84,8 @@ con.execute(
     f"(DATA_PATH '{root}/lake/', METADATA_SCHEMA '{schema}')"
 )
 con.execute("CALL lake.set_option('parquet_row_group_size', 8192)")
-con.execute("CALL lake.set_option('parquet_compression', 'lz4')")
+con.execute("CALL lake.set_option('parquet_compression', 'zstd')")
+con.execute("CALL lake.set_option('parquet_version', 2)")
 con.execute("CALL lake.set_option('target_file_size', '64MB')")
 con.execute("CREATE TABLE lake.t AS SELECT i, i % 7 AS k FROM range(100000) t(i)")
 con.execute("INSERT INTO lake.t SELECT i, i % 7 FROM range(100000, 150000) t(i)")
@@ -91,6 +93,19 @@ assert one(con, "SELECT count(*), sum(k) FROM lake.t") == (
     150000,
     sum(i % 7 for i in range(150000)),
 )
+
+# Files written elsewhere, byte-copied into pgvfs and registered (loading.md).
+staged = os.path.join(tempfile.mkdtemp(), "staged.parquet")
+con.execute(
+    f"COPY (SELECT i, i % 7 AS k FROM range(150000, 160000) t(i)) TO '{staged}' "
+    "(FORMAT parquet, COMPRESSION zstd, PARQUET_VERSION V2, ROW_GROUP_SIZE 8192)"
+)
+copied = f"{root}/lake/main/t/staged.parquet"
+con.execute(f"COPY (SELECT content FROM read_blob('{staged}')) TO '{copied}' (FORMAT blob)")
+assert one(con, f"SELECT size FROM read_blob('{copied}')") == (os.path.getsize(staged),)
+con.execute(f"CALL ducklake_add_data_files('lake', 't', ['{copied}'])")
+assert one(con, "SELECT count(*) FROM lake.t WHERE i >= 150000") == (10000,)
+con.execute("DELETE FROM lake.t WHERE i >= 150000")
 con.execute("DELETE FROM lake.t WHERE k = 0")
 assert one(con, "SELECT count(*) FROM lake.t WHERE k = 0") == (0,)
 files = one(con, f"SELECT count(*) FROM glob('{root}/lake/**')")[0]
