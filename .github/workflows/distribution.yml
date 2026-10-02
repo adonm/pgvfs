@@ -27,3 +27,17 @@ jobs:
       # No sockets in WebAssembly; MinGW is not a supported target.
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools"
       opt_in_archs: "linux_amd64_musl;linux_arm64_musl"
+
+  # The same build against DuckDB's 2.0 branch, so breakage shows up here
+  # rather than on 2.0's release day. What DuckDB's community repository runs
+  # as "Community Extension with latest DuckDB" for ref_next.
+  duckdb-next-build:
+    name: Build extension binaries (DuckDB 2.0)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: main
+      extension_name: pgvfs
+      extra_toolchains: rust
+      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools"
+      opt_in_archs: "linux_amd64_musl;linux_arm64_musl"
