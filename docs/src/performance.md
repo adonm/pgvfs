@@ -32,6 +32,13 @@ pool from each DuckDB's `threads` setting.
 For many small lookups, 2 threads per reader halves latency for about 7% less
 throughput. For wide scans it costs about 35%.
 
+Fewer threads also lower peak memory on an aggregation that would not fit:
+each thread aggregates into its own hash table, so a query grouping on millions
+of distinct values can approach `threads × groups` of memory
+([DuckDB on dimension tables](https://duckdb.org/2026/10/02/dimension-tables)).
+Narrower group keys shrink each entry but not the count, and data clustered by
+the group key helps too.
+
 ## Reference results
 
 All on one 16-core laptop, DuckDB 1.5.6, PostgreSQL 18 in a container.
@@ -59,6 +66,17 @@ revalidation are gone. [Records](https://github.com/adonm/pgvfs/blob/main/docs/r
 read costs mostly its bytes: alone, 8 KB takes 0.11 ms and 115 KB 0.2 ms, of
 which PostgreSQL executes 0.01–0.03 ms. Under load the rest is queueing for
 CPU.
+
+**Schema shape.** The layout decides which bytes a query fetches; column types
+decide what it does with them. DuckDB measures the same timestamp column at
+0.9 s aggregated as `TIMESTAMP` against 3.9 s as `VARCHAR`
+([its schema guide](https://duckdb.org/docs/current/guides/performance/schema)),
+and DuckLake takes only `NOT NULL`, so unlike a plain DuckDB table there are no
+keys or indexes to declare. Replacing long repeated strings with narrow integer
+keys is the change that shrinks a lake's bytes rather than just its read set
+([dimension tables](https://duckdb.org/2026/10/02/dimension-tables));
+[Loading data](loading.md#4-keep-columns-typed-and-narrow) has the pattern.
+Not measured here.
 
 **Tried, and not worth it:**
 

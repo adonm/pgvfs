@@ -79,11 +79,24 @@ Each sort stays small, and ranges don't overlap across files, so a filtered
 query opens one or two files instead of all of them. `bench/hits.py` shows
 the pattern.
 
-## 4. Keep columns typed
+## 4. Keep columns typed and narrow
 
 Convert dates, timestamps and numbers from strings or epochs at load time
 (`make_date`, `epoch_ms`, casts). Statistics on typed columns prune; on
-strings they mostly don't.
+strings they mostly don't. DuckDB quantifies the rest in its
+[performance guide](https://duckdb.org/docs/current/guides/performance/schema):
+one timestamp column aggregated as `TIMESTAMP` took 0.9 s and 3.3 GB, the same
+values as `VARCHAR` 3.9 s and 5.2 GB, and a join on a `VARCHAR` key ran 1.8×
+slower than on a `BIGINT`.
+
+Parquet stores a fixed-width type at its declared width whatever the values
+are, so use the narrowest type that holds them: `INTEGER` and `DATE` shrink the
+file as well as the memory and the comparisons. That is worth more here than
+DuckDB's note suggests, because DuckDB's own file format bitpacks small values
+into wide columns while Parquet does not.
+
+There are no keys or indexes to declare: DuckLake supports only `NOT NULL`, so
+`PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` and `CHECK` are rejected outright.
 
 Store nested payloads as `JSON` (text in Parquet), with the fields queries
 filter on as typed columns beside them. On DuckDB 1.5.6, shredded `VARIANT`
@@ -91,6 +104,49 @@ was 14–19× slower than JSON both for reading payloads whole and for
 filtering or aggregating on one field inside them, at the same storage, and
 JSON loaded about 35% faster. A 2.0 nightly through DuckLake was still 5–7×
 slower.
+
+### Group on a narrow key, not a long string
+
+Grouping on a long, repeated string hashes and compares every byte of it for
+every row, and copies it into the hash table. DuckDB's
+[write-up on dimension tables](https://duckdb.org/2026/10/02/dimension-tables)
+moves those values into a small dimension table keyed by a narrow integer,
+aggregates on the key, and joins the strings back once the result is small:
+
+```sql
+-- the distinct strings, once, keyed in string order
+CREATE TABLE lake.station_names AS
+    SELECT station_name,
+           (row_number() OVER (ORDER BY station_name))::USMALLINT AS station_id
+    FROM (SELECT DISTINCT station_name FROM lake.stops WHERE station_name IS NOT NULL);
+
+-- the fact table then stores station_id in place of station_name
+```
+
+Size the key to the cardinality: `UTINYINT` holds 255 distinct values,
+`USMALLINT` 65,535, `UINTEGER` about 4.3 billion. Keep the `ORDER BY`, so
+`ORDER BY station_id` still means alphabetical and a rebuild of the same data
+assigns the same keys.
+
+- **The dimension table is small enough to stay cached**, so its join costs
+  almost nothing. The win is in the fact table's column: fewer bytes to fetch
+  from PostgreSQL, and a key that sorts and prunes like any other integer,
+  where a string column's Parquet statistics are truncated prefixes.
+- **A small, dense key range skips hashing.** The optimizer then uses a
+  perfect hash aggregate, indexing by the key (`perfect_ht_threshold`).
+- **Add unseen values with an `ANTI JOIN`** so existing keys stay put. Later
+  keys stop following alphabetical order, so rebuild and re-key if a query
+  relies on `ORDER BY station_id` meaning alphabetical.
+- **`ENUM` is the built-in form of this**, but its values are fixed when the
+  type is created, so a lake that keeps taking new values wants the dimension
+  table.
+
+Skip it when the strings are short (up to 12 bytes are stored inline anyway),
+the column is nearly unique, the data is read once, or nothing groups on it.
+Narrower keys also do not reduce the *number* of groups: every thread
+aggregates into its own hash table, so an aggregation whose groups approach the
+rows each thread sees wants fewer threads instead (see
+[Sizing](performance.md#sizing)). Not measured here.
 
 ## 5. For big or continuous loads, write files elsewhere and register them
 
