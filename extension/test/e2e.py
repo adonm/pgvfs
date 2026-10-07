@@ -17,6 +17,8 @@ from urllib.parse import unquote, urlsplit
 
 import duckdb
 
+from search import check_search
+
 ext = sys.argv[1]
 url = urlsplit(os.environ["PGVFS_TEST_URL"])
 os.environ.pop("PGVFS_URL", None)  # exercise the secret, not the env fallback
@@ -48,6 +50,8 @@ def one(con, sql, *args):
 con = connect()
 assert one(con, "SELECT current_setting('parquet_metadata_cache')") == (True,), "footer cache not on"
 stats0 = json.loads(one(con, "SELECT pgvfs_stats()")[0])
+with tempfile.TemporaryDirectory() as local_root:
+    check_search(con, local_root)
 
 # Parquet round trip, including a multi-row-group file larger than a read piece.
 con.execute(
@@ -79,10 +83,7 @@ except duckdb.IOException:
 # DuckLake with its data on pgvfs.
 con.execute("INSTALL ducklake")
 schema = "dl_" + vol.replace("-", "_")
-con.execute(
-    f"ATTACH 'ducklake:postgres:' AS lake "
-    f"(DATA_PATH '{root}/lake/', METADATA_SCHEMA '{schema}')"
-)
+con.execute(f"ATTACH 'ducklake:postgres:' AS lake " f"(DATA_PATH '{root}/lake/', METADATA_SCHEMA '{schema}')")
 con.execute("CALL lake.set_option('parquet_row_group_size', 8192)")
 con.execute("CALL lake.set_option('parquet_compression', 'zstd')")
 con.execute("CALL lake.set_option('parquet_version', 2)")
@@ -119,20 +120,16 @@ con.execute("CALL ducklake_expire_snapshots('lake', older_than => now())")
 con.execute("CALL ducklake_cleanup_old_files('lake', cleanup_all => true)")
 assert one(con, f"SELECT count(*) FROM glob('{root}/lake/main/gone/*')") == (0,)
 after = one(con, f"SELECT count(*) FROM glob('{root}/lake/**')")[0]
-assert one(con, "SELECT count(*) FROM lake.t") == (
-    150000 - sum(1 for i in range(150000) if i % 7 == 0),
-)
+assert one(con, "SELECT count(*) FROM lake.t") == (150000 - sum(1 for i in range(150000) if i % 7 == 0),)
 
 # A second process-level connection reads the lake through the cache path.
 con2 = connect()
-con2.execute(
-    f"ATTACH 'ducklake:postgres:' AS lake "
-    f"(METADATA_SCHEMA '{schema}')"
-)
+con2.execute(f"ATTACH 'ducklake:postgres:' AS lake " f"(METADATA_SCHEMA '{schema}')")
 assert one(con2, "SELECT count(*) FROM lake.t") == one(con, "SELECT count(*) FROM lake.t")
 
 # Tantivy search splits: one immutable file each, through DuckDB's filesystem,
 # so pgvfs:// (outside DATA_PATH, which DuckLake's cleanup owns) or anywhere.
+check_search(con, f"{root}/advanced-fts")
 idx = f"{root}/fts/docs.tantivy"
 con.execute(
     "CREATE TABLE lake.docs AS SELECT * FROM (VALUES "
@@ -164,11 +161,14 @@ assert match(con, "cats dogs", ", conjunctive := true") == [2]
 hits = con.execute(f"SELECT score, doc FROM tantivy_search('{idx}', 'body:fox OR author:raasveldt')").fetchall()
 assert sorted(json.loads(d)["_key"] for _, d in hits) == ["1", "2"], hits
 assert hits[0][0] >= hits[1][0]
-assert one(
-    con,
-    f"""SELECT d.id FROM tantivy_search('{idx}', '"brown fox"', '{{"top_k": 5}}') s
+assert (
+    one(
+        con,
+        f"""SELECT d.id FROM tantivy_search('{idx}', '"brown fox"', '{{"top_k": 5}}') s
     JOIN lake.docs d ON d.id = (s.doc->>'_key')::INTEGER""",
-) == (1,)
+    )
+    == (1,)
+)
 assert con2.execute(f"SELECT count(*) FROM tantivy_search('{idx}', 'cats')").fetchone() == (2,)
 assert match(con2, "cat") == [2, 3]
 # Splits are immutable: refresh by dropping and building again.
@@ -194,44 +194,55 @@ assert one(con, f"SELECT tantivy_drop('{local}')") == (True,) and not os.path.ex
 # listed in a lake table. A hit counts if its row still exists and the split
 # indexed its current version (rowid and snapshot_id are DuckLake's).
 splits = f"{root}/fts/splits"
-fts_schema = json.dumps([
-    {"name": "rowid", "type": "i64", "options": {"stored": True, "indexed": True}},
-    {"name": "body", "type": "text", "options": {"indexing": {"record": "position", "tokenizer": "en_stem"}}},
-])
+fts_schema = json.dumps(
+    [
+        {"name": "rowid", "type": "i64", "options": {"stored": True, "indexed": True, "fast": True}},
+        {"name": "body", "type": "text", "options": {"indexing": {"record": "position", "tokenizer": "en_stem"}}},
+    ]
+)
 con.execute("CREATE TABLE lake.docs_splits (path VARCHAR, snapshot BIGINT, docs BIGINT)")
+con.execute("CREATE TABLE lake.docs_fts_dead (rowid BIGINT, snapshot BIGINT)")
+con.execute("CREATE TABLE lake.docs_fts_state (snapshot BIGINT)")
 
 
 def split_of(rows, s1, path):
-    return f"""SELECT path, {s1} AS snapshot, tantivy_index(path, {sql_text(fts_schema)}, to_json(c)) AS docs
+    return f"""SELECT path, {s1} AS snapshot, tantivy_index(path, {sql_text(fts_schema)}, c) AS docs
         FROM (SELECT {path} AS path, * FROM ({rows})) c GROUP BY path"""
 
 
 # The first split indexes the table; later ones, the current version of each
 # row changed since (rows deleted since drop out at search time).
-CHANGES = """SELECT * FROM lake.table_changes('docs', getvariable('s0') + 1, getvariable('s1'))
-    WHERE change_type IN ('insert', 'update_postimage')
-    QUALIFY row_number() OVER (PARTITION BY rowid ORDER BY snapshot_id DESC) = 1"""
+CHANGES = """SELECT * FROM (
+    SELECT * FROM lake.table_changes('docs', getvariable('s0') + 1, getvariable('s1'))
+    WHERE change_type IN ('insert', 'update_postimage', 'delete')
+    QUALIFY row_number() OVER (PARTITION BY rowid ORDER BY snapshot_id DESC) = 1
+) WHERE change_type IN ('insert', 'update_postimage')"""
 
 
 def index_changes():
-    con.execute("SET VARIABLE s0 = (SELECT max(snapshot) FROM lake.docs_splits)")
+    con.execute("BEGIN")
+    con.execute("SET VARIABLE s0 = (SELECT snapshot FROM lake.docs_fts_state)")
     con.execute("SET VARIABLE s1 = (SELECT id::BIGINT FROM lake.current_snapshot())")
     first = one(con, "SELECT getvariable('s0') IS NULL")[0]
+    if not first:
+        con.execute(
+            "INSERT INTO lake.docs_fts_dead SELECT DISTINCT rowid, snapshot_id FROM "
+            "lake.table_changes('docs', getvariable('s0') + 1, getvariable('s1')) "
+            "WHERE change_type IN ('delete', 'update_preimage')"
+        )
     rows = "SELECT rowid, snapshot_id, * FROM lake.docs" if first else CHANGES
     path = f"'{splits}/' || getvariable('s1') || '.tantivy'"
     con.execute("INSERT INTO lake.docs_splits " + split_of(rows, "getvariable('s1')", path))
+    con.execute("DELETE FROM lake.docs_fts_state")
+    con.execute("INSERT INTO lake.docs_fts_state VALUES (getvariable('s1'))")
+    con.execute("COMMIT")
 
 
 def search(c, query):
-    return sorted(
-        r[0]
-        for r in c.execute(
-            f"""SELECT d.id
+    return sorted(r[0] for r in c.execute(f"""SELECT d.id
             FROM lake.docs_splits s
             CROSS JOIN tantivy_search(s.path, {sql_text(query)}) h
-            JOIN lake.docs d ON d.rowid = (h.doc->>'rowid')::BIGINT AND d.snapshot_id <= s.snapshot"""
-        ).fetchall()
-    )
+            JOIN lake.docs d ON d.rowid = (h.doc->>'rowid')::BIGINT AND d.snapshot_id <= s.snapshot""").fetchall())
 
 
 assert search(con, "fox") == []  # no splits yet
@@ -240,32 +251,95 @@ assert search(con, "fox") == [1]
 con.execute("INSERT INTO lake.docs VALUES (4, 'Foxes everywhere', NULL)")
 con.execute("UPDATE lake.docs SET body = 'no longer' WHERE id = 1")
 con.execute("DELETE FROM lake.docs WHERE id = 3")
+con.execute("INSERT INTO lake.docs VALUES (5, 'temporary fox', NULL)")
+con.execute("DELETE FROM lake.docs WHERE id = 5")  # inserted and deleted inside the same indexed range
 assert search(con, "fox") == [] and search(con, "cafe") == []  # stale: filtered, not yet indexed
+# Dead versions from the change feed: an invalidation after a split's snapshot
+# excludes the old version, but not the same rowid's version in a newer split.
+con.execute("SET VARIABLE s0 = (SELECT min(snapshot) FROM lake.docs_splits)")
+con.execute("SET VARIABLE s1 = (SELECT id::BIGINT FROM lake.current_snapshot())")
+con.execute(
+    "CREATE TEMP TABLE fts_dead AS SELECT rowid, snapshot_id FROM "
+    "lake.table_changes('docs', getvariable('s0') + 1, getvariable('s1')) "
+    "WHERE change_type IN ('delete', 'update_preimage')"
+)
+dead_ids = "(SELECT list(rowid) FROM fts_dead d WHERE d.snapshot_id > s.snapshot)"
+live_options = sql_text('{"exclude_field":"rowid","fast":["rowid"],"top_k":1}')
+
+
+def live_count(query):
+    return one(
+        con,
+        f"SELECT sum(tantivy_count(s.path, {sql_text(query)}, {live_options}, {dead_ids})) " "FROM lake.docs_splits s",
+    )[0]
+
+
+def live_search(query):
+    return sorted(
+        r[0]
+        for r in con.execute(
+            f"SELECT d.id FROM lake.docs_splits s CROSS JOIN "
+            f"tantivy_search(s.path, {sql_text(query)}, {live_options}, {dead_ids}) h "
+            "JOIN lake.docs d ON d.rowid = (h.doc->>'rowid')::BIGINT"
+        ).fetchall()
+    )
+
+
+assert live_count("fox") == 0 and live_count("cafe") == 0
+assert live_count("cats") == 1 and live_search("cats") == [2]  # dead hit cannot crowd out top_k
 index_changes()
 assert search(con, "fox") == [4]
 assert search(con, "longer") == [1]
+assert live_count("fox") == 1 and live_search("fox") == [4]
+assert live_count("longer") == 1 and live_search("longer") == [1]
 assert search(con2, "fox") == [4]
 assert one(con, "SELECT count(*), sum(docs) FROM lake.docs_splits") == (2, 5)
-# Compaction: one split for the range the others cover replaces them. (The
-# change feed for the range would do, had this lake not expired early
-# snapshots above.)
+# Native compaction: prune each source with its own dead versions, then merge
+# the live segments. No table rescan or document re-indexing.
 con.execute("SET VARIABLE s1 = (SELECT max(snapshot) FROM lake.docs_splits)")
 con.execute(
-    "CREATE TEMP TABLE merged AS "
-    + split_of(
-        "SELECT rowid, snapshot_id, * FROM lake.docs WHERE snapshot_id <= getvariable('s1')",
-        "getvariable('s1')",
-        f"'{splits}/0-' || getvariable('s1') || '.tantivy'",
-    )
+    f"CREATE TEMP TABLE cleaned AS SELECT s.path AS old_path, "
+    f"'{splits}/clean/' || s.snapshot || '.tantivy' AS path, "
+    f"tantivy_merge([s.path], '{splits}/clean/' || s.snapshot || '.tantivy', "
+    f'\'{{"exclude_field":"rowid"}}\', {dead_ids}) AS docs FROM lake.docs_splits s'
 )
+con.execute(
+    f"CREATE TEMP TABLE merged AS SELECT '{splits}/0-' || getvariable('s1') || '.tantivy' AS path, "
+    "getvariable('s1') AS snapshot, "
+    f"tantivy_merge((SELECT list(path) FROM cleaned), '{splits}/0-' || getvariable('s1') || '.tantivy') AS docs"
+)
+assert one(con, "SELECT docs FROM merged") == (3,)
 con.execute("CREATE TEMP TABLE replaced AS FROM lake.docs_splits")
 con.execute("BEGIN")
 con.execute("DELETE FROM lake.docs_splits")
 con.execute("INSERT INTO lake.docs_splits FROM merged")
 con.execute("COMMIT")
 assert con.execute("SELECT bool_and(tantivy_drop(path)) FROM replaced").fetchall() == [(True,)]
+assert con.execute("SELECT bool_and(tantivy_drop(path)) FROM cleaned").fetchall() == [(True,)]
 assert search(con, "fox") == [4] and search(con, "longer") == [1] and search(con, "cats") == [2]
+assert live_count("fox") == 1 and live_count("cats") == 1
 assert one(con, f"SELECT count(*) FROM glob('{splits}/*')") == (1,)
+
+# A coherent indexed checkpoint, as in search.md: newer lake rows need not be
+# indexed yet. Time travel joins the data version that the checkpoint covers.
+con.execute("INSERT INTO lake.docs VALUES (99, 'a future fox', NULL)")
+con.execute("BEGIN")
+con.execute("SET VARIABLE r = (SELECT snapshot FROM lake.docs_fts_state)")
+checkpoint = con.execute("""SELECT d.id FROM lake.docs_splits s
+    CROSS JOIN tantivy_search(s.path, 'fox',
+        '{"top_k":1,"fast":["rowid"],"exclude_field":"rowid"}',
+        (SELECT list(rowid) FROM lake.docs_fts_dead x
+         WHERE x.snapshot > s.snapshot AND x.snapshot <= getvariable('r'))) h
+    JOIN lake.docs d AT (VERSION => getvariable('r')) ON d.rowid = (h.doc->>'rowid')::BIGINT""").fetchall()
+assert checkpoint == [(4,)], checkpoint
+assert one(con, "SELECT count(*) FROM lake.docs AT (VERSION => getvariable('r'))") == (3,)
+con.execute("COMMIT")
+con.execute("DELETE FROM lake.docs WHERE id = 99")
+previous = one(con, "SELECT snapshot FROM lake.docs_fts_state")[0]
+index_changes()  # no surviving postimage: advance the watermark without a split
+assert one(con, "SELECT snapshot FROM lake.docs_fts_state")[0] > previous
+assert one(con, "SELECT count(*) FROM lake.docs_splits") == (1,)
+assert live_count("fox") == 1
 
 for sql, msg in [
     (f"FROM tantivy_search('{root}/fts/missing.tantivy', 'x')", "no tantivy split"),
@@ -284,7 +358,9 @@ for sql, msg in [
         assert msg in str(e), (sql, e)
 assert one(con, f"SELECT count(*) FROM glob('{root}/fts/x*')") == (0,), "failed builds left files"
 try:  # only the pgvfs writer writes to pgvfs
-    con2.execute(f"SELECT tantivy_index('{root}/fts/y.tantivy', {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t").fetchall()
+    con2.execute(
+        f"SELECT tantivy_index('{root}/fts/y.tantivy', {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t"
+    ).fetchall()
     raise AssertionError("a second process wrote a split")
 except duckdb.Error as e:
     assert "writer" in str(e), e
@@ -309,5 +385,38 @@ if standby:
         time.sleep(0.1)
     assert one(con3, "SELECT count(*) FROM lake.t") == want, "standby never caught up"
     assert one(con3, "SELECT count(*) FROM lake.docs_splits s CROSS JOIN tantivy_search(s.path, 'fox')") == (1,)
+
+# Drop only one volume, through the writer. Cache entries are invalidated at
+# once in that database; open readers keep their file IDs for the usual grace.
+drop_volume = vol + "-drop"
+drop_root = f"pgvfs://{drop_volume}"
+drop_index = f"{drop_root}/docs.tantivy"
+con.execute(f"COPY (SELECT 1 AS i) TO '{drop_root}/one.parquet'").fetchall()
+assert one(con, f"SELECT i FROM '{drop_root}/one.parquet'") == (1,)
+assert one(
+    con, f"SELECT tantivy_index('{drop_index}', {sql_text(fts_schema)}, " "json_object('rowid', 1, 'body', 'fox'))"
+) == (1,)
+assert one(con, f"SELECT tantivy_count('{drop_index}', 'fox')") == (1,)
+try:
+    con2.execute(f"SELECT pgvfs_drop_volume('{drop_volume}')").fetchall()
+    raise AssertionError("a reader dropped a volume")
+except duckdb.Error as e:
+    assert "writer" in str(e), str(e)
+assert one(con, "SELECT pgvfs_drop_volume(NULL)") == (None,)
+try:
+    con.execute("SELECT pgvfs_drop_volume(?)", [drop_volume + "\0suffix"]).fetchall()
+    raise AssertionError("a NUL-containing volume name was accepted")
+except duckdb.Error as e:
+    assert "NUL" in str(e), str(e)
+assert one(con, f"SELECT tantivy_count('{drop_index}', 'fox')") == (1,)
+assert one(con, f"SELECT pgvfs_drop_volume('{drop_volume}')") == (2,)
+assert one(con, f"SELECT pgvfs_drop_volume('{drop_volume}')") == (0,)
+assert one(con, f"SELECT count(*) FROM glob('{drop_root}/**')") == (0,)
+assert one(con, f"SELECT count(*) FROM glob('{root}/**')")[0] > 0, "other volumes were removed"
+try:
+    con.execute(f"SELECT tantivy_count('{drop_index}', 'fox')").fetchall()
+    raise AssertionError("a dropped volume's split remained cached")
+except duckdb.Error as e:
+    assert "no tantivy split" in str(e), str(e)
 
 print(f"pgvfs e2e ok: volume {vol}, lake files {files} -> {after}")

@@ -12,8 +12,8 @@
 //! Bundle: the files' bytes back to back, a JSON footer naming each file's
 //! [offset, length], the footer's length (u64, little-endian) and `MAGIC`.
 
-use std::collections::{BTreeMap, HashMap};
-use std::io::{self, Read};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,23 +21,22 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
 use serde::{Deserialize, Serialize};
-use tantivy::collector::{Collector, SegmentCollector, TopDocs};
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
     DirectoryLock, FileHandle, Lock, OwnedBytes, WatchCallback, WatchHandle, WritePtr,
 };
 use tantivy::merge_policy::NoMergePolicy;
-use tantivy::query::QueryParser;
-use tantivy::schema::{FieldType, Schema};
+use tantivy::schema::Schema;
 use tantivy::tokenizer::{
     AlphaNumOnlyFilter, AsciiFoldingFilter, Language, LowerCaser, NgramTokenizer, RawTokenizer,
     RegexTokenizer, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
     WhitespaceTokenizer,
 };
 use tantivy::{
-    DocAddress, DocId, Document, HasLen, Index, IndexReader, IndexSettings, IndexWriter,
-    ReloadPolicy, Score, SegmentOrdinal, SegmentReader, TantivyDocument,
+    HasLen, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument,
 };
+
+use crate::search::{Exclude, Filter, InSetQuery};
 
 const MAGIC: &[u8; 8] = b"tantivy1";
 
@@ -46,7 +45,7 @@ const MAGIC: &[u8; 8] = b"tantivy1";
 /// the new index into one segment (one read per term per query).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BuildOptions {
+pub(crate) struct BuildOptions {
     #[serde(default)]
     tokenizers: BTreeMap<String, Analyzer>,
     #[serde(default)]
@@ -65,29 +64,14 @@ fn yes() -> bool {
     true
 }
 
-/// Search options, as JSON: `top_k` (default: every hit), the default
-/// `fields` for terms that name none (default: every indexed text field),
-/// `conjunctive` (all terms must match) and `strict` (fail on query syntax
-/// errors instead of dropping what tantivy cannot parse).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SearchOptions {
-    top_k: Option<usize>,
-    fields: Option<Vec<String>>,
-    #[serde(default)]
-    conjunctive: bool,
-    #[serde(default)]
-    strict: bool,
-}
-
-fn options<'a, T: Deserialize<'a>>(json: &'a str, what: &str) -> Result<T> {
+pub(crate) fn options<'a, T: Deserialize<'a>>(json: &'a str, what: &str) -> Result<T> {
     let json = if json.trim().is_empty() { "{}" } else { json };
     serde_json::from_str(json).with_context(|| format!("tantivy {what} options"))
 }
 
 /// A tokenizer and its filters, built into a tantivy `TextAnalyzer`:
 /// `{"tokenizer": "simple", "filters": ["lowercase", {"stemmer": "english"}]}`.
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Analyzer {
     #[serde(default)]
@@ -96,7 +80,7 @@ struct Analyzer {
     filters: Vec<FilterSpec>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum TokenizerSpec {
     #[default]
@@ -112,7 +96,7 @@ enum TokenizerSpec {
     Regex(String),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum FilterSpec {
     Lowercase,
@@ -123,7 +107,7 @@ enum FilterSpec {
     Stemmer(String),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(untagged)]
 enum StopWords {
     Language(String),
@@ -179,7 +163,7 @@ impl Analyzer {
 }
 
 /// Register the options' tokenizers, for text and fast fields alike.
-fn register(index: &Index, options: &BuildOptions) -> Result<()> {
+pub(crate) fn register(index: &Index, options: &BuildOptions) -> Result<()> {
     for (name, spec) in &options.tokenizers {
         let analyzer = spec
             .build()
@@ -247,7 +231,7 @@ impl Build {
     }
 
     /// Commit, and write the split's bundle to `out`. Returns the documents.
-    pub fn finish(self, mut out: impl FnMut(&[u8]) -> Result<()>) -> Result<u64> {
+    pub fn finish(self, out: impl FnMut(&[u8]) -> Result<()>) -> Result<u64> {
         let Build {
             mut writer,
             index,
@@ -267,41 +251,144 @@ impl Build {
             }
         }
         writer.wait_merging_threads()?;
-        // Everything but lock files, in a stable order.
-        let mut names = Vec::new();
-        for entry in std::fs::read_dir(dir.path())? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow!("non-UTF-8 file name"))?;
-            if entry.file_type()?.is_file() && !name.starts_with(".tantivy-") {
-                names.push(name);
-            }
-        }
-        names.sort();
-        let mut footer = Footer::default();
-        let mut offset = 0u64;
-        let mut buf = vec![0; 1 << 20];
-        for name in names {
-            let mut file = std::fs::File::open(dir.path().join(&name))?;
-            let start = offset;
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                out(&buf[..n])?;
-                offset += n as u64;
-            }
-            footer.files.insert(name, [start, offset - start]);
-        }
-        let footer = serde_json::to_vec(&footer)?;
-        out(&footer)?;
-        out(&(footer.len() as u64).to_le_bytes())?;
-        out(MAGIC)?;
+        bundle(&index, dir.path(), out)?;
         Ok(docs.load(Ordering::Relaxed))
     }
+}
+
+/// Write a local index's live files (meta.json and its segments') as a
+/// bundle to `out`.
+fn bundle(index: &Index, dir: &Path, mut out: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    let mut names: Vec<PathBuf> = vec![PathBuf::from("meta.json")];
+    for segment in index.searchable_segment_metas()? {
+        // list_files names a delete file whether or not there is one.
+        names.extend(
+            segment
+                .list_files()
+                .into_iter()
+                .filter(|f| dir.join(f).exists()),
+        );
+    }
+    names.sort();
+    names.dedup();
+    let mut footer = Footer::default();
+    let mut offset = 0u64;
+    let mut buf = vec![0; 1 << 20];
+    for name in names {
+        let mut file = std::fs::File::open(dir.join(&name))
+            .with_context(|| format!("tantivy file {}", name.display()))?;
+        let start = offset;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out(&buf[..n])?;
+            offset += n as u64;
+        }
+        let name = name
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow!("non-UTF-8 file name"))?;
+        footer.files.insert(name, [start, offset - start]);
+    }
+    let footer = serde_json::to_vec(&footer)?;
+    out(&footer)?;
+    out(&(footer.len() as u64).to_le_bytes())?;
+    out(MAGIC)?;
+    Ok(())
+}
+
+/// Merge options, as JSON: the fast field `exclude` holds values of, and the
+/// writer's memory budget.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergeOptions {
+    exclude_field: Option<String>,
+    #[serde(default = "default_memory_budget")]
+    memory_budget: usize,
+}
+
+/// Merge splits of one schema into a single split without the documents
+/// `exclude` names, written to `out`. Returns the documents kept. The
+/// sources' segments are copied as they are, not re-indexed.
+pub fn merge(
+    splits: &[&Split],
+    options_json: &str,
+    exclude: Option<&Exclude>,
+    out: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<u64> {
+    let options: MergeOptions = options(options_json, "merge")?;
+    let first = splits
+        .first()
+        .context("tantivy_merge needs at least one split")?;
+    let schema = first.index.schema();
+    anyhow::ensure!(
+        splits.iter().all(|s| s.index.schema() == schema),
+        "tantivy_merge: the splits have different schemas"
+    );
+    let payload = first.index.load_metas()?.payload.unwrap_or_default();
+    let build_options: BuildOptions = self::options(&payload, "index")?;
+    let filter = Filter::new(&schema, options.exclude_field.as_deref(), exclude)?;
+    for split in splits {
+        let payload = split.index.load_metas()?.payload.unwrap_or_default();
+        let source_options: BuildOptions = self::options(&payload, "index")?;
+        anyhow::ensure!(
+            source_options.tokenizers == build_options.tokenizers,
+            "tantivy_merge: the splits have different tokenizers"
+        );
+        filter.validate(&split.reader.searcher())?;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("duckdb-tantivy-")
+        .tempdir()?;
+    let index = Index::builder()
+        .schema(schema)
+        .settings(first.index.settings().clone())
+        .create_in_dir(dir.path())?;
+    register(&index, &build_options)?;
+    let mut writer: IndexWriter = index.writer(options.memory_budget)?;
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    let mut seen = HashSet::new();
+    for split in splits {
+        for meta in split.index.searchable_segment_metas()? {
+            anyhow::ensure!(
+                !meta.has_deletes(),
+                "tantivy_merge: a split has deleted documents"
+            );
+            anyhow::ensure!(
+                seen.insert(meta.id()),
+                "tantivy_merge: a segment appears twice"
+            );
+            for file in meta.list_files() {
+                if split.bundle.files.contains_key(&file) {
+                    split.bundle.copy(&file, &dir.path().join(&file))?;
+                }
+            }
+            writer.add_segment(index.new_segment_meta(meta.id(), meta.max_doc()))?;
+        }
+    }
+    if let Some(exclude) = exclude {
+        let field = options
+            .exclude_field
+            .context("tantivy_merge: exclude needs options.exclude_field")?;
+        writer.delete_query(Box::new(InSetQuery::new(field, exclude)))?;
+    }
+    let mut commit = writer.prepare_commit()?;
+    commit.set_payload(&payload);
+    commit.commit()?;
+    let segments = index.searchable_segment_ids()?;
+    if !segments.is_empty() {
+        writer.merge(&segments).wait()?;
+    }
+    writer.wait_merging_threads()?;
+    bundle(&index, dir.path(), out)?;
+    let docs = index
+        .searchable_segment_metas()?
+        .iter()
+        .map(|m| m.num_docs() as u64)
+        .sum();
+    Ok(docs)
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -315,8 +402,9 @@ pub type ReadAt = dyn Fn(u64, &mut [u8]) -> io::Result<()> + Send + Sync;
 
 /// A split open for search.
 pub struct Split {
-    index: Index,
-    reader: IndexReader,
+    pub(crate) index: Index,
+    pub(crate) reader: IndexReader,
+    pub(crate) bundle: Bundle,
 }
 
 impl Split {
@@ -345,29 +433,28 @@ impl Split {
             );
             files.insert(PathBuf::from(name), offset..offset + len);
         }
-        let index = Index::open(Bundle {
+        let bundle = Bundle {
             read,
             files: Arc::new(files),
-        })?;
+        };
+        let index = Index::open(bundle.clone())?;
         let payload = index.load_metas()?.payload.unwrap_or_default();
         register(&index, &options(&payload, "index")?)?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
-        Ok(Split { index, reader })
-    }
-
-    /// Search with a tantivy query: (score, stored fields as a JSON object)
-    /// per match, best first.
-    pub fn search(&self, query: &str, options_json: &str) -> Result<Vec<(Score, String)>> {
-        run(self, query, &options(options_json, "search")?)
+        Ok(Split {
+            index,
+            reader,
+            bundle,
+        })
     }
 }
 
 /// A bundle's files, as a read-only tantivy `Directory`.
 #[derive(Clone)]
-struct Bundle {
+pub(crate) struct Bundle {
     read: Arc<ReadAt>,
     files: Arc<HashMap<PathBuf, Range<u64>>>,
 }
@@ -388,6 +475,21 @@ impl Bundle {
             .get(p)
             .cloned()
             .ok_or_else(|| OpenReadError::FileDoesNotExist(p.to_path_buf()))
+    }
+
+    /// Copy one of the bundle's files to a local path.
+    fn copy(&self, p: &Path, to: &Path) -> Result<()> {
+        let range = self.range(p)?;
+        let mut file = std::fs::File::create(to)?;
+        let mut buf = vec![0; 1 << 20];
+        let mut at = range.start;
+        while at < range.end {
+            let n = (range.end - at).min(buf.len() as u64) as usize;
+            (self.read)(at, &mut buf[..n])?;
+            file.write_all(&buf[..n])?;
+            at += n as u64;
+        }
+        Ok(())
     }
 }
 
@@ -466,119 +568,29 @@ impl FileHandle for Slice {
     }
 }
 
-fn run(s: &Split, query: &str, options: &SearchOptions) -> Result<Vec<(Score, String)>> {
-    let schema = s.index.schema();
-    let fields = match &options.fields {
-        Some(names) => names
-            .iter()
-            .map(|n| schema.get_field(n))
-            .collect::<Result<_, _>>()?,
-        None => schema
-            .fields()
-            .filter(|(_, e)| {
-                e.is_indexed()
-                    && matches!(e.field_type(), FieldType::Str(_) | FieldType::JsonObject(_))
-            })
-            .map(|(f, _)| f)
-            .collect(),
-    };
-    let mut parser = QueryParser::for_index(&s.index, fields);
-    if options.conjunctive {
-        parser.set_conjunction_by_default();
-    }
-    let query = if options.strict {
-        parser.parse_query(query)?
-    } else {
-        parser.parse_query_lenient(query).0
-    };
-    let searcher = s.reader.searcher();
-    let hits = match options.top_k {
-        Some(0) => Vec::new(),
-        Some(n) => searcher.search(&query, &TopDocs::with_limit(n).order_by_score())?,
-        None => searcher.search(&query, &AllHits)?,
-    };
-    hits.into_iter()
-        .map(|(score, addr)| Ok((score, stored_json(&searcher.doc(addr)?, &schema)?)))
-        .collect()
-}
-
-/// Stored fields as a JSON object: a field's value, or an array of several.
-fn stored_json(doc: &TantivyDocument, schema: &Schema) -> Result<String> {
-    let fields = doc
-        .to_named_doc(schema)
-        .0
-        .into_iter()
-        .map(|(name, mut values)| {
-            let value = if values.len() == 1 {
-                serde_json::to_value(values.pop())
-            } else {
-                serde_json::to_value(values)
-            };
-            value.map(|v| (name, v))
-        })
-        .collect::<Result<serde_json::Map<_, _>, _>>()?;
-    Ok(serde_json::to_string(&fields)?)
-}
-
-/// Every match and its score, best first (`TopDocs` needs a limit).
-struct AllHits;
-
-struct SegmentHits(SegmentOrdinal, Vec<(Score, DocAddress)>);
-
-impl Collector for AllHits {
-    type Fruit = Vec<(Score, DocAddress)>;
-    type Child = SegmentHits;
-
-    fn for_segment(
-        &self,
-        segment: SegmentOrdinal,
-        _: &SegmentReader,
-    ) -> tantivy::Result<SegmentHits> {
-        Ok(SegmentHits(segment, Vec::new()))
-    }
-
-    fn requires_scoring(&self) -> bool {
-        true
-    }
-
-    fn merge_fruits(&self, fruits: Vec<Self::Fruit>) -> tantivy::Result<Self::Fruit> {
-        let mut hits: Vec<_> = fruits.into_iter().flatten().collect();
-        hits.sort_by(|a, b| b.0.total_cmp(&a.0));
-        Ok(hits)
-    }
-}
-
-impl SegmentCollector for SegmentHits {
-    type Fruit = Vec<(Score, DocAddress)>;
-
-    fn collect(&mut self, doc: DocId, score: Score) {
-        self.1.push((score, DocAddress::new(self.0, doc)));
-    }
-
-    fn harvest(self) -> Self::Fruit {
-        self.1
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use super::*;
 
-    const SCHEMA: &str = r#"[
-        {"name": "id", "type": "i64", "options": {"stored": true, "indexed": true}},
+    pub const SCHEMA: &str = r#"[
+        {"name": "id", "type": "i64", "options": {"stored": true, "indexed": true, "fast": true}},
         {"name": "body", "type": "text", "options": {"stored": false,
             "indexing": {"record": "position", "fieldnorms": true, "tokenizer": "fts"}}},
-        {"name": "tag", "type": "text", "options": {"stored": true,
+        {"name": "tag", "type": "text", "options": {"stored": true, "fast": true,
             "indexing": {"record": "basic", "tokenizer": "raw"}}}
     ]"#;
 
-    const OPTIONS: &str = r#"{"tokenizers": {"fts": {"tokenizer": "simple", "filters":
+    pub const OPTIONS: &str = r#"{"tokenizers": {"fts": {"tokenizer": "simple", "filters":
         ["lowercase", "ascii_folding", {"stop_words": "english"}, {"stemmer": "porter"}]}},
         "memory_budget": 15000000}"#;
 
-    /// Build a split in memory and open it.
-    fn split(docs: &[&str]) -> (Split, Vec<u8>) {
-        let build = Build::new(SCHEMA, OPTIONS).unwrap();
+    /// A split's bytes.
+    pub fn build(docs: &[&str]) -> Vec<u8> {
+        build_with(SCHEMA, OPTIONS, docs)
+    }
+
+    pub fn build_with(schema: &str, options: &str, docs: &[&str]) -> Vec<u8> {
+        let build = Build::new(schema, options).unwrap();
         for doc in docs {
             build.add(doc).unwrap();
         }
@@ -590,66 +602,48 @@ mod tests {
             })
             .unwrap();
         assert_eq!(n, docs.len() as u64);
-        let shared = Arc::new(bytes.clone());
+        bytes
+    }
+
+    pub fn open(bytes: Vec<u8>) -> Split {
+        let size = bytes.len() as u64;
         let read = move |at: u64, buf: &mut [u8]| {
             let at = at as usize;
-            buf.copy_from_slice(&shared[at..at + buf.len()]);
+            buf.copy_from_slice(&bytes[at..at + buf.len()]);
             Ok(())
         };
-        (
-            Split::open(bytes.len() as u64, Arc::new(read)).unwrap(),
-            bytes,
-        )
+        Split::open(size, Arc::new(read)).unwrap()
     }
 
-    fn search(s: &Split, query: &str, options: &str) -> Vec<(f32, String)> {
-        s.search(query, options).unwrap()
+    pub fn split(docs: &[&str]) -> Split {
+        open(build(docs))
     }
+}
 
-    #[test]
-    fn builds_bundles_and_searches() {
-        let (s, _) = split(&[
-            r#"{"id": 1, "body": "The quick brown fox jumps", "tag": "a"}"#,
-            r#"{"id": 2, "body": "Small CATS and a café", "tag": ["b", "c"], "x": null}"#,
-            r#"{"id": 3, "body": "cats chasing the fox", "tag": "a", "unknown": 1}"#,
-        ]);
-        let docs =
-            |hits: Vec<(f32, String)>| -> Vec<String> { hits.into_iter().map(|h| h.1).collect() };
-        // Stemmed, lowercased and folded; stored fields flatten single values.
-        assert_eq!(
-            docs(search(&s, "cat", "")),
-            [r#"{"id":2,"tag":["b","c"]}"#, r#"{"id":3,"tag":"a"}"#]
-        );
-        assert_eq!(
-            docs(search(&s, "cafe", "")),
-            [r#"{"id":2,"tag":["b","c"]}"#]
-        );
-        assert!(search(&s, "the", "").is_empty());
-        // Disjunctive by default, best first; conjunctive and top_k.
-        assert_eq!(search(&s, "fox cats", "").len(), 3);
-        assert_eq!(
-            docs(search(&s, "fox cats", r#"{"top_k": 1}"#)),
-            [r#"{"id":3,"tag":"a"}"#]
-        );
-        assert_eq!(search(&s, "fox cats", r#"{"conjunctive": true}"#).len(), 1);
-        assert!(search(&s, "fox", r#"{"top_k": 0}"#).is_empty());
-        // Tantivy's query language: fields, ranges, phrases.
-        assert_eq!(search(&s, "tag:a AND id:[2 TO 3]", "").len(), 1);
-        assert_eq!(search(&s, "\"brown fox\"", "").len(), 1);
-        assert_eq!(search(&s, "a", r#"{"fields": ["tag"]}"#).len(), 2);
-        assert_eq!(search(&s, "fox", r#"{"fields": null}"#).len(), 2);
-        // Lenient unless strict.
-        assert_eq!(search(&s, "fox nosuchfield:x", "").len(), 2);
-        assert!(s.search("nosuchfield:x", r#"{"strict": true}"#).is_err());
-        let scores: Vec<f32> = search(&s, "fox cats", "")
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use crate::search::Request;
+
+    fn ids(splits: &[&Split], query: &str) -> Vec<i64> {
+        let mut ids: Vec<i64> = Request::new(splits, query, r#"{"fast": ["id"]}"#, None)
+            .unwrap()
+            .hits()
+            .unwrap()
             .into_iter()
-            .map(|h| h.0)
+            .map(|(_, _, doc)| {
+                serde_json::from_str::<serde_json::Value>(&doc).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
             .collect();
-        assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
+        ids.sort();
+        ids
     }
 
     #[test]
-    fn merges_into_one_segment() {
+    fn bundles_one_segment_of_live_files() {
         let docs: Vec<String> = (0..20_000)
             .map(|i| {
                 format!(
@@ -659,11 +653,93 @@ mod tests {
             })
             .collect();
         let docs: Vec<&str> = docs.iter().map(String::as_str).collect();
-        let (s, bytes) = split(&docs);
-        assert_eq!(s.reader.searcher().segment_readers().len(), 1);
-        assert_eq!(search(&s, "fox", "").len(), 2_000);
-        assert_eq!(search(&s, "fox", r#"{"top_k": 5}"#).len(), 5);
+        let bytes = build(&docs);
         assert_eq!(&bytes[bytes.len() - 8..], MAGIC);
+        let s = open(bytes);
+        assert_eq!(s.reader.searcher().segment_readers().len(), 1);
+        // meta.json and one segment's files, no leftovers of merged segments
+        let segment = s.index.searchable_segment_metas().unwrap()[0].list_files();
+        assert!(s
+            .bundle
+            .files
+            .keys()
+            .all(|f| segment.contains(f) || f.as_os_str() == "meta.json"));
+        assert_eq!(ids(&[&s], "fox").len(), 2_000);
+    }
+
+    #[test]
+    fn merges_splits_without_excluded_documents() {
+        let a = split(&[r#"{"id": 1, "body": "fox"}"#, r#"{"id": 2, "body": "cat"}"#]);
+        let b = split(&[
+            r#"{"id": 3, "body": "fox"}"#,
+            r#"{"id": 4, "body": "fox and cat"}"#,
+        ]);
+        let mut bytes = Vec::new();
+        let kept = merge(
+            &[&a, &b],
+            r#"{"exclude_field": "id"}"#,
+            Some(&Exclude::from_ids([3])),
+            |b| {
+                bytes.extend_from_slice(b);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(kept, 3);
+        let m = open(bytes);
+        assert_eq!(m.reader.searcher().segment_readers().len(), 1);
+        assert_eq!(ids(&[&m], "fox"), [1, 4]);
+        assert_eq!(ids(&[&m], "cat"), [2, 4]); // stemming kept: tokenizers ride along
+        assert!(merge(&[], "", None, |_| Ok(())).is_err());
+        assert!(merge(&[&a], "", Some(&Exclude::from_ids([1])), |_| Ok(())).is_err());
+        assert!(merge(&[&a, &a], "", None, |_| Ok(())).is_err());
+        assert!(merge(
+            &[&a],
+            r#"{"exclude_field":"missing"}"#,
+            Some(&Exclude::from_ids([1])),
+            |_| Ok(())
+        )
+        .is_err());
+        let different = open(build_with(
+            SCHEMA,
+            r#"{"tokenizers":{"fts":{"tokenizer":"raw"}},"memory_budget":15000000}"#,
+            &[r#"{"id":5,"body":"fox"}"#],
+        ));
+        assert!(merge(&[&a, &different], "", None, |_| Ok(()))
+            .unwrap_err()
+            .to_string()
+            .contains("different tokenizers"));
+        let other_schema = open(build_with("[]", "", &["{}"]));
+        assert!(merge(&[&a, &other_schema], "", None, |_| Ok(())).is_err());
+        assert!(Request::new(&[&a, &other_schema], "*", r#"{"global_stats":true}"#, None).is_err());
+    }
+
+    #[test]
+    fn merges_empty_splits_and_all_excluded_documents() {
+        let a = split(&[r#"{"id":1,"body":"fox"}"#]);
+        let mut bytes = Vec::new();
+        assert_eq!(
+            merge(
+                &[&a],
+                r#"{"exclude_field":"id"}"#,
+                Some(&Exclude::from_ids([1])),
+                |b| {
+                    bytes.extend_from_slice(b);
+                    Ok(())
+                }
+            )
+            .unwrap(),
+            0
+        );
+        let empty = open(bytes);
+        assert_eq!(
+            Request::new(&[&empty], "*", "", None)
+                .unwrap()
+                .count()
+                .unwrap(),
+            0
+        );
+        assert_eq!(merge(&[&empty], "", None, |_| Ok(())).unwrap(), 0);
     }
 
     #[test]
@@ -673,7 +749,6 @@ mod tests {
         let b = Build::new(SCHEMA, OPTIONS).unwrap();
         assert!(b.add("[1]").is_err());
         assert!(b.add(r#"{"id": "x"}"#).is_err());
-        assert!(options::<SearchOptions>(r#"{"limit": 1}"#, "search").is_err());
         let bad = options::<BuildOptions>(
             r#"{"tokenizers": {"x": {"filters": [{"stemmer": "klingon"}]}}}"#,
             "index",

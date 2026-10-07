@@ -416,6 +416,39 @@ pub unsafe extern "C" fn pgvfs_remove(
     }
 }
 
+/// Remove every file under `prefix` ("" for the whole volume). Returns how
+/// many, or -1.
+#[no_mangle]
+pub unsafe extern "C" fn pgvfs_remove_prefix(
+    c: *const PgvfsConn,
+    volume: *const c_char,
+    prefix: *const c_char,
+    err: *mut *mut c_char,
+) -> i64 {
+    let c = conn(c);
+    let run = || -> Result<i64> {
+        let (volume, prefix) = (text(volume)?, text(prefix)?);
+        store::check_volume(volume)?;
+        c.writer()?;
+        c.files
+            .map
+            .lock()
+            .unwrap()
+            .retain(|(v, p), _| v != volume || !p.starts_with(prefix));
+        c.rt.block_on(store::remove_prefix(&c.pool, volume, prefix))
+    };
+    match run() {
+        Ok(n) => {
+            c.maybe_reap();
+            n
+        }
+        Err(e) => {
+            set_err(err, &e);
+            -1
+        }
+    }
+}
+
 /// Rename within a volume, replacing the target. 0 ok, -1 error.
 #[no_mangle]
 pub unsafe extern "C" fn pgvfs_rename(

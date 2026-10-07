@@ -1,23 +1,31 @@
-//! C ABI over tantivy splits (`split`), for the DuckDB tantivy extension
-//! (extension/). The C++ side does all storage, through DuckDB's
-//! filesystem, so splits live wherever DuckDB can read and write: local
-//! files, object stores, pgvfs.
+//! C ABI over tantivy splits (`split`, `search`, `dsl`), for the DuckDB
+//! extension (extension/src/tantivy_functions.cpp). The C++ side does all
+//! storage, through DuckDB's filesystem, so splits live wherever DuckDB can
+//! read and write: local files, object stores, pgvfs.
 //!
-//! Errors come back as `*err`, freed with `tantivy_free_str`. Callbacks
-//! report theirs by writing a message of at most `cap` bytes (NUL included)
-//! to `msg` and returning nonzero.
+//! Errors come back as `*err`, freed with `tantivy_free_str`; a panic is an
+//! error too, never an abort of the host. Callbacks report theirs by writing
+//! a message of at most `cap` bytes (NUL included) to `msg` and returning
+//! nonzero.
+//!
+//! Exclude sets (`kind`, `data`, `len`): 0 none; 1 a serialized roaring
+//! bitmap of `len` bytes; 2 `len` int64 values.
 //!
 //! Safety (every function): handles are those this library returned and not
 //! yet freed; strings are NUL-terminated or come with their length; a split's
 //! `ctx` outlives it.
 #![allow(clippy::missing_safety_doc)]
 
+mod dsl;
+pub mod search;
 pub mod split;
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use search::{Exclude, Request};
 use split::{Build, Split};
 
 pub type ReadCb = extern "C" fn(
@@ -35,7 +43,8 @@ pub type WriteCb = extern "C" fn(
     msg: *mut c_char,
     cap: usize,
 ) -> c_int;
-pub type HitCb = extern "C" fn(ctx: *mut c_void, score: f64, doc: *const c_char, len: usize);
+pub type HitCb =
+    extern "C" fn(ctx: *mut c_void, split: usize, score: f64, doc: *const c_char, len: usize);
 
 const MSG_CAP: usize = 1024;
 
@@ -43,6 +52,26 @@ fn set_err(err: *mut *mut c_char, e: &anyhow::Error) {
     if !err.is_null() {
         let msg = format!("{e:#}").replace('\0', " ");
         unsafe { *err = CString::new(msg).unwrap_or_default().into_raw() };
+    }
+}
+
+/// Run `f`, reporting its error or panic in `*err` and returning `failed`.
+fn guard<T>(err: *mut *mut c_char, failed: T, f: impl FnOnce() -> Result<T>) -> T {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            set_err(err, &e);
+            failed
+        }
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown".into());
+            set_err(err, &anyhow!("tantivy panicked: {msg}"));
+            failed
+        }
     }
 }
 
@@ -55,18 +84,58 @@ fn text<'a>(p: *const c_char) -> Result<&'a str> {
         .map_err(|_| anyhow!("strings must be UTF-8"))
 }
 
+fn handle<'a, T>(p: *const T) -> Result<&'a T> {
+    unsafe { p.as_ref() }.ok_or_else(|| anyhow!("null tantivy handle"))
+}
+
+fn data<'a, T>(p: *const T, len: usize) -> Result<&'a [T]> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    anyhow::ensure!(
+        !p.is_null() && p.is_aligned(),
+        "invalid tantivy data pointer"
+    );
+    anyhow::ensure!(
+        len <= isize::MAX as usize / std::mem::size_of::<T>(),
+        "tantivy data is too long"
+    );
+    Ok(unsafe { std::slice::from_raw_parts(p, len) })
+}
+
 /// A callback's message, from its NUL-terminated buffer.
 fn message(buf: &[u8]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
-fn status(result: Result<()>, err: *mut *mut c_char) -> c_int {
-    match result {
-        Ok(()) => 0,
-        Err(e) => {
-            set_err(err, &e);
-            -1
+fn splits<'a>(p: *const *const Split, n: usize) -> Result<Vec<&'a Split>> {
+    data(p, n)?.iter().map(|&s| handle(s)).collect()
+}
+
+fn exclude(kind: c_int, data: *const c_void, len: usize) -> Result<Option<Exclude>> {
+    Ok(match kind {
+        0 => None,
+        1 => Some(Exclude::from_roaring(self::data(data.cast::<u8>(), len)?)?),
+        2 => Some(Exclude::from_ids(
+            self::data(data.cast::<i64>(), len)?.iter().copied(),
+        )),
+        _ => return Err(anyhow!("unknown exclude kind {kind}")),
+    })
+}
+
+fn writer(cb: WriteCb, ctx: *mut c_void) -> impl FnMut(&[u8]) -> Result<()> {
+    move |bytes| {
+        let mut msg = [0u8; MSG_CAP];
+        match cb(
+            ctx,
+            bytes.as_ptr(),
+            bytes.len() as u64,
+            msg.as_mut_ptr().cast(),
+            MSG_CAP,
+        ) {
+            0 => Ok(()),
+            _ => Err(anyhow!("{}", message(&msg))),
         }
     }
 }
@@ -91,13 +160,12 @@ pub unsafe extern "C" fn tantivy_build_open(
     options: *const c_char,
     err: *mut *mut c_char,
 ) -> *mut Build {
-    match text(schema).and_then(|s| Build::new(s, text(options)?)) {
-        Ok(b) => Box::into_raw(Box::new(b)),
-        Err(e) => {
-            set_err(err, &e);
-            std::ptr::null_mut()
-        }
-    }
+    guard(err, std::ptr::null_mut(), || {
+        Ok(Box::into_raw(Box::new(Build::new(
+            text(schema)?,
+            text(options)?,
+        )?)))
+    })
 }
 
 /// Add one document (a JSON object), from any thread. 0 ok, -1 error.
@@ -108,12 +176,12 @@ pub unsafe extern "C" fn tantivy_build_add(
     len: usize,
     err: *mut *mut c_char,
 ) -> c_int {
-    let run = || {
-        let doc = unsafe { std::slice::from_raw_parts(doc.cast::<u8>(), len) };
-        let doc = std::str::from_utf8(doc).map_err(|_| anyhow!("documents must be UTF-8"))?;
-        unsafe { &*b }.add(doc)
-    };
-    status(run(), err)
+    guard(err, -1, || {
+        let build = handle(b)?;
+        let doc = data(doc.cast::<u8>(), len)?;
+        build.add(std::str::from_utf8(doc).map_err(|_| anyhow!("documents must be UTF-8"))?)?;
+        Ok(0)
+    })
 }
 
 /// Commit, write the split to `cb`, and free the build. Returns the documents
@@ -125,34 +193,17 @@ pub unsafe extern "C" fn tantivy_build_finish(
     ctx: *mut c_void,
     err: *mut *mut c_char,
 ) -> i64 {
-    let build = unsafe { Box::from_raw(b) };
-    let result = build.finish(|bytes| {
-        let mut msg = [0u8; MSG_CAP];
-        match cb(
-            ctx,
-            bytes.as_ptr(),
-            bytes.len() as u64,
-            msg.as_mut_ptr().cast(),
-            MSG_CAP,
-        ) {
-            0 => Ok(()),
-            _ => Err(anyhow!("{}", message(&msg))),
-        }
-    });
-    match result {
-        Ok(n) => n as i64,
-        Err(e) => {
-            set_err(err, &e);
-            -1
-        }
-    }
+    guard(err, -1, || {
+        handle(b)?;
+        Ok(unsafe { Box::from_raw(b) }.finish(writer(cb, ctx))? as i64)
+    })
 }
 
 /// Discard and free the build.
 #[no_mangle]
 pub unsafe extern "C" fn tantivy_build_abort(b: *mut Build) {
     if !b.is_null() {
-        drop(unsafe { Box::from_raw(b) });
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(unsafe { Box::from_raw(b) })));
     }
 }
 
@@ -181,39 +232,143 @@ pub unsafe extern "C" fn tantivy_split_open(
             _ => Err(std::io::Error::other(message(&msg))),
         }
     };
-    match Split::open(size, Arc::new(read)) {
-        Ok(s) => Box::into_raw(Box::new(s)),
-        Err(e) => {
-            set_err(err, &e);
-            std::ptr::null_mut()
-        }
-    }
+    guard(err, std::ptr::null_mut(), || {
+        Ok(Box::into_raw(Box::new(Split::open(size, Arc::new(read))?)))
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn tantivy_split_close(s: *mut Split) {
     if !s.is_null() {
-        drop(unsafe { Box::from_raw(s) });
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(unsafe { Box::from_raw(s) })));
     }
 }
 
-/// Search with a tantivy query; `options` (may be NULL) is search options as
-/// JSON. Calls `cb` per hit, best first, with its score and stored fields as a
-/// JSON object. 0 ok, -1 error.
+/// Search `n` splits with a query (tantivy's syntax, or OpenSearch query DSL
+/// as JSON); `options` (may be NULL) is search options as JSON. Calls `cb` per
+/// hit, best first: its split's position, score, and doc as a JSON object.
+/// 0 ok, -1 error.
 #[no_mangle]
-pub unsafe extern "C" fn tantivy_split_search(
-    s: *const Split,
+pub unsafe extern "C" fn tantivy_search(
+    s: *const *const Split,
+    n: usize,
     query: *const c_char,
     options: *const c_char,
+    exclude_kind: c_int,
+    exclude_data: *const c_void,
+    exclude_len: usize,
     cb: HitCb,
     ctx: *mut c_void,
     err: *mut *mut c_char,
 ) -> c_int {
-    let run = || -> Result<()> {
-        for (score, doc) in unsafe { &*s }.search(text(query)?, text(options)?)? {
-            cb(ctx, score as f64, doc.as_ptr().cast(), doc.len());
+    guard(err, -1, || {
+        let splits = splits(s, n)?;
+        let exclude = exclude(exclude_kind, exclude_data, exclude_len)?;
+        let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?;
+        for (split, score, doc) in request.hits()? {
+            cb(ctx, split, score as f64, doc.as_ptr().cast(), doc.len());
         }
-        Ok(())
-    };
-    status(run(), err)
+        Ok(0)
+    })
+}
+
+/// The number of matches over `n` splits, or -1.
+#[no_mangle]
+pub unsafe extern "C" fn tantivy_count(
+    s: *const *const Split,
+    n: usize,
+    query: *const c_char,
+    options: *const c_char,
+    exclude_kind: c_int,
+    exclude_data: *const c_void,
+    exclude_len: usize,
+    err: *mut *mut c_char,
+) -> i64 {
+    guard(err, -1, || {
+        let splits = splits(s, n)?;
+        let exclude = exclude(exclude_kind, exclude_data, exclude_len)?;
+        let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?;
+        Ok(request.count()? as i64)
+    })
+}
+
+/// Tantivy aggregations (`aggs`, Elasticsearch's JSON) over the matches in
+/// `n` splits, merged; the result in `*out` (free with `tantivy_free_str`).
+/// 0 ok, -1 error.
+#[no_mangle]
+pub unsafe extern "C" fn tantivy_aggregate(
+    s: *const *const Split,
+    n: usize,
+    query: *const c_char,
+    aggs: *const c_char,
+    options: *const c_char,
+    exclude_kind: c_int,
+    exclude_data: *const c_void,
+    exclude_len: usize,
+    out: *mut *mut c_char,
+    err: *mut *mut c_char,
+) -> c_int {
+    guard(err, -1, || {
+        anyhow::ensure!(!out.is_null(), "null tantivy result pointer");
+        let splits = splits(s, n)?;
+        let exclude = exclude(exclude_kind, exclude_data, exclude_len)?;
+        let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?;
+        let json = request.aggregate(text(aggs)?)?;
+        unsafe { *out = CString::new(json)?.into_raw() };
+        Ok(0)
+    })
+}
+
+/// Merge `n` splits into one without the excluded documents, written to
+/// `cb`. Returns the documents kept, or -1.
+#[no_mangle]
+pub unsafe extern "C" fn tantivy_merge(
+    s: *const *const Split,
+    n: usize,
+    options: *const c_char,
+    exclude_kind: c_int,
+    exclude_data: *const c_void,
+    exclude_len: usize,
+    cb: WriteCb,
+    ctx: *mut c_void,
+    err: *mut *mut c_char,
+) -> i64 {
+    guard(err, -1, || {
+        let splits = splits(s, n)?;
+        let exclude = exclude(exclude_kind, exclude_data, exclude_len)?;
+        Ok(split::merge(&splits, text(options)?, exclude.as_ref(), writer(cb, ctx))? as i64)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_panics_and_null_handles_without_aborting() {
+        let mut err = std::ptr::null_mut();
+        assert_eq!(
+            guard(&mut err, -1, || -> Result<i32> { panic!("test panic") }),
+            -1
+        );
+        assert!(unsafe { CStr::from_ptr(err) }
+            .to_str()
+            .unwrap()
+            .contains("test panic"));
+        unsafe { tantivy_free_str(err) };
+        err = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { tantivy_build_add(std::ptr::null(), std::ptr::null(), 0, &mut err) },
+            -1
+        );
+        assert!(unsafe { CStr::from_ptr(err) }
+            .to_str()
+            .unwrap()
+            .contains("null tantivy handle"));
+        unsafe { tantivy_free_str(err) };
+        assert!(splits(std::ptr::null(), 1).is_err());
+        assert!(exclude(1, std::ptr::null(), 1).is_err());
+        assert!(exclude(2, std::ptr::null(), 1).is_err());
+        assert!(splits(std::ptr::null(), 0).unwrap().is_empty());
+    }
 }

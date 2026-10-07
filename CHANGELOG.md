@@ -4,6 +4,30 @@ pgvfs is in beta: the SQL interface and configuration are expected to stay,
 but storage layout changes are still possible (see "Storage layout" in the
 docs). Each release lists its layout version.
 
+## Unreleased
+
+Storage layout: **v2** (unchanged).
+
+- Exclude dead IDs before tantivy top-k, exact counts and aggregations, using
+  portable 32/64-bit roaring BLOBs or `BIGINT[]` on a fast integer key. Bitmap
+  paths use DuckDB's `read_blob`, so every filesystem works.
+- Fast-field-only hit projection, `tantivy_count`, and `tantivy_aggregate`
+  with tantivy's Elasticsearch-shaped requests, including terms and cardinality.
+- OpenSearch query-DSL subset: fuzzy, prefix, exists, boolean clauses,
+  minimum-should-match and non-scoring filters; unsupported parameters fail.
+- List-of-splits search, counts and aggregation merging; optional combined
+  BM25 statistics. Hits now also include their split `path`.
+- `tantivy_merge` compacts segments natively, optionally removing excluded
+  documents. `tantivy_index` accepts rows/structs directly.
+- Prepared index plans own their execution resources correctly: repeated
+  execution and retries after errors neither crash nor keep partial documents.
+  Rust panics at the tantivy C boundary become errors; oversized top-k is clamped.
+- `pgvfs_drop_volume` removes one volume through the writer and invalidates
+  caches. Directory removal unpublishes a key prefix.
+- DuckDB 2.0 scalar error declarations and filesystem access checks, including
+  cached splits. SQL and PostgreSQL tests cover snapshot liveness and native
+  compaction; changes inserted then deleted within one range are not indexed.
+
 ## 0.2.0-beta.4
 
 Storage layout: **v2** (unchanged).

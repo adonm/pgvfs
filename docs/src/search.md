@@ -18,7 +18,10 @@ indexes.
 | Function | |
 | --- | --- |
 | `tantivy_index(index, schema, doc [, options])` | aggregate: builds a split from its rows |
-| `tantivy_search(index, query, ...)` | table: searches a split; with a lateral join, many |
+| `tantivy_search(index, query, ...)` | table: ranked hits from one split or a list of them |
+| `tantivy_count(index, query, ...)` | scalar: exact total, without loading stored documents |
+| `tantivy_aggregate(index, query, aggs, ...)` | scalar: tantivy's aggregations as JSON, merged across splits |
+| `tantivy_merge(splits, target, ...)` | scalar: native compaction, without re-indexing documents |
 | `tantivy_drop(index)` | scalar: removes a split |
 | `tantivy_create_index`, `tantivy_match_bm25` | macros that work like DuckDB's [fts](https://duckdb.org/docs/current/core_extensions/full_text_search) |
 
@@ -69,76 +72,123 @@ Index each load's changes as a new split. DuckLake's
 gives the rows inserted or updated between two snapshots. Each row's `rowid`
 stays the same across updates and compaction, and its `snapshot_id` is the
 snapshot that wrote the current version. Together they let a search keep
-only hits on current rows.
+only hits on current rows. To exclude stale versions **before** top-k, counting
+and aggregation, record deletes and updates as invalidations too.
 
 ```sql
--- once: the index's splits, and the first one, of the whole table
+-- once: splits, invalidations, and a durable indexing watermark
 CREATE TABLE lake.docs_splits (path VARCHAR, snapshot BIGINT, docs BIGINT);
+CREATE TABLE lake.docs_fts_dead (rowid BIGINT, snapshot BIGINT);
+CREATE TABLE lake.docs_fts_state (snapshot BIGINT);
+BEGIN;
 SET VARIABLE s1 = (SELECT id::BIGINT FROM lake.current_snapshot());
 INSERT INTO lake.docs_splits
 SELECT path, getvariable('s1'), tantivy_index(path,
-    '[{"name": "rowid", "type": "i64", "options": {"stored": true, "indexed": true}},
+    '[{"name": "rowid", "type": "i64", "options": {"stored": true, "indexed": true, "fast": true}},
       {"name": "body", "type": "text", "options": {"indexing": {"record": "position", "tokenizer": "en_stem"}}}]',
-    to_json(c))
+    c)
 FROM (SELECT 'pgvfs://lake-fts/docs/' || getvariable('s1') || '.tantivy' AS path, rowid, * FROM lake.docs) c
 GROUP BY path;
+INSERT INTO lake.docs_fts_state VALUES (getvariable('s1'));
+COMMIT;
 
--- after each load, on the writer: a split of the rows changed since the last
--- one, at their latest version (rows deleted since drop out at search time)
-SET VARIABLE s0 = (SELECT max(snapshot) FROM lake.docs_splits);
+-- after each load, on the writer
+BEGIN;
+SET VARIABLE s0 = (SELECT snapshot FROM lake.docs_fts_state);
 SET VARIABLE s1 = (SELECT id::BIGINT FROM lake.current_snapshot());
+CREATE OR REPLACE TEMP TABLE docs_changes AS
+FROM lake.table_changes('docs', getvariable('s0') + 1, getvariable('s1'));
+
+INSERT INTO lake.docs_fts_dead
+SELECT DISTINCT rowid, snapshot_id FROM docs_changes
+WHERE change_type IN ('delete', 'update_preimage');
+
 INSERT INTO lake.docs_splits
-SELECT path, getvariable('s1'), tantivy_index(path, '<the same schema>', to_json(c))
+SELECT path, getvariable('s1'), tantivy_index(path, '<the same schema>', c)
 FROM (
     SELECT 'pgvfs://lake-fts/docs/' || getvariable('s1') || '.tantivy' AS path, *
-    FROM lake.table_changes('docs', getvariable('s0') + 1, getvariable('s1'))
+    FROM (
+        SELECT * FROM docs_changes
+        WHERE change_type IN ('insert', 'update_postimage', 'delete')
+        QUALIFY row_number() OVER (PARTITION BY rowid ORDER BY snapshot_id DESC) = 1
+    ) latest
     WHERE change_type IN ('insert', 'update_postimage')
-    QUALIFY row_number() OVER (PARTITION BY rowid ORDER BY snapshot_id DESC) = 1
 ) c
 GROUP BY path;
+UPDATE lake.docs_fts_state SET snapshot = getvariable('s1');
+COMMIT;
 ```
 
 `table_changes` reads only the files that changed, so a load's split costs
-in proportion to the load, not the table. A split's row in `docs_splits` is written only once the split is complete.
-If the statement fails after that, the split is left unlisted; drop it. A
-load with no changes adds no split. To search, search every split and keep
-only hits on rows that still exist and whose current version that split
-indexed:
+in proportion to the load, not the table. Choose the latest event **including
+deletes**, then discard deleted rows: otherwise a row inserted and deleted
+inside the range would incorrectly enter the split. The watermark advances
+even on delete-only loads. Retain the change feed until each range is processed.
+
+Publish the splits, invalidations and watermark together. Files themselves are
+not transactional: if the SQL transaction fails after writing a split, drop
+the unlisted file before retrying.
+
+Readers can search the latest **indexed** snapshot coherently, even while the
+next load is being indexed. Each split gets the IDs invalidated after its
+snapshot and up to the indexing watermark:
 
 ```sql
+BEGIN;
+SET VARIABLE r = (SELECT snapshot FROM lake.docs_fts_state);
 SELECT d.*, h.score
 FROM lake.docs_splits s
-CROSS JOIN tantivy_search(s.path, 'small cats', '{"top_k": 10}') h
-JOIN lake.docs d ON d.rowid = (h.doc->>'rowid')::BIGINT AND d.snapshot_id <= s.snapshot
+CROSS JOIN tantivy_search(s.path, 'small cats',
+    '{"top_k": 10, "fast": ["rowid"], "exclude_field": "rowid"}',
+    (SELECT list(rowid) FROM lake.docs_fts_dead x
+     WHERE x.snapshot > s.snapshot AND x.snapshot <= getvariable('r'))) h
+JOIN lake.docs d AT (VERSION => getvariable('r')) ON d.rowid = (h.doc->>'rowid')::BIGINT
 ORDER BY h.score DESC
 LIMIT 10;
+COMMIT;
 ```
 
 `top_k` applies per split, so it bounds each split's work while `LIMIT`
-picks the overall best. Each split scores with its own term statistics, as
-Elasticsearch shards and Quickwit splits do.
+picks the overall best. Exclusion happens before that bound: a dead hit cannot
+crowd out a live one. Sum `tantivy_count(s.path, query, options, dead_ids)` with
+the same exclusions for the exact total. Without exclusions, joining live rows
+**after** top-k can underfill a page and cannot give correct totals.
 
-**Compaction.** Every split is a search, so merge them as they pile up. The
-same statement over a longer range, `table_changes('docs', a + 1, b)`, builds
-one split that replaces the splits covering snapshots `a + 1` to `b`. Swap it
-in and drop them:
+Keep the indexed data snapshot available if joining its rows as above. Each
+split scores with its own term statistics by default. A list argument searches
+several splits in one call; `global_stats` uses their combined statistics.
+
+**Native compaction.** Merge splits as they pile up. When rowids occur in old
+and new versions, first prune each source with its **own** dead set, then merge
+the live segments. Neither step rescans the table or re-indexes documents:
 
 ```sql
-CREATE TEMP TABLE merged AS
-SELECT path, 1234 AS snapshot, tantivy_index(path, '<schema>', to_json(c)) AS docs
-FROM (<the query above over table_changes('docs', 1001, 1234), path 'pgvfs://lake-fts/docs/1001-1234.tantivy'>) c
-GROUP BY path;
-CREATE TEMP TABLE replaced AS FROM lake.docs_splits WHERE snapshot BETWEEN 1001 AND 1234;
 BEGIN;
-DELETE FROM lake.docs_splits WHERE snapshot BETWEEN 1001 AND 1234;
+SET VARIABLE r = (SELECT snapshot FROM lake.docs_fts_state);
+CREATE TEMP TABLE replaced AS SELECT *, uuid()::VARCHAR AS token FROM lake.docs_splits;
+CREATE TEMP TABLE cleaned AS
+SELECT 'pgvfs://lake-fts/staging/' || s.token || '.tantivy' AS path,
+       tantivy_merge([s.path], 'pgvfs://lake-fts/staging/' || s.token || '.tantivy',
+           '{"exclude_field": "rowid"}',
+           (SELECT list(rowid) FROM lake.docs_fts_dead x
+            WHERE x.snapshot > s.snapshot AND x.snapshot <= getvariable('r'))) AS docs
+FROM replaced s;
+CREATE TEMP TABLE merged AS
+SELECT 'pgvfs://lake-fts/docs/compact-' || getvariable('r') || '.tantivy' AS path,
+       getvariable('r') AS snapshot,
+       tantivy_merge((SELECT list(path) FROM cleaned),
+           'pgvfs://lake-fts/docs/compact-' || getvariable('r') || '.tantivy') AS docs;
+DELETE FROM lake.docs_splits;
 INSERT INTO lake.docs_splits FROM merged;
 COMMIT;
-SELECT tantivy_drop(path) FROM replaced;
+SELECT tantivy_drop(path) FROM (SELECT path FROM replaced UNION ALL SELECT path FROM cleaned);
 ```
 
-This needs the change feed for the range, so compact before expiring those
-snapshots. After that, `FROM lake.docs WHERE snapshot_id BETWEEN 1001 AND 1234`
-selects the same rows by scanning the table.
+The output must have a new path; use a unique one for another compaction at the
+same watermark. On object storage, delay dropping replaced files until old
+readers have finished. Native merging does not deduplicate keys automatically.
+Retain invalidations while an active split still needs them. You can instead
+rebuild from a longer change-feed range, using the same latest-event rule.
 
 **Large tables.** A tantivy split holds at most 2³¹ documents, and a smaller
 one builds, merges and opens faster. Partition big builds: `GROUP BY` builds
@@ -152,20 +202,22 @@ dozen in all, since a query searches each one.
 ### `tantivy_index(index, schema, doc [, options])`
 
 An aggregate that builds a split at `index`, a path DuckDB can write, from one
-JSON document per row, and returns the number of documents. The split is
+document per row, and returns the number of documents. The split is
 written as the aggregate finishes. The arguments are per row: with
 `GROUP BY`, each group builds its own split, and every row of a group must
 name the same `index`. No rows, no split. `index` must not exist yet (on
-pgvfs, only the writer can write). A failed or cancelled build leaves
-nothing behind.
+pgvfs, only the writer can write). A failed split write cleans up its target;
+already completed splits are not rolled back with the SQL statement.
 
 - `schema` is a tantivy schema as JSON: an array of
   [field entries](https://docs.rs/tantivy/latest/tantivy/schema/index.html).
   Each has a `name`, a `type` (`text`, `i64`, `u64`, `f64`, `bool`, `date`,
   `facet`, `bytes`, `json_object` or `ip_addr`) and `options` (indexing,
   tokenizer, `stored`, `fast`, `coerce` and so on).
-- `doc` is a JSON object, usually `to_json(t)` for row `t`. Fields not in the
-  schema and `null`s are skipped; an array gives a field several values.
+- `doc` is a row/`STRUCT` (just pass `t`; it is cast to JSON, which needs DuckDB's
+  `json` extension, autoloaded in standard builds), or a JSON object as text.
+  Fields not in the schema and `null`s are skipped; an array gives a field
+  several values.
   `coerce` on a text field indexes numbers as text.
 - `options`, as JSON:
   - `tokenizers`: named analyzers to use in the schema, besides tantivy's
@@ -183,9 +235,10 @@ nothing behind.
   - `merge`: merge into one segment (default `true`), so a search reads each
     term once.
 
-### `tantivy_search(index, query [, options])`
+### `tantivy_search(index, query [, options [, exclude]])`
 
-Searches the split at `index`. Returns `score DOUBLE` and `doc JSON` per hit,
+Searches a path (`VARCHAR`) or a list of paths (`VARCHAR[]`). Returns
+`score DOUBLE`, `doc JSON`, and the hit's split `path VARCHAR` per hit,
 best first; `doc` holds the hit's stored fields, a value each or an array for
 several. All arguments may be columns, so a lateral join searches every split
 in a table (`FROM splits s CROSS JOIN tantivy_search(s.path, ...)`), or runs a
@@ -193,14 +246,117 @@ query per row. A `NULL` index or query finds nothing. The query uses
 tantivy's
 [query language](https://docs.rs/tantivy/latest/tantivy/query/struct.QueryParser.html):
 words, `"phrases"`, `+required` and `-excluded` terms, `field:term` and
-ranges such as `id:[10 TO 20]`. `options`, as JSON:
+ranges such as `id:[10 TO 20]`. A query starting with `{` is instead
+[OpenSearch query DSL](#query-dsl). `options`, as JSON:
 
 | Option | Default | |
 | --- | --- | --- |
-| `top_k` | every hit | the number of top hits |
+| `top_k` | every hit | top hits across the whole list of splits; use a bound on large indexes |
 | `fields` | every indexed text field | the fields to search for terms that name none |
 | `conjunctive` | `false` | every term must match |
 | `strict` | `false` | fail on query syntax errors instead of dropping what tantivy cannot parse |
+| `fast` | stored fields | build `doc` only from these fast fields, without reading stored documents; `[]` returns `{}` |
+| `exclude_field` | none | an `i64` or `u64` fast field whose values are in `exclude`; exactly one value on every document |
+| `global_stats` | `false` | use combined BM25 statistics; needs the same schema across splits; statistics still include excluded documents |
+
+`exclude` is a portable roaring bitmap `BLOB` (32-bit bitmap or 64-bit treemap),
+or a `BIGINT[]` of dead IDs. `NULL` means no exclusions. Signed IDs use their
+unsigned 64-bit bit pattern in a treemap. Read a bitmap path with DuckDB itself:
+
+```sql
+FROM tantivy_search('pgvfs://lake-fts/docs.tantivy', 'roof',
+    '{"top_k": 10, "exclude_field": "rowid", "fast": ["rowid"]}',
+    (SELECT content FROM read_blob('pgvfs://lake-fts/dead.roaring')));
+```
+
+One exclusion set applies to every split in a list. If a rowid is dead in an
+old split but live in a new one, use per-split exclusions with lateral calls
+as above, or index a unique **document-version** key. Do not globally exclude
+that rowid from both versions.
+
+Fast projection keeps grouping and typed output in SQL. For example, with
+`roof_id` and `building_id` declared fast in your schema:
+
+```sql
+SELECT doc->>'building_id' AS building,
+       arg_max((doc->>'roof_id')::BIGINT, score) AS best_roof
+FROM tantivy_search(['s3://bucket/part-1.tantivy', 's3://bucket/part-2.tantivy'],
+    'roof', '{"fast": ["roof_id", "building_id"]}')
+GROUP BY building;
+```
+
+### `tantivy_count(index, query [, options [, exclude]])`
+
+The exact number of matches, as `BIGINT`, across one split or a list of them.
+Uses the same query, options and exclusions as search, but ignores `top_k`
+and reads no stored documents. A `NULL` index or query returns `NULL`; an
+empty list returns zero.
+
+### `tantivy_aggregate(index, query, aggs [, options [, exclude]])`
+
+Tantivy's [aggregation module](https://docs.rs/tantivy/latest/tantivy/aggregation/index.html),
+directly: Elasticsearch-shaped aggregation requests and results as JSON.
+Includes terms, cardinality, stats, ranges and histograms; fields must be fast.
+Intermediate results merge natively across splits. Exclusions apply first;
+`top_k` does not limit aggregations. Cardinality is approximate. Tantivy's
+default memory and bucket limits apply across the request.
+
+```sql
+SELECT tantivy_aggregate(['part-1.tantivy', 'part-2.tantivy'], 'roof',
+    '{"buildings": {"terms": {"field": "building_id", "size": 20}},
+      "unique_roofs": {"cardinality": {"field": "roof_id"}}}');
+```
+
+### `tantivy_merge(splits, target [, options [, exclude]])`
+
+Copies the source segments into a local temporary index and merges them into
+one split at `target`, returning the documents kept. `splits` is a nonempty
+`VARCHAR[]`; schemas and custom tokenizer definitions must agree. The first
+source's index settings are used. Sources are unchanged, and `target` must
+not exist. The temporary index needs disk for the sources and merged output.
+
+Options: `memory_budget` (default 256 MB) and `exclude_field`. Exclusions have
+the same formats as search, and delete documents during compaction. They need
+only a fast integer key, not an indexed one. A merge does not deduplicate IDs;
+the caller decides which versions are live.
+
+### Query DSL
+
+Pass the query object directly, or wrap it as `{"query": ...}` (not a whole
+OpenSearch search request with `size`, `_source`, etc.):
+
+```sql
+FROM tantivy_search('docs.tantivy',
+    '{"bool": {
+        "must": {"match": {"body": {"query": "roofs", "fuzziness": "AUTO"}}},
+        "filter": {"term": {"building_id": "b17"}},
+        "must_not": {"term": {"status": "demolished"}}
+    }}', '{"top_k": 10, "fast": ["roof_id", "building_id"]}');
+```
+
+This is a **subset**, compiled to tantivy queries, not an OpenSearch server.
+Unsupported query types and parameters fail rather than being silently ignored:
+
+| Query | Supported parameters |
+| --- | --- |
+| `bool` | `must`, `should`, `must_not`, `filter`, `minimum_should_match` |
+| `match` | `query`, `operator` (`and`/`or`), `minimum_should_match`, `fuzziness`, `fuzzy_transpositions` |
+| `match_phrase`, `match_phrase_prefix` | `query`; `slop` for phrases, `max_expansions` for phrase prefixes |
+| `multi_match` | named `fields` (with `^boost`), `best_fields`, `most_fields`, `phrase`, `phrase_prefix`; applicable match parameters, `tie_breaker` |
+| `term`, `terms` | exact typed values, without analysis |
+| `prefix`, `wildcard`, `regexp`, `fuzzy` | text `value`; wildcard `*`, `?`, escapes; fuzzy `fuzziness`, `transpositions` |
+| `exists` | `field` (must be fast) |
+| `range` | `gt`, `gte`, `lt`, `lte` |
+| `constant_score`, `dis_max` | `filter`; `queries` and `tie_breaker`, respectively |
+| `match_all`, `match_none` | |
+| `query_string`, `simple_query_string` | `query`, named `fields`, `default_field`, `default_operator`; tantivy syntax, lenient for `simple_query_string` |
+
+`boost` is supported in query parameter objects. `minimum_should_match` accepts
+integers, negative integers, percentages and negative percentages, not
+conditional expressions. Fuzziness is `0`, `1`, `2` or `AUTO[:low,high]`.
+`bool.filter` and `must_not` do not contribute scores. Numeric values, booleans,
+RFC 3339 dates (or epoch milliseconds), facets and IP addresses are typed by
+the schema. Regular expressions and scoring follow tantivy's behaviour.
 
 ### `tantivy_drop(index)`
 
@@ -225,7 +381,7 @@ parameters:
 `tantivy_match_bm25(index, input_id, query_string, fields := NULL, conjunctive := false)`
 returns a row's score, or `NULL`. `fields` restricts the search to some
 columns (`'title, body'`), and `conjunctive` requires every term. The query
-is parsed leniently, so any user input works. BM25 uses tantivy's
+uses tantivy's lenient query-string parser, or the DSL above. BM25 uses tantivy's
 `k1 = 1.2` and `b = 0.75`.
 
 Both macros are short SQL over the functions above (`CREATE_INDEX_MACRO`
@@ -243,8 +399,8 @@ with the lake.
   and a small footer naming them.
 - **Searches** read a split through DuckDB's filesystem, opening it once per
   DuckDB database and keeping its term dictionaries in memory. A search then
-  reads each query term's postings, plus the stored fields of the hits: a
-  few range reads, so a search on pgvfs takes milliseconds. An open split is
+  reads query postings and the requested stored or fast fields. Counts and
+  aggregations skip the document store. An open split is
   checked for a change (size, modification time, version tag) at most every
   10 s, so another process's rebuild at the same path shows up within that.
 - **Drops** remove the file. On pgvfs its rows stay for the usual 10-minute

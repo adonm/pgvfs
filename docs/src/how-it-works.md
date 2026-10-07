@@ -42,6 +42,11 @@ database (`CREATE TABLE new.t AS FROM old.t`).
 
 ## Operations
 
+- **Dropping a volume.** On the writer, `SELECT pgvfs_drop_volume('lake-fts');`
+  unpublishes all files in exactly that volume and returns their count. It
+  invalidates that database's file and search caches; rows are reaped after
+  the usual grace. This is destructive: DuckLake's catalog is not removed,
+  so do not drop an active lake's data volume.
 - **Reaping.** Deleted files' rows are removed by the writer, at most once a
   minute while it writes and when it first connects. If writes stop for a
   long time, reap from cron or a scheduler, as the writer's role:

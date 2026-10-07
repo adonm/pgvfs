@@ -13,5 +13,6 @@ public:
 
 //! Tantivy search splits on any DuckDB filesystem (tantivy_functions.cpp).
 void RegisterTantivy(ExtensionLoader &loader);
+void ForgetTantivyPrefix(ClientContext &context, const string &prefix);
 
 } // namespace duckdb

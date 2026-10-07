@@ -38,6 +38,8 @@ int pgvfs_list(const PgvfsConn *conn, const char *volume, const char *prefix, in
                void *ctx, char **err);
 /* 0 removed, 1 not found, -1 error */
 int pgvfs_remove(const PgvfsConn *conn, const char *volume, const char *path, char **err);
+/* every file under prefix ("" for the whole volume); how many, or -1 */
+int64_t pgvfs_remove_prefix(const PgvfsConn *conn, const char *volume, const char *prefix, char **err);
 /* replaces any file at `to`; 0 ok, -1 error */
 int pgvfs_rename(const PgvfsConn *conn, const char *volume, const char *from, const char *to, char **err);
 

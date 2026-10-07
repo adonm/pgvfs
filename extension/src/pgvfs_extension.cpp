@@ -21,7 +21,9 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/client_context_file_opener.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include <cstdlib>
 #include <mutex>
@@ -330,12 +332,36 @@ public:
 		}
 	}
 
-	// Directories are key prefixes: they exist while they hold a file.
-	// DuckLake never removes directories, so RemoveDirectory stays
-	// unimplemented (DuckDB's base class throws).
+	// Directories are key prefixes: they exist while they hold a file, and
+	// removing one removes every file under it, in one statement.
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) override {
 		auto p = Parse(directory);
 		return !List(Conn(opener), p.volume, DirPrefix(p.path), 1).empty();
+	}
+
+	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) override {
+		auto p = Parse(directory);
+		RemovePrefix(Conn(opener), p.volume, DirPrefix(p.path));
+		auto context = FileOpener::TryGetClientContext(opener);
+		if (context) {
+			ForgetTantivyPrefix(*context, string(SCHEME) + p.volume + "/" + DirPrefix(p.path));
+		}
+	}
+
+	// Every file under prefix ("" for the whole volume): how many there were.
+	static int64_t RemovePrefix(PgvfsConn *conn, const string &volume, const string &prefix) {
+		char *err = nullptr;
+		auto n = pgvfs_remove_prefix(conn, volume.c_str(), prefix.c_str(), &err);
+		if (n < 0) {
+			Fail("remove", string(SCHEME) + volume + "/" + prefix, err);
+		}
+		return n;
+	}
+
+	// For SQL functions: this database's connection.
+	PgvfsConn *Connect(ClientContext &context) {
+		ClientContextFileOpener opener(context);
+		return Conn(&opener);
 	}
 
 	void CreateDirectory(const string &, optional_ptr<FileOpener>) override {
@@ -514,6 +540,55 @@ void StatsFunction(DataChunk &, ExpressionState &, Vector &result) {
 	pgvfs_free_str(json);
 }
 
+// How SQL functions find this database's PgvfsFileSystem.
+struct PgvfsEntry : public ObjectCacheEntry {
+	explicit PgvfsEntry(PgvfsFileSystem &fs) : fs(fs) {
+	}
+	static string ObjectType() {
+		return "pgvfs_filesystem";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // never evicted
+	}
+	PgvfsFileSystem &fs;
+};
+
+// pgvfs_drop_volume(volume): remove every file in a volume; how many there
+// were. Their rows are reaped after the usual grace. The writer only.
+void DropVolumeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	auto entry = ObjectCache::GetObjectCache(context).Get<PgvfsEntry>(PgvfsEntry::ObjectType());
+	if (!entry) {
+		throw InternalException("pgvfs is not loaded in this database");
+	}
+	PgvfsConn *conn = nullptr;
+	for (idx_t i = 0; i < args.size(); i++) {
+		auto volume = args.data[0].GetValue(i);
+		if (volume.IsNull()) {
+			result.SetValue(i, Value());
+			continue;
+		}
+		auto name = volume.ToString();
+		if (name.find('\0') != string::npos) {
+			throw InvalidInputException("pgvfs volume cannot contain NUL");
+		}
+		auto path = string(SCHEME) + name + "/";
+		if (!DBConfig::GetConfig(context).CanAccessFile(path, FileType::FILE_TYPE_DIR) ||
+		    FileSystem::GetFileSystem(context).IsDisabledForPath(path)) {
+			throw PermissionException("Cannot drop pgvfs volume %s - file system operations are disabled", name);
+		}
+		if (!conn) {
+			conn = entry->fs.Connect(context);
+		}
+		auto n = PgvfsFileSystem::RemovePrefix(conn, name, "");
+		ForgetTantivyPrefix(context, path);
+		result.SetValue(i, Value::BIGINT(n));
+	}
+}
+
 void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
@@ -528,8 +603,18 @@ void LoadInternal(ExtensionLoader &loader) {
 	if (config.HasExtensionOption("parquet_metadata_cache")) {
 		config.SetOption("parquet_metadata_cache", Value::BOOLEAN(true));
 	}
-	db.GetFileSystem().RegisterSubSystem(make_uniq<PgvfsFileSystem>());
+	auto fs = make_uniq<PgvfsFileSystem>();
+	db.GetObjectCache().Put(PgvfsEntry::ObjectType(), make_shared_ptr<PgvfsEntry>(*fs));
+	db.GetFileSystem().RegisterSubSystem(std::move(fs));
 	RegisterTantivy(loader);
+
+	ScalarFunction drop_volume("pgvfs_drop_volume", {LogicalType::VARCHAR}, LogicalType::BIGINT, DropVolumeFunction);
+	drop_volume.SetVolatile();
+#if __has_include("duckdb/function/aggregate_state_layout.hpp")
+	drop_volume.SetFallible();
+#endif
+	loader.RegisterFunction(std::move(drop_volume));
+
 	ScalarFunction stats("pgvfs_stats", vector<LogicalType> {}, LogicalType::VARCHAR, StatsFunction);
 	stats.SetVolatile();
 	CreateScalarFunctionInfo stats_info(stats);

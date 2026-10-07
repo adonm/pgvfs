@@ -5,6 +5,8 @@
 
 require parquet
 
+require json
+
 require pgvfs
 
 query I
@@ -25,9 +27,9 @@ pgvfs needs PostgreSQL credentials
 # Tantivy splits use any DuckDB filesystem; here, local files.
 query I
 SELECT tantivy_index('__TEST_DIR__/docs.tantivy',
-    '[{"name": "id", "type": "i64", "options": {"stored": true, "indexed": true}},
+    '[{"name": "id", "type": "i64", "options": {"stored": true, "indexed": true, "fast": true}},
       {"name": "body", "type": "text", "options": {"indexing": {"record": "position", "tokenizer": "en_stem"}}}]',
-    to_json(t))
+    t)
 FROM (VALUES (1, 'quick brown foxes'), (2, 'lazy cats')) t(id, body)
 ----
 2
@@ -37,6 +39,110 @@ SELECT score > 0, (doc->>'id')::INTEGER FROM tantivy_search('__TEST_DIR__/docs.t
 ----
 true	1
 
+query I
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', 'fox', NULL)
+----
+1
+
+query I
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '*', '{"exclude_field":"id"}', [1])
+----
+1
+
+query I
+SELECT count(*) FROM tantivy_search('__TEST_DIR__/docs.tantivy', 'fox',
+    '{"exclude_field":"id","top_k":1}', [1])
+----
+0
+
+query II
+SELECT (doc->>'id')::INTEGER, path = '__TEST_DIR__/docs.tantivy'
+FROM tantivy_search('__TEST_DIR__/docs.tantivy', 'fox', '{"fast":["id"]}')
+----
+1	true
+
+query I
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '{"match":{"body":{"query":"foz","fuzziness":1}}}')
+----
+1
+
+query I
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '{"bool":{"filter":{"term":{"id":1}}}}')
+----
+1
+
+query I
+SELECT round((tantivy_aggregate('__TEST_DIR__/docs.tantivy', '*',
+    '{"n":{"cardinality":{"field":"id"}}}')->'n'->>'value')::DOUBLE)::INTEGER
+----
+2
+
+statement error
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '{"bool":{"filters":{"term":{"id":1}}}}')
+----
+unsupported bool parameter
+
+statement error
+FROM tantivy_search('__TEST_DIR__/docs.tantivy', 'fox', '{"fast":["body"]}')
+----
+not a fast field
+
+query I
+SELECT tantivy_index('__TEST_DIR__/docs2.tantivy',
+    '[{"name": "id", "type": "i64", "options": {"stored": true, "indexed": true, "fast": true}},
+      {"name": "body", "type": "text", "options": {"indexing": {"record": "position", "tokenizer": "en_stem"}}}]',
+    t)
+FROM (VALUES (3, 'red fox'), (4, 'a dog')) t(id, body)
+----
+2
+
+query I
+SELECT tantivy_count(['__TEST_DIR__/docs.tantivy', '__TEST_DIR__/docs2.tantivy'], 'fox')
+----
+2
+
+query I
+SELECT count(*) FROM tantivy_search(['__TEST_DIR__/docs.tantivy', '__TEST_DIR__/docs2.tantivy'], 'fox',
+    '{"top_k":1,"global_stats":true}')
+----
+1
+
+query I
+SELECT tantivy_merge(['__TEST_DIR__/docs.tantivy', '__TEST_DIR__/docs2.tantivy'],
+    '__TEST_DIR__/merged.tantivy', '{"exclude_field":"id"}', [1])
+----
+3
+
+query I
+SELECT tantivy_count('__TEST_DIR__/merged.tantivy', 'fox')
+----
+1
+
+statement ok
+PREPARE fts_build AS SELECT tantivy_index('__TEST_DIR__/prep.tantivy',
+    '[{"name":"id","type":"i64","options":{"stored":true,"indexed":true,"fast":true}}]',
+    t) FROM (VALUES (1)) t(id)
+
+query I
+EXECUTE fts_build
+----
+1
+
+query I
+SELECT tantivy_drop('__TEST_DIR__/prep.tantivy')
+----
+true
+
+query I
+EXECUTE fts_build
+----
+1
+
+query I
+SELECT tantivy_drop('__TEST_DIR__/prep.tantivy')
+----
+true
+
 statement error
 SELECT tantivy_index('__TEST_DIR__/docs.tantivy', '[]', '{}')
 ----
@@ -44,6 +150,16 @@ already exists
 
 query I
 SELECT tantivy_drop('__TEST_DIR__/docs.tantivy')
+----
+true
+
+query I
+SELECT tantivy_drop('__TEST_DIR__/docs2.tantivy')
+----
+true
+
+query I
+SELECT tantivy_drop('__TEST_DIR__/merged.tantivy')
 ----
 true
 

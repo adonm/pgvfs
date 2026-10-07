@@ -18,3 +18,4 @@ serde_json = "1"
 # No zstd: a C build on every platform.
 tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "stemmer", "stopwords"] }
 tempfile = "3"
+roaring = "0.11"

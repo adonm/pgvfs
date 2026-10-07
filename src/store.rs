@@ -407,6 +407,20 @@ pub async fn remove(pool: &Pool, volume: &str, path: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Unpublish every file under `prefix` ("" for the whole volume) at once.
+/// Returns how many there were.
+pub async fn remove_prefix(pool: &Pool, volume: &str, prefix: &str) -> Result<i64> {
+    let conn = pool.get().await?;
+    let n = conn
+        .execute_typed(
+            "WITH gone AS (DELETE FROM pgvfs.files WHERE volume = $1 AND left(path, length($2)) = $2 \
+             RETURNING file_id) INSERT INTO pgvfs.garbage (file_id) SELECT file_id FROM gone",
+            &[(&volume, Type::TEXT), (&prefix, Type::TEXT)],
+        )
+        .await?;
+    Ok(n as i64)
+}
+
 /// Rename within a volume, replacing any file at `to`.
 pub async fn rename(pool: &Pool, volume: &str, from: &str, to: &str) -> Result<()> {
     check_path(to)?;

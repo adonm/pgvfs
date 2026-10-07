@@ -208,6 +208,40 @@ async fn list_remove_rename() -> Result<()> {
 
 #[tokio::test]
 #[ignore]
+async fn removes_prefixes_and_volumes() -> Result<()> {
+    let (pool, _lease) = writer().await?;
+    let vol = volume("rp");
+    let other = volume("rq");
+    for p in ["a/1", "a/2", "a/b/3", "ab", "b/4"] {
+        write(&pool, &vol, p, b"x").await?;
+    }
+    write(&pool, &other, "a/1", b"y").await?;
+    let queued = |id| {
+        count(
+            &pool,
+            "SELECT count(*) FROM pgvfs.garbage WHERE file_id = $1",
+            id,
+        )
+    };
+    let a1 = store::open(&pool, &vol, "a/1").await?.unwrap();
+    assert_eq!(store::remove_prefix(&pool, &vol, "a/").await?, 3);
+    assert_eq!(
+        queued(a1.file_id).await?,
+        1,
+        "rows wait out the grace period"
+    );
+    assert_eq!(store::list(&pool, &vol, "", "", 100).await?, ["ab", "b/4"]);
+    assert_eq!(store::remove_prefix(&pool, &vol, "").await?, 2);
+    assert_eq!(store::remove_prefix(&pool, &vol, "").await?, 0);
+    assert!(
+        store::open(&pool, &other, "a/1").await?.is_some(),
+        "other volumes stay"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
 async fn one_writer_at_a_time() -> Result<()> {
     let (pool, lease) = writer().await?;
     let err = store::acquire_writer(&pool)
