@@ -72,7 +72,7 @@ PGVFS_TEST_DB_URL="$base/pgvfs_t" PGVFS_TEST_EMPTY_DB_URL="$base/empty_t" \
   PGVFS_TEST_STANDBY_URL="postgres://postgres:postgres@$(docker port "$name-standby" 5432/tcp)/pgvfs_t" \
   PGVFS_TEST_TLS_URL="postgres://postgres:postgres@localhost:$(docker port "$name-tls" 5432/tcp | cut -d: -f2)/postgres?sslmode=require" \
   PGVFS_TEST_TLS_CA="$certs/ca.crt" PGVFS_POOL_MIN=1 PGVFS_POOL_MAX=8 \
-  cargo test --locked --test store_contract -- --include-ignored --test-threads=1
+  cargo test --locked --test store_contract --test index_contract -- --include-ignored --test-threads=1
 
 if [ -n "${1:-}" ]; then
   PGVFS_TEST_URL="$base/pgvfs_t" \
