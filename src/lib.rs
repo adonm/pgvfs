@@ -589,7 +589,7 @@ pub unsafe extern "C" fn pgvfs_writer_abort(w: *mut PgvfsWriter) {
     }
 }
 
-/// Start a tantivy index build at pgvfs://`volume`/`path` (see `index`):
+/// Start building a tantivy split at pgvfs://`volume`/`path` (see `index`):
 /// `schema` is a tantivy schema as JSON, `options` (may be NULL) build options
 /// as JSON. Add documents with `pgvfs_index_add`, from any thread; finish with
 /// `pgvfs_index_commit` or `pgvfs_index_abort`.
@@ -631,8 +631,8 @@ pub unsafe extern "C" fn pgvfs_index_add(
     status(bytes_text(doc, len).and_then(|doc| b.add(doc)), err)
 }
 
-/// Commit and publish the index, replacing any there, and free the build.
-/// Returns the documents indexed, or -1 on error (nothing published).
+/// Commit the split and free the build. Returns the documents indexed, or -1
+/// on error (the build's files are removed).
 #[no_mangle]
 pub unsafe extern "C" fn pgvfs_index_commit(b: *mut index::Build, err: *mut *mut c_char) -> i64 {
     match unsafe { Box::from_raw(b) }.commit() {
@@ -644,7 +644,7 @@ pub unsafe extern "C" fn pgvfs_index_commit(b: *mut index::Build, err: *mut *mut
     }
 }
 
-/// Discard and free the build; nothing is published.
+/// Discard and free the build, removing its files.
 #[no_mangle]
 pub unsafe extern "C" fn pgvfs_index_abort(b: *mut index::Build) {
     if !b.is_null() {
@@ -654,9 +654,9 @@ pub unsafe extern "C" fn pgvfs_index_abort(b: *mut index::Build) {
 
 pub type HitCb = extern "C" fn(ctx: *mut c_void, score: f64, doc: *const c_char, len: usize);
 
-/// Search the index at pgvfs://`volume`/`path` with a tantivy query; `options`
-/// (may be NULL) is search options as JSON. Calls `cb` per hit with its score
-/// and stored fields as a JSON object. 0 ok, -1 error.
+/// Search the split at pgvfs://`volume`/`path` with a tantivy query;
+/// `options` (may be NULL) is search options as JSON. Calls `cb` per hit, best
+/// first, with its score and stored fields as a JSON object. 0 ok, -1 error.
 #[no_mangle]
 pub unsafe extern "C" fn pgvfs_index_search(
     c: *const PgvfsConn,
@@ -686,7 +686,7 @@ pub unsafe extern "C" fn pgvfs_index_search(
     status(run(), err)
 }
 
-/// Remove the index at pgvfs://`volume`/`path`. 0 removed, 1 none there, -1
+/// Remove the split at pgvfs://`volume`/`path`. 0 removed, 1 none there, -1
 /// error.
 #[no_mangle]
 pub unsafe extern "C" fn pgvfs_index_drop(

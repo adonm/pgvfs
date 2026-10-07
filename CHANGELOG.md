@@ -4,6 +4,20 @@ pgvfs is in beta: the SQL interface and configuration are expected to stay,
 but storage layout changes are still possible (see "Storage layout" in the
 docs). Each release lists its layout version.
 
+## Unreleased
+
+Storage layout: **v2** (unchanged).
+
+- Full-text search with tantivy, stored in pgvfs. `tantivy_index` (an
+  aggregate) builds an immutable split from any query's rows, one per group;
+  `tantivy_search` searches a split (laterally, many); `tantivy_drop` removes one.
+  Schemas, documents, options and queries are tantivy's own. The
+  `tantivy_create_index` and `tantivy_match_bm25` macros work like DuckDB's
+  fts. Which splits make up an index is up to SQL: the docs show one split
+  per DuckLake commit, using `table_changes`, `rowid` and `snapshot_id`.
+- The extension grows by about 5 MB (tantivy, without its mmap and zstd
+  features).
+
 ## 0.2.0-beta.3
 
 Storage layout: **v2** (unchanged).

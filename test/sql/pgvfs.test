@@ -21,3 +21,18 @@ statement error
 SELECT * FROM 'pgvfs://lake/missing.parquet'
 ----
 pgvfs needs PostgreSQL credentials
+
+query I
+SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE function_name LIKE 'tantivy\_%' ESCAPE '\'
+----
+5
+
+statement error
+FROM tantivy_search('pgvfs://lake/fts', 'cats')
+----
+pgvfs needs PostgreSQL credentials
+
+statement error
+SELECT tantivy_drop('pgvfs://lake/fts')
+----
+pgvfs needs PostgreSQL credentials

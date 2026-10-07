@@ -12,6 +12,8 @@ is the whole lake:
   revalidating. Reads are primary-key range queries straight into DuckDB's
   buffers: a block read takes about 0.1–0.2 ms, and lookups on a well-laid-out
   lake take single-digit milliseconds (see [Performance](performance.md)).
+- **Full-text search.** [Tantivy](search.md) indexes live in the same
+  database, built by the writer and searched by every reader from SQL.
 - **Plain PostgreSQL 11+.** No extensions and no superuser needed, so managed
   services work too; tested on Amazon Aurora PostgreSQL (with password
   authentication; RDS IAM tokens aren't supported).

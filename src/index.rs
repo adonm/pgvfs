@@ -1,12 +1,12 @@
 //! Tantivy indexes stored as pgvfs files, for full-text search from DuckDB.
 //!
-//! The index at pgvfs://<volume>/<path> is `<path>/current`, naming the live
-//! generation, plus each generation's tantivy files under `<path>/gen-<id>/`.
-//! A build writes a whole new generation with one tantivy `IndexWriter` (so
-//! only in the pgvfs writer), commits it, publishes `current`, and removes the
-//! generations it replaced. A published generation never changes, so readers
-//! take no locks: they open the generation `current` names (cached per
-//! connection), and a replaced one stays readable for the reap grace period.
+//! As in Quickwit, an index is a set of immutable splits: a split is one
+//! tantivy index, its files directly under a pgvfs://<volume>/<path>, written
+//! once by one `IndexWriter` (so only in the pgvfs writer) and merged to one
+//! segment. Which splits make up an index, and when to add, merge or drop
+//! them, is for SQL to decide (a DuckLake table is a natural metastore).
+//! Readers take no locks: a split never changes, and a dropped one stays
+//! readable for the reap grace period.
 //!
 //! Tantivy's own formats pass straight through as JSON: the schema, documents,
 //! index settings and the query language. Build options may also name
@@ -68,14 +68,14 @@ fn yes() -> bool {
     true
 }
 
-/// Search options, as JSON: `limit` (default: every hit), the default
+/// Search options, as JSON: `top_k` (default: every hit), the default
 /// `fields` for terms that name none (default: every indexed text field),
 /// `conjunctive` (all terms must match) and `strict` (fail on query syntax
 /// errors instead of dropping what tantivy cannot parse).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchOptions {
-    limit: Option<usize>,
+    top_k: Option<usize>,
     fields: Option<Vec<String>>,
     #[serde(default)]
     conjunctive: bool,
@@ -202,12 +202,12 @@ fn index_path(path: &str) -> Result<String> {
     Ok(path.to_owned())
 }
 
-/// One generation's files, as a tantivy `Directory`.
+/// One split's files, as a tantivy `Directory`.
 #[derive(Clone)]
 struct Dir {
     conn: &'static PgvfsConn,
     volume: Arc<str>,
-    /// `<path>/<generation>/`
+    /// `<path>/`
     prefix: Arc<str>,
     /// Set when a build is abandoned: tantivy threads still finishing (the
     /// doc store's compressor) must not publish files after its cleanup.
@@ -317,8 +317,8 @@ impl tantivy::Directory for Dir {
         Ok(())
     }
 
-    /// A generation has one `IndexWriter`, in the one pgvfs writer process,
-    /// and never changes once published: nothing to lock (lock files would
+    /// A split has one `IndexWriter`, in the one pgvfs writer process,
+    /// and never changes once committed: nothing to lock (lock files would
     /// also need write access, which readers lack) and nothing to watch.
     fn acquire_lock(&self, _: &Lock) -> Result<DirectoryLock, LockError> {
         Ok(DirectoryLock::from(Box::new(())))
@@ -393,26 +393,23 @@ impl TerminatingWrite for FileWrite {
 /// Index paths with a build running in this process.
 static BUILDING: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
-/// A generation being built: unless published, dropping it removes its
-/// files. Either way it frees the index path for the next build.
-struct Generation {
+/// Holds an index path for one build. Until the build commits, dropping it
+/// removes the files the build wrote.
+struct Building {
     conn: &'static PgvfsConn,
     volume: String,
     path: String,
-    name: String,
-    published: bool,
+    remove_on_drop: bool,
     abandoned: Arc<AtomicBool>,
 }
 
-impl Drop for Generation {
+impl Drop for Building {
     fn drop(&mut self) {
-        if !self.published {
+        if self.remove_on_drop {
             self.abandoned.store(true, Ordering::Relaxed);
             // Wait out an upload in flight; later ones see `abandoned`.
             let _uploads = UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) =
-                remove_generations(self.conn, &self.volume, &self.path, |g| g == self.name)
-            {
+            if let Err(e) = remove_split(self.conn, &self.volume, &self.path) {
                 eprintln!("pgvfs: could not remove an abandoned index build: {e:#}");
             }
         }
@@ -421,19 +418,20 @@ impl Drop for Generation {
     }
 }
 
-/// A new index generation being written.
+/// A split being built.
 pub struct Build {
-    // Dropped first: the writer's threads stop before `generation` cleans up.
+    // Dropped first: the writer's threads stop before `building` cleans up.
     writer: Option<IndexWriter>,
     index: Index,
     schema: Schema,
     payload: String,
     merge: bool,
     docs: AtomicU64,
-    generation: Generation,
+    building: Building,
 }
 
 impl Build {
+    /// Start a split at `path`, which must not hold one yet.
     pub fn open(
         conn: &'static PgvfsConn,
         volume: &str,
@@ -453,22 +451,23 @@ impl Build {
             );
             building.push(key);
         }
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos();
-        let generation = Generation {
+        let mut building = Building {
             conn,
             volume: volume.into(),
             path: path.clone(),
-            name: format!("gen-{nanos:x}"),
-            published: false,
+            remove_on_drop: false,
             abandoned: Arc::default(),
         };
+        anyhow::ensure!(
+            conn.open(volume, &format!("{path}/meta.json"))?.is_none(),
+            "pgvfs://{volume}/{path} already holds a tantivy index (splits are immutable: drop it or use another path)"
+        );
+        building.remove_on_drop = true;
         let dir = Dir {
             conn,
             volume: volume.into(),
-            prefix: format!("{path}/{}/", generation.name).into(),
-            abandoned: generation.abandoned.clone(),
+            prefix: format!("{path}/").into(),
+            abandoned: building.abandoned.clone(),
         };
         let index = Index::create(dir, schema.clone(), options.settings.clone())?;
         register(&index, &options)?;
@@ -487,7 +486,7 @@ impl Build {
             },
             merge: options.merge,
             docs: AtomicU64::new(0),
-            generation,
+            building,
         })
     }
 
@@ -506,8 +505,7 @@ impl Build {
         Ok(())
     }
 
-    /// Commit, publish as the index at this path, and remove the generations
-    /// it replaces. Returns the documents indexed.
+    /// Commit the split. Returns the documents indexed.
     pub fn commit(mut self) -> Result<u64> {
         let mut writer = self
             .writer
@@ -523,46 +521,33 @@ impl Build {
             }
         }
         writer.wait_merging_threads()?;
-
-        let g = &mut self.generation;
-        let mut current = PgvfsWriter::open(g.conn, &g.volume, &format!("{}/current", g.path))?;
-        current.write(g.name.as_bytes())?;
-        current.publish()?;
-        g.published = true;
-        if let Err(e) = remove_generations(g.conn, &g.volume, &g.path, |name| name != g.name) {
-            eprintln!("pgvfs: could not remove replaced index generations: {e:#}");
-        }
+        self.building.remove_on_drop = false;
         Ok(self.docs.load(Ordering::Relaxed))
     }
 }
 
-/// Remove the files of generations under `path` that `doomed` picks.
-fn remove_generations(
-    conn: &PgvfsConn,
-    volume: &str,
-    path: &str,
-    doomed: impl Fn(&str) -> bool,
-) -> Result<()> {
+/// Remove the files directly under `path/`: a split's (tantivy's are flat,
+/// so splits nested deeper stay). Returns whether it held an index.
+fn remove_split(conn: &PgvfsConn, volume: &str, path: &str) -> Result<bool> {
     let prefix = format!("{path}/");
     let mut files = Vec::new();
     conn.list(volume, &prefix, -1, |p| {
-        if let Some((generation, _)) = p[prefix.len()..].split_once('/') {
-            if generation.starts_with("gen-") && doomed(generation) {
-                files.push(p.to_owned());
-            }
+        if !p[prefix.len()..].contains('/') {
+            files.push(p.to_owned());
         }
     })?;
+    let meta = format!("{prefix}meta.json");
+    let found = files.contains(&meta);
     for file in files {
         conn.remove(volume, &file)?;
     }
-    Ok(())
+    Ok(found)
 }
 
-/// Remove the index at `path`. Returns false if there was none.
+/// Remove the split at `path`. Returns false if there was none.
 pub fn drop_index(conn: &PgvfsConn, volume: &str, path: &str) -> Result<bool> {
     let path = index_path(path)?;
-    let found = conn.remove(volume, &format!("{path}/current"))?;
-    remove_generations(conn, volume, &path, |_| true)?;
+    let found = remove_split(conn, volume, &path)?;
     conn.indexes
         .0
         .lock()
@@ -571,34 +556,32 @@ pub fn drop_index(conn: &PgvfsConn, volume: &str, path: &str) -> Result<bool> {
     Ok(found)
 }
 
-/// Open indexes by (volume, path).
+/// Open splits by (volume, path).
 #[derive(Default)]
 pub struct Cache(Mutex<HashMap<(String, String), Arc<Searchable>>>);
 
 struct Searchable {
-    /// The file_id of the `current` that named this generation.
-    current: i64,
+    /// The file_id of the meta.json opened: a split dropped and rebuilt at
+    /// the same path has a new one.
+    meta: i64,
     index: Index,
     reader: IndexReader,
 }
 
 fn open_index(conn: &'static PgvfsConn, volume: &str, path: &str) -> Result<Arc<Searchable>> {
-    let current = conn
-        .open(volume, &format!("{path}/current"))?
+    let meta = conn
+        .open(volume, &format!("{path}/meta.json"))?
         .ok_or_else(|| anyhow!("no tantivy index at pgvfs://{volume}/{path}"))?;
     let key = (volume.to_owned(), path.to_owned());
     if let Some(s) = conn.indexes.0.lock().unwrap().get(&key) {
-        if s.current == current.file_id {
+        if s.meta == meta.file_id {
             return Ok(s.clone());
         }
     }
-    let mut name = vec![0; current.size as usize];
-    conn.read(&current, 0, &mut name)?;
-    let generation = String::from_utf8(name)?;
     let index = Index::open(Dir {
         conn,
         volume: volume.into(),
-        prefix: format!("{path}/{generation}/").into(),
+        prefix: format!("{path}/").into(),
         abandoned: Arc::default(),
     })?;
     let payload = index.load_metas()?.payload.unwrap_or_default();
@@ -608,7 +591,7 @@ fn open_index(conn: &'static PgvfsConn, volume: &str, path: &str) -> Result<Arc<
         .reload_policy(ReloadPolicy::Manual)
         .try_into()?;
     let searchable = Arc::new(Searchable {
-        current: current.file_id,
+        meta: meta.file_id,
         index,
         reader,
     });
@@ -620,8 +603,10 @@ fn open_index(conn: &'static PgvfsConn, volume: &str, path: &str) -> Result<Arc<
     Ok(searchable)
 }
 
-/// Search the index at `path` with a tantivy query, calling `hit` with each
-/// match's score and stored fields as a JSON object, best first.
+/// Search the split at `path` with a tantivy query, calling `hit` with each
+/// match's score and stored fields as a JSON object, best first. A search over
+/// several splits is SQL's to compose: each scores with its own statistics,
+/// as Elasticsearch shards and Quickwit splits do.
 pub fn search(
     conn: &'static PgvfsConn,
     volume: &str,
@@ -634,9 +619,9 @@ pub fn search(
     let options: SearchOptions = options(options_json, "search")?;
     let attempt = || run(&*open_index(conn, volume, &path)?, query, &options);
     let hits = attempt().or_else(|_| {
-        // `current` is cached for up to PGVFS_OPEN_CACHE_S: it may name a
-        // generation that has since been replaced and removed.
-        conn.files.forget(volume, &format!("{path}/current"));
+        // meta.json is cached for up to PGVFS_OPEN_CACHE_S: the split may
+        // have been dropped (and rebuilt) since.
+        conn.files.forget(volume, &format!("{path}/meta.json"));
         attempt()
     })?;
     for (score, doc) in &hits {
@@ -671,7 +656,7 @@ fn run(s: &Searchable, query: &str, options: &SearchOptions) -> Result<Vec<(Scor
         parser.parse_query_lenient(query).0
     };
     let searcher = s.reader.searcher();
-    let hits = match options.limit {
+    let hits = match options.top_k {
         Some(0) => Vec::new(),
         Some(n) => searcher.search(&query, &TopDocs::with_limit(n).order_by_score())?,
         None => searcher.search(&query, &AllHits)?,
@@ -756,7 +741,7 @@ mod tests {
         writer.commit().unwrap();
         let reader = index.reader().unwrap();
         Searchable {
-            current: 0,
+            meta: 0,
             index,
             reader,
         }
@@ -796,14 +781,14 @@ mod tests {
             [r#"{"id":2,"tag":["b","c"]}"#, r#"{"id":3,"tag":"a"}"#]
         );
         assert_eq!(ids(search(&s, "cafe", "")), [r#"{"id":2,"tag":["b","c"]}"#]);
-        // Disjunctive by default, best first; conjunctive and limit.
+        // Disjunctive by default, best first; conjunctive and top_k.
         assert_eq!(search(&s, "fox cats", "").len(), 3);
         assert_eq!(
-            ids(search(&s, "fox cats", r#"{"limit": 1}"#)),
+            ids(search(&s, "fox cats", r#"{"top_k": 1}"#)),
             [r#"{"id":3,"tag":"a"}"#]
         );
         assert_eq!(search(&s, "fox cats", r#"{"conjunctive": true}"#).len(), 1);
-        assert!(search(&s, "fox", r#"{"limit": 0}"#).is_empty());
+        assert!(search(&s, "fox", r#"{"top_k": 0}"#).is_empty());
         // Tantivy's query language: fields, ranges, phrases.
         assert_eq!(search(&s, "tag:a AND id:[2 TO 3]", "").len(), 1);
         assert_eq!(search(&s, "\"brown fox\"", "").len(), 1);
@@ -825,7 +810,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_options() {
-        assert!(options::<SearchOptions>(r#"{"limt": 1}"#, "search").is_err());
+        assert!(options::<SearchOptions>(r#"{"top_kk": 1}"#, "search").is_err());
         assert!(options::<BuildOptions>(
             r#"{"tokenizers": {"x": {"filters": ["nope"]}}}"#,
             "index"

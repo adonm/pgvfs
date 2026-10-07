@@ -26,8 +26,9 @@ writes, a lost writer lock, readers during writes, and offsets past 4 GiB.
 | `src/store.rs` | reads, the `COPY` writer, the writer lock, reaping |
 | `src/pg.rs` | connection pool and TLS |
 | `src/lib.rs` | the C interface used by the extension, the open cache, `pgvfs_stats()` |
-| `extension/` | the C++ DuckDB `FileSystem` adapter, its build and end-to-end test |
-| `tests/` | the storage contract, against real PostgreSQL |
+| `src/index.rs` | tantivy indexes on pgvfs: the `Directory`, builds, search |
+| `extension/` | the C++ DuckDB `FileSystem` adapter and SQL functions, its build and end-to-end test |
+| `tests/` | the storage and index contracts, against real PostgreSQL |
 | `bench/` | benchmark harness (`lake.py`) and datasets (`city.py`, `hits.py`) |
 | `scripts/` | build inputs, test and benchmark runners, release and site tools |
 | `docs/` | this site (mdbook) |

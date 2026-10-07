@@ -69,6 +69,8 @@ and pgvfs tables. Only one process writes. For remote PostgreSQL, add
 - [Install](https://pgvfs.adonm.dev/install.html): builds, versions, Python.
 - [Loading data](https://pgvfs.adonm.dev/loading.html): lay out a lake for
   fast reads, load at scale, and keep it fast.
+- [Full-text search](https://pgvfs.adonm.dev/search.html): tantivy indexes
+  stored with the lake, built and searched from SQL.
 - [How it works](https://pgvfs.adonm.dev/how-it-works.html): storage, one
   writer and many readers, credentials, configuration.
 - [Performance](https://pgvfs.adonm.dev/performance.html): benchmarks and
