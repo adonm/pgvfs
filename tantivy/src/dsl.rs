@@ -22,7 +22,9 @@ use tantivy::query::{
 use tantivy::schema::{Facet, Field, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Term};
 
-pub fn compile(index: &Index, dsl: &Value) -> Result<Box<dyn Query>> {
+/// `ignore_unmapped`: a field the split lacks matches nothing, as in
+/// Elasticsearch, instead of failing the query.
+pub fn compile(index: &Index, dsl: &Value, ignore_unmapped: bool) -> Result<Box<dyn Query>> {
     let dsl = match dsl.as_object() {
         Some(o) if o.len() == 1 && o.contains_key("query") => &o["query"],
         _ => dsl,
@@ -30,6 +32,7 @@ pub fn compile(index: &Index, dsl: &Value) -> Result<Box<dyn Query>> {
     Compiler {
         index,
         schema: index.schema(),
+        ignore_unmapped,
     }
     .query(dsl)
 }
@@ -37,6 +40,13 @@ pub fn compile(index: &Index, dsl: &Value) -> Result<Box<dyn Query>> {
 struct Compiler<'a> {
     index: &'a Index,
     schema: Schema,
+    ignore_unmapped: bool,
+}
+
+/// A field, or a path inside a JSON field (`attributes.contractor`).
+struct Target {
+    field: Field,
+    path: Option<String>,
 }
 
 /// `params[key]`, or `params` itself in the short form (`{"field": value}`).
@@ -246,7 +256,7 @@ impl Compiler<'_> {
                 ))
             }
             "multi_match" => self.multi_match(body),
-            "exists" => Ok(boosted(exists(&self.schema, body)?, body)),
+            "exists" => Ok(boosted(self.exists(body)?, body)),
             "query_string" | "simple_query_string" => {
                 self.query_string(body, kind == "query_string")
             }
@@ -260,7 +270,7 @@ impl Compiler<'_> {
             | "regexp"
             | "fuzzy"
             | "range" => {
-                let (field, params) = self.field_body(kind, body)?;
+                let (name, target, params) = self.field_body(kind, body)?;
                 let allowed: &[&str] = match kind.as_str() {
                     "term" | "prefix" | "wildcard" | "regexp" => &["value"],
                     "match" => &[
@@ -279,31 +289,44 @@ impl Compiler<'_> {
                 if params.is_object() || kind == "range" {
                     parameters(params, kind, allowed)?;
                 }
-                if matches!(kind.as_str(), "prefix" | "wildcard" | "regexp" | "fuzzy") {
-                    let entry = self.schema.get_field_entry(field);
+                if kind == "terms" {
+                    parameters(body, kind, &[name])?;
+                }
+                // A field the split lacks, where that is allowed.
+                let Some(target) = target else {
+                    return Ok(Box::new(EmptyQuery));
+                };
+                let entry = self.schema.get_field_entry(target.field);
+                if matches!(
+                    kind.as_str(),
+                    "prefix" | "wildcard" | "regexp" | "fuzzy" | "match_phrase_prefix"
+                ) {
                     anyhow::ensure!(
-                        entry.is_indexed() && matches!(entry.field_type(), FieldType::Str(_)),
-                        "{kind} needs an indexed text field"
+                        target.path.is_none()
+                            && entry.is_indexed()
+                            && matches!(entry.field_type(), FieldType::Str(_)),
+                        "{kind} needs an indexed text field, not a path inside a JSON field"
                     );
                 }
+                let field = target.field;
                 let q = match kind.as_str() {
                     "term" => Box::new(TermQuery::new(
-                        self.term(field, short(params, "value"))?,
+                        self.term(&target, short(params, "value"))?,
                         IndexRecordOption::WithFreqs,
                     )) as Box<dyn Query>,
                     "terms" => {
                         let values = params.as_array().context("terms takes a list of values")?;
                         let terms = values
                             .iter()
-                            .map(|v| self.term(field, v))
+                            .map(|v| self.term(&target, v))
                             .collect::<Result<Vec<_>>>()?;
                         Box::new(TermSetQuery::new(terms))
                     }
-                    "match" => self.match_query(field, params)?,
-                    "match_phrase" => self.phrase(field, params, false)?,
-                    "match_phrase_prefix" => self.phrase(field, params, true)?,
+                    "match" => self.match_query(&target, params)?,
+                    "match_phrase" => self.phrase(&target, params, false)?,
+                    "match_phrase_prefix" => self.phrase(&target, params, true)?,
                     "prefix" => {
-                        let term = self.term(field, short(params, "value"))?;
+                        let term = self.term(&target, short(params, "value"))?;
                         Box::new(FuzzyTermQuery::new_prefix(term, 0, false))
                     }
                     "wildcard" => {
@@ -325,15 +348,14 @@ impl Compiler<'_> {
                             .and_then(Value::as_bool)
                             .unwrap_or(true);
                         Box::new(FuzzyTermQuery::new(
-                            self.term(field, &Value::from(value))?,
+                            self.term(&target, &Value::from(value))?,
                             d,
                             transpositions,
                         ))
                     }
-                    _ => self.range(field, params)?,
+                    _ => self.range(&target, params)?,
                 };
                 Ok(if kind == "terms" {
-                    parameters(body, kind, &[self.schema.get_field_entry(field).name()])?;
                     boosted(q, body)
                 } else {
                     boosted(q, params)
@@ -343,8 +365,13 @@ impl Compiler<'_> {
         }
     }
 
-    /// `{"<field>": params}` of a field-level query.
-    fn field_body<'v>(&self, kind: &str, body: &'v Value) -> Result<(Field, &'v Value)> {
+    /// `{"<field>": params}` of a field-level query: the field's name, what it
+    /// names (nothing, if it is missing and that is allowed) and the params.
+    fn field_body<'v>(
+        &self,
+        kind: &str,
+        body: &'v Value,
+    ) -> Result<(&'v str, Option<Target>, &'v Value)> {
         let obj = body
             .as_object()
             .with_context(|| format!("{kind} takes {{\"<field>\": ...}}"))?;
@@ -354,18 +381,75 @@ impl Compiler<'_> {
         let (Some((name, params)), None) = (fields.next(), fields.next()) else {
             bail!("{kind} takes one field");
         };
-        Ok((self.field(name)?, params))
+        Ok((name.as_str(), self.resolve(name)?, params))
     }
 
-    fn field(&self, name: &str) -> Result<Field> {
-        self.schema
-            .get_field(name)
-            .map_err(|_| anyhow!("no field {name:?}"))
+    /// A field, or a path inside a JSON field. `None` for a field the schema
+    /// lacks, if `ignore_unmapped`.
+    fn resolve(&self, name: &str) -> Result<Option<Target>> {
+        match self.schema.find_field(name) {
+            Some((field, "")) => Ok(Some(Target { field, path: None })),
+            Some((field, path))
+                if matches!(
+                    self.schema.get_field_entry(field).field_type(),
+                    FieldType::JsonObject(_)
+                ) =>
+            {
+                Ok(Some(Target {
+                    field,
+                    path: Some(path.to_owned()),
+                }))
+            }
+            _ if self.ignore_unmapped => Ok(None),
+            _ => bail!("no field {name:?}"),
+        }
+    }
+
+    /// Fields by name; those the schema lacks are left out if `ignore_unmapped`.
+    fn fields(&self, names: &[&str]) -> Result<Vec<Field>> {
+        let mut found = Vec::new();
+        for name in names {
+            match self.schema.get_field(name) {
+                Ok(field) => found.push(field),
+                Err(_) if self.ignore_unmapped => {}
+                Err(_) => bail!("no field {name:?}"),
+            }
+        }
+        Ok(found)
+    }
+
+    /// A value as a term of a field or of a path in a JSON field.
+    fn term(&self, target: &Target, v: &Value) -> Result<Term> {
+        match &target.path {
+            None => self.field_term(target.field, v),
+            Some(path) => self.json_term(target.field, path, v),
+        }
+    }
+
+    /// A JSON value as the term a JSON field indexes at `path`: text as it
+    /// is (not analyzed), numbers by their JSON type, booleans.
+    fn json_term(&self, field: Field, path: &str, v: &Value) -> Result<Term> {
+        let entry = self.schema.get_field_entry(field);
+        let FieldType::JsonObject(options) = entry.field_type() else {
+            bail!("{}: not a JSON field", entry.name());
+        };
+        let mut term = Term::from_field_json_path(field, path, options.is_expand_dots_enabled());
+        match v {
+            Value::String(s) => term.append_type_and_str(s),
+            Value::Bool(b) => term.append_type_and_fast_value(*b),
+            Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => term.append_type_and_fast_value(i),
+                (None, Some(u)) => term.append_type_and_fast_value(u),
+                _ => term.append_type_and_fast_value(n.as_f64().context("a number")?),
+            },
+            _ => bail!("{}.{path}: cannot use {v} as a value", entry.name()),
+        }
+        Ok(term)
     }
 
     /// A field value as a term: text verbatim (not analyzed), numbers, dates
     /// (RFC 3339 or epoch milliseconds), booleans, IP addresses, facets.
-    fn term(&self, field: Field, v: &Value) -> Result<Term> {
+    fn field_term(&self, field: Field, v: &Value) -> Result<Term> {
         let entry = self.schema.get_field_entry(field);
         let name = entry.name();
         let bad = || {
@@ -433,28 +517,43 @@ impl Compiler<'_> {
     }
 
     /// The field's analyzer applied to `text`: (position, term) per token.
-    /// Fields that are not analyzed text give the value itself.
-    fn tokens(&self, field: Field, v: &Value) -> Result<Vec<(usize, Term)>> {
-        if !matches!(
-            self.schema.get_field_entry(field).field_type(),
-            FieldType::Str(_)
+    /// Values that are not analyzed text give the value itself.
+    fn tokens(&self, target: &Target, v: &Value) -> Result<Vec<(usize, Term)>> {
+        let analyzed = match (
+            &target.path,
+            self.schema.get_field_entry(target.field).field_type(),
         ) {
-            return Ok(vec![(0, self.term(field, v)?)]);
+            (None, FieldType::Str(_)) => true,
+            (Some(_), _) => v.is_string(),
+            _ => false,
+        };
+        if !analyzed {
+            return Ok(vec![(0, self.term(target, v)?)]);
         }
-        let mut analyzer = self.index.tokenizer_for_field(field)?;
+        let mut analyzer = self.index.tokenizer_for_field(target.field)?;
         let text = text(v)?;
         let mut stream = analyzer.token_stream(&text);
         let mut out = Vec::new();
         while stream.advance() {
             let token = stream.token();
-            out.push((token.position, Term::from_field_text(field, &token.text)));
+            let term = match &target.path {
+                None => Term::from_field_text(target.field, &token.text),
+                Some(path) => {
+                    self.json_term(target.field, path, &Value::from(token.text.clone()))?
+                }
+            };
+            out.push((token.position, term));
         }
         Ok(out)
     }
 
-    fn match_query(&self, field: Field, params: &Value) -> Result<Box<dyn Query>> {
-        let tokens = self.tokens(field, short(params, "query"))?;
+    fn match_query(&self, target: &Target, params: &Value) -> Result<Box<dyn Query>> {
+        let tokens = self.tokens(target, short(params, "query"))?;
         let fuzziness = params.get("fuzziness");
+        anyhow::ensure!(
+            fuzziness.is_none() || target.path.is_none(),
+            "fuzziness is not supported on a path inside a JSON field"
+        );
         let transpositions = params
             .get("fuzzy_transpositions")
             .and_then(Value::as_bool)
@@ -494,8 +593,8 @@ impl Compiler<'_> {
         })
     }
 
-    fn phrase(&self, field: Field, params: &Value, prefix: bool) -> Result<Box<dyn Query>> {
-        let tokens = self.tokens(field, short(params, "query"))?;
+    fn phrase(&self, target: &Target, params: &Value, prefix: bool) -> Result<Box<dyn Query>> {
+        let tokens = self.tokens(target, short(params, "query"))?;
         Ok(match tokens.len() {
             0 => Box::new(EmptyQuery),
             1 if !prefix => Box::new(TermQuery::new(
@@ -516,7 +615,7 @@ impl Compiler<'_> {
         })
     }
 
-    fn range(&self, field: Field, params: &Value) -> Result<Box<dyn Query>> {
+    fn range(&self, target: &Target, params: &Value) -> Result<Box<dyn Query>> {
         anyhow::ensure!(
             params.get("gte").is_some()
                 || params.get("gt").is_some()
@@ -531,8 +630,8 @@ impl Compiler<'_> {
         );
         let bound = |inclusive: &str, exclusive: &str| -> Result<Bound<Term>> {
             Ok(match (params.get(inclusive), params.get(exclusive)) {
-                (Some(v), _) => Bound::Included(self.term(field, v)?),
-                (None, Some(v)) => Bound::Excluded(self.term(field, v)?),
+                (Some(v), _) => Bound::Included(self.term(target, v)?),
+                (None, Some(v)) => Bound::Excluded(self.term(target, v)?),
                 (None, None) => Bound::Unbounded,
             })
         };
@@ -612,7 +711,7 @@ impl Compiler<'_> {
                 "tie_breaker",
             ],
         )?;
-        let fields: Vec<(Field, f32)> = match body.get("fields") {
+        let fields: Vec<(Option<Target>, f32)> = match body.get("fields") {
             Some(Value::Array(names)) => names
                 .iter()
                 .map(|n| {
@@ -622,12 +721,20 @@ impl Compiler<'_> {
                         None => (n, 1.0),
                     };
                     anyhow::ensure!(boost.is_finite() && boost >= 0.0, "invalid field boost");
-                    Ok((self.field(name)?, boost))
+                    Ok((self.resolve(name)?, boost))
                 })
                 .collect::<Result<_>>()?,
             None => crate::search::text_fields(&self.schema)
                 .into_iter()
-                .map(|f| (f, 1.0))
+                .map(|f| {
+                    (
+                        Some(Target {
+                            field: f,
+                            path: None,
+                        }),
+                        1.0,
+                    )
+                })
                 .collect(),
             Some(other) => bail!("multi_match fields: {other}"),
         };
@@ -635,13 +742,20 @@ impl Compiler<'_> {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("best_fields");
+        let fields: Vec<(Target, f32)> = fields
+            .into_iter()
+            .filter_map(|(target, boost)| Some((target?, boost)))
+            .collect();
+        if fields.is_empty() {
+            return Ok(Box::new(EmptyQuery));
+        }
         let per_field = fields
             .into_iter()
-            .map(|(field, boost)| {
+            .map(|(target, boost)| {
                 let q = match kind {
-                    "best_fields" | "most_fields" => self.match_query(field, body)?,
-                    "phrase" => self.phrase(field, body, false)?,
-                    "phrase_prefix" => self.phrase(field, body, true)?,
+                    "best_fields" | "most_fields" => self.match_query(&target, body)?,
+                    "phrase" => self.phrase(&target, body, false)?,
+                    "phrase_prefix" => self.phrase(&target, body, true)?,
                     other => bail!("unsupported multi_match type {other:?}"),
                 };
                 Ok(if boost != 1.0 {
@@ -663,6 +777,34 @@ impl Compiler<'_> {
         Ok(boosted(q, body))
     }
 
+    /// `{"exists": {"field": "<name>"}}`: a fast field's column says which
+    /// documents have a value. For an indexed text field without one, any term
+    /// in the field's dictionary does, which is slower. A JSON field matches
+    /// by any path inside it.
+    fn exists(&self, body: &Value) -> Result<Box<dyn Query>> {
+        parameters(body, "exists", &["field"])?;
+        let name = body
+            .get("field")
+            .and_then(Value::as_str)
+            .context("exists takes {\"field\": \"<name>\"}")?;
+        let Some(target) = self.resolve(name)? else {
+            return Ok(Box::new(EmptyQuery));
+        };
+        let entry = self.schema.get_field_entry(target.field);
+        if entry.is_fast() {
+            let subpaths =
+                target.path.is_none() && matches!(entry.field_type(), FieldType::JsonObject(_));
+            return Ok(Box::new(ExistsQuery::new(name.to_owned(), subpaths)));
+        }
+        anyhow::ensure!(
+            target.path.is_none()
+                && entry.is_indexed()
+                && matches!(entry.field_type(), FieldType::Str(_)),
+            "exists needs a fast field, or an indexed text field: {name:?} is neither"
+        );
+        Ok(Box::new(RegexQuery::from_pattern("(?s).*", target.field)?))
+    }
+
     fn query_string(&self, body: &Value, strict: bool) -> Result<Box<dyn Query>> {
         parameters(
             body,
@@ -674,14 +816,23 @@ impl Compiler<'_> {
             &["query", "fields", "default_field", "default_operator"],
         )?;
         let text = text(short(body, "query"))?;
-        let fields = match (body.get("fields"), body.get("default_field")) {
-            (Some(Value::Array(names)), _) => names
-                .iter()
-                .map(|n| self.field(n.as_str().context("field names")?))
-                .collect::<Result<_>>()?,
-            (_, Some(Value::String(name))) => vec![self.field(name)?],
-            _ => crate::search::text_fields(&self.schema),
+        let named: Option<Vec<&str>> = match (body.get("fields"), body.get("default_field")) {
+            (Some(Value::Array(names)), _) => Some(
+                names
+                    .iter()
+                    .map(|n| n.as_str().context("field names"))
+                    .collect::<Result<_>>()?,
+            ),
+            (_, Some(Value::String(name))) => Some(vec![name.as_str()]),
+            _ => None,
         };
+        let fields = match &named {
+            Some(names) => self.fields(names)?,
+            None => crate::search::text_fields(&self.schema),
+        };
+        if named.is_some() && fields.is_empty() {
+            return Ok(Box::new(EmptyQuery));
+        }
         let mut parser = QueryParser::for_index(self.index, fields);
         if body
             .get("default_operator")
@@ -697,19 +848,6 @@ impl Compiler<'_> {
         };
         Ok(boosted(q, body))
     }
-}
-
-/// `{"exists": {"field": "<name>"}}`: needs a fast field.
-fn exists(schema: &Schema, body: &Value) -> Result<Box<dyn Query>> {
-    parameters(body, "exists", &["field"])?;
-    let name = body
-        .get("field")
-        .and_then(Value::as_str)
-        .context("exists takes {\"field\": \"<name>\"}")?;
-    schema
-        .get_field(name)
-        .map_err(|_| anyhow!("no field {name:?}"))?;
-    Ok(Box::new(ExistsQuery::new(name.to_owned(), false)))
 }
 
 #[cfg(test)]
@@ -892,7 +1030,6 @@ mod tests {
         assert!(fails(json!({"match": {"nosuch": "x"}})).contains("no field"));
         assert!(fails(json!({"term": {"id": "x"}})).contains("cannot use"));
         assert!(fails(json!({"match": {"body": "x"}, "term": {"id": 1}})).contains("one key"));
-        assert!(fails(json!({"exists": {"field": "body"}})).contains("fast"));
         assert!(!fails(json!({"query_string": {"query": "body:("}})).is_empty());
         for q in [
             json!({"bool": {"filters": {"term": {"id": 1}}}}),
@@ -928,5 +1065,155 @@ mod tests {
             .unwrap()
             .hits()
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod json_tests {
+    use crate::search::Request;
+    use crate::split::testing::{build_with, open};
+    use serde_json::json;
+    use tantivy::schema::{Schema, FAST, STORED, TEXT};
+
+    fn schema() -> String {
+        let mut b = Schema::builder();
+        b.add_i64_field("id", FAST | STORED | tantivy::schema::INDEXED);
+        b.add_json_field("meta", TEXT | FAST);
+        b.add_text_field("kw", tantivy::schema::STRING);
+        b.add_text_field("note", STORED);
+        b.add_text_field("body", TEXT);
+        serde_json::to_string(&b.build()).unwrap()
+    }
+
+    const DOCS: &[&str] = &[
+        r#"{"id": 1, "meta": {"color": "red", "n": 5, "flag": true, "tags": "Big roof"}, "kw": "a\nb", "body": "alpha"}"#,
+        r#"{"id": 2, "meta": {"color": "blue", "n": 9, "tags": "small roof"}, "kw": "c", "note": "x"}"#,
+        r#"{"id": 3, "meta": {"color": "red", "n": 1, "flag": false}, "body": "beta"}"#,
+        r#"{"id": 4, "note": "y"}"#,
+    ];
+
+    fn ids(query: serde_json::Value, options: &str) -> anyhow::Result<Vec<i64>> {
+        let s = open(build_with(&schema(), "", DOCS));
+        let options = if options.is_empty() { "{}" } else { options };
+        let options = options
+            .replacen('{', r#"{"fast": ["id"], "#, 1)
+            .replace(", }", "}");
+        let hits = Request::new(&[&s], &query.to_string(), &options, None)?.hits()?;
+        let mut ids: Vec<i64> = hits
+            .into_iter()
+            .map(|(_, _, d)| {
+                serde_json::from_str::<serde_json::Value>(&d).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn ok(query: serde_json::Value) -> Vec<i64> {
+        ids(query, "").unwrap()
+    }
+
+    fn fails(query: serde_json::Value, options: &str) -> String {
+        format!("{:#}", ids(query, options).expect_err("should fail"))
+    }
+
+    #[test]
+    fn reaches_paths_inside_json_fields() {
+        assert_eq!(ok(json!({"term": {"meta.color": "red"}})), [1, 3]);
+        assert_eq!(ok(json!({"term": {"meta.n": 5}})), [1]);
+        assert_eq!(ok(json!({"term": {"meta.flag": true}})), [1]);
+        assert_eq!(ok(json!({"terms": {"meta.color": ["blue", "green"]}})), [2]);
+        // Analyzed by the field's tokenizer, so any case of a word matches.
+        assert_eq!(ok(json!({"match": {"meta.tags": "BIG"}})), [1]);
+        assert_eq!(
+            ok(json!({"match": {"meta.tags": {"query": "big small", "operator": "and"}}})),
+            Vec::<i64>::new()
+        );
+        assert_eq!(ok(json!({"match": {"meta.tags": "roof"}})), [1, 2]);
+        assert_eq!(ok(json!({"match_phrase": {"meta.tags": "big roof"}})), [1]);
+        assert_eq!(
+            ok(json!({"match_phrase": {"meta.tags": "roof big"}})),
+            Vec::<i64>::new()
+        );
+        assert_eq!(ok(json!({"range": {"meta.n": {"gte": 2, "lt": 9}}})), [1]);
+        assert_eq!(ok(json!({"range": {"meta.n": {"gt": 0}}})), [1, 2, 3]);
+        assert_eq!(ok(json!({"exists": {"field": "meta.n"}})), [1, 2, 3]);
+        assert_eq!(ok(json!({"exists": {"field": "meta.flag"}})), [1, 3]);
+        assert_eq!(ok(json!({"exists": {"field": "meta"}})), [1, 2, 3]);
+        assert_eq!(
+            ok(json!({"exists": {"field": "meta.nosuch"}})),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            ok(json!({"multi_match": {"query": "red", "fields": ["meta.color", "body"]}})),
+            [1, 3]
+        );
+        assert_eq!(
+            ok(
+                json!({"bool": {"must": {"term": {"meta.color": "red"}}, "filter": {"range": {"meta.n": {"lt": 3}}}}})
+            ),
+            [3]
+        );
+        assert!(
+            fails(json!({"prefix": {"meta.color": "re"}}), "").contains("path inside a JSON field")
+        );
+        assert!(fails(json!({"regexp": {"meta.color": "r.*"}}), "")
+            .contains("path inside a JSON field"));
+        assert!(fails(
+            json!({"match": {"meta.tags": {"query": "roof", "fuzziness": 1}}}),
+            ""
+        )
+        .contains("fuzziness"));
+        assert!(fails(json!({"term": {"meta.color": null}}), "").contains("cannot use"));
+        // A path inside something that is not a JSON field is not a field.
+        assert!(fails(json!({"term": {"body.x": "a"}}), "").contains("no field"));
+    }
+
+    #[test]
+    fn leaves_out_missing_fields_on_request() {
+        let missing = [
+            json!({"term": {"nosuch": "a"}}),
+            json!({"match": {"nosuch": "a"}}),
+            json!({"terms": {"nosuch": ["a"]}}),
+            json!({"range": {"nosuch": {"gt": 1}}}),
+            json!({"exists": {"field": "nosuch"}}),
+            json!({"multi_match": {"query": "a", "fields": ["nosuch", "nosuch.x"]}}),
+            json!({"query_string": {"query": "a", "fields": ["nosuch"]}}),
+        ];
+        for q in missing {
+            assert!(fails(q.clone(), "").contains("no field"), "{q}");
+            assert_eq!(
+                ids(q.clone(), r#"{"ignore_unmapped": true}"#).unwrap(),
+                Vec::<i64>::new(),
+                "{q}"
+            );
+        }
+        // Only what is missing matches nothing.
+        let q = json!({"bool": {"should": [{"term": {"nosuch": "a"}}, {"term": {"meta.color": "blue"}}]}});
+        assert_eq!(ids(q, r#"{"ignore_unmapped": true}"#).unwrap(), [2]);
+        let q = json!({"multi_match": {"query": "red", "fields": ["nosuch", "meta.color"]}});
+        assert_eq!(ids(q, r#"{"ignore_unmapped": true}"#).unwrap(), [1, 3]);
+        let q = json!({"bool": {"must_not": {"term": {"nosuch": "a"}}}});
+        assert_eq!(
+            ids(q, r#"{"ignore_unmapped": true}"#).unwrap(),
+            [1, 2, 3, 4]
+        );
+        // A type error is still an error.
+        assert!(
+            fails(json!({"term": {"id": "x"}}), r#"{"ignore_unmapped": true}"#)
+                .contains("cannot use")
+        );
+    }
+
+    #[test]
+    fn exists_falls_back_to_the_terms_of_an_indexed_text_field() {
+        // `body` and `kw` are indexed text, not fast fields.
+        assert_eq!(ok(json!({"exists": {"field": "body"}})), [1, 3]);
+        assert_eq!(ok(json!({"exists": {"field": "kw"}})), [1, 2]); // even "a\nb"
+        assert_eq!(ok(json!({"exists": {"field": "id"}})), [1, 2, 3, 4]); // fast
+        let err = fails(json!({"exists": {"field": "note"}}), "");
+        assert!(err.contains("neither"), "{err}");
     }
 }

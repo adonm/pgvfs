@@ -18,8 +18,8 @@ indexes.
 | Function | |
 | --- | --- |
 | `tantivy_index(index, schema, doc [, options])` | aggregate: builds a split from its rows |
-| `tantivy_search(index, query, ...)` | table: ranked hits from one split or a list of them |
-| `tantivy_count(index, query, ...)` | scalar: exact total, without loading stored documents |
+| `tantivy_search(index, query, ...)` | table: ranked hits from one split or a list of them, searched in parallel |
+| `tantivy_count(index, query, ...)` | scalar: exact total (or capped, or distinct values), without loading stored documents |
 | `tantivy_aggregate(index, query, aggs, ...)` | scalar: tantivy's aggregations as JSON, merged across splits |
 | `tantivy_merge(splits, target, ...)` | scalar: native compaction, without re-indexing documents |
 | `tantivy_drop(index)` | scalar: removes a split |
@@ -190,6 +190,22 @@ readers have finished. Native merging does not deduplicate keys automatically.
 Retain invalidations while an active split still needs them. You can instead
 rebuild from a longer change-feed range, using the same latest-event rule.
 
+**What a merge costs.** `tantivy_merge` copies each source into a local
+temporary index (`TMPDIR`), merges all its segments on one thread, and writes
+the result. Four splits of 460 MB (4 million documents, 60% excluded), with
+`TMPDIR` on disk:
+
+| | copy in | merge | write out | total | re-index the 1.6M live documents from source |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| local files | 0.6 s | 11.5 s | 0.3 s | 12.7 s | 21.6 s |
+| pgvfs, PostgreSQL on the same host | 4.4 s | 10.9 s | 1.7 s | 17.2 s | 20.1 s |
+
+The copy is a quarter of the time through pgvfs at most, so reading the
+sources in place would not remove the cost: the merge is. It is one thread,
+so it is the part a busy host slows most, while indexing from source uses
+every core. When most of the documents are excluded, compare the two on your
+data (`bench/search.py --merge` does).
+
 **Large tables.** A tantivy split holds at most 2³¹ documents, and a smaller
 one builds, merges and opens faster. Partition big builds: `GROUP BY` builds
 one split per group, so a path such as
@@ -235,6 +251,33 @@ already completed splits are not rolled back with the SQL statement.
   - `merge`: merge into one segment (default `true`), so a search reads each
     term once.
 
+**Memory and disk of a build.** Every group of a query is built at the same
+time, and each takes about `memory_budget` of heap (256 MB by default, plus
+about 10 MB; less for a group with less data than that) on top of DuckDB's own
+memory. `memory_limit` does not bound it, and a materialised source table is
+DuckDB memory as well. So
+
+> peak ≈ DuckDB's memory + groups × (`memory_budget` + 10 MB)
+
+for groups bigger than the budget. Measured on 2 million documents of about
+440 bytes of split each, streamed from a query (DuckDB alone: 40 MB):
+
+| groups | 256 MB (default) | 64 MB | 16 MB |
+| ---: | ---: | ---: | ---: |
+| 1 | 300 MB | 120 MB | |
+| 4 | 780 MB | 320 MB | |
+| 16 | 1,680 MB | 1,140 MB | 390 MB |
+
+The default stays below `groups × 266 MB` when groups hold less than the budget
+(16 groups of 125,000 documents used 100 MB each). A smaller budget only makes
+more, smaller segments to merge at the end: slower for one big group (12 s to
+18 s here), not for many (14 s to 13 s). To build a large table in less memory,
+lower `memory_budget` or build fewer groups per query.
+
+Each group also keeps its index in a local temporary directory (`TMPDIR`)
+until its split is written: about the size of the split, for all groups at
+once. On a tmpfs (often `/tmp`) that is memory too, so point `TMPDIR` at a disk.
+
 ### `tantivy_search(index, query [, options [, exclude]])`
 
 Searches a path (`VARCHAR`) or a list of paths (`VARCHAR[]`). Returns
@@ -251,13 +294,16 @@ ranges such as `id:[10 TO 20]`. A query starting with `{` is instead
 
 | Option | Default | |
 | --- | --- | --- |
-| `top_k` | every hit | top hits across the whole list of splits; use a bound on large indexes |
+| `top_k` | every hit | hits to return across the whole list of splits; use a bound on large indexes |
+| `offset` | `0` | hits to skip before `top_k`, across all the splits. Documents are read only for the hits returned, so a deep page costs its scoring, not its position |
+| `collapse` | none | return only the best hit of each distinct value of this fast field (text, number, boolean or date; one value per document), best first. `top_k` and `offset` then count values. Documents without a value form one group |
 | `fields` | every indexed text field | the fields to search for terms that name none |
 | `conjunctive` | `false` | every term must match |
 | `strict` | `false` | fail on query syntax errors instead of dropping what tantivy cannot parse |
 | `fast` | stored fields | build `doc` only from these fast fields, without reading stored documents; `[]` returns `{}` |
 | `exclude_field` | none | an `i64` or `u64` fast field whose values are in `exclude`; exactly one value on every document |
-| `global_stats` | `false` | use combined BM25 statistics; needs the same schema across splits; statistics still include excluded documents |
+| `global_stats` | `false` | use combined BM25 statistics; needs the same schema across splits. As in tantivy, statistics include excluded (deleted) documents until the splits are merged |
+| `ignore_unmapped` | `false` | in [query DSL](#query-dsl), a field a split lacks matches nothing instead of failing the call (the other half of searching splits built with different schemas) |
 
 `exclude` is a portable roaring bitmap `BLOB` (32-bit bitmap or 64-bit treemap),
 or a `BIGINT[]` of dead IDs. `NULL` means no exclusions. Signed IDs use their
@@ -268,6 +314,14 @@ FROM tantivy_search('pgvfs://lake-fts/docs.tantivy', 'roof',
     '{"top_k": 10, "exclude_field": "rowid", "fast": ["rowid"]}',
     (SELECT content FROM read_blob('pgvfs://lake-fts/dead.roaring')));
 ```
+
+Exclusion works like tantivy's own deletes. The first call with an exclusion
+reads the key column of each split once and builds an alive bitset for its
+segments; the split keeps the last four (by `exclude_field` and the set), so
+later calls with the same set skip dead documents as tantivy's deletes are
+skipped: they never crowd out `top_k`, and never reach a count or an
+aggregation. A set that changes on every call pays that first read each time:
+about 20 ms per million documents of a split (splits build in parallel).
 
 One exclusion set applies to every split in a list. If a rowid is dead in an
 old split but live in a new one, use per-split exclusions with lateral calls
@@ -285,12 +339,27 @@ FROM tantivy_search(['s3://bucket/part-1.tantivy', 's3://bucket/part-2.tantivy']
 GROUP BY building;
 ```
 
+A list of splits is searched in parallel, up to DuckDB's `threads` at a time,
+and merged: hits by score (equal scores in list order, then document order),
+so a page does not depend on how many threads ran. One call over the list also
+gives `global_stats`, a merged `top_k` and, for deep pages, `offset`: calling
+once per split in a lateral join gives all of these up.
+
 ### `tantivy_count(index, query [, options [, exclude]])`
 
 The exact number of matches, as `BIGINT`, across one split or a list of them.
 Uses the same query, options and exclusions as search, but ignores `top_k`
 and reads no stored documents. A `NULL` index or query returns `NULL`; an
-empty list returns zero.
+empty list returns zero. Two options change what it counts:
+
+| Option | |
+| --- | --- |
+| `limit` | stop counting after `limit + 1` matches and return that, so "more than 100" costs a hundred matches, not millions: `{"limit": 100}` returns 101 when there are more |
+| `distinct` | the **exact** number of distinct values of a fast field among the matches (text, number, boolean or date; one value per document; documents without one are not counted), merged across splits. Memory is proportional to the distinct values. The `cardinality` aggregation is approximate but much faster and smaller; use it when an estimate will do |
+
+`offset`, `collapse` and `distinct`/`limit` belong to one call each: a search
+rejects `limit` and `distinct`, a count rejects `offset` and `collapse`, and
+`limit` cannot be combined with `distinct`.
 
 ### `tantivy_aggregate(index, query, aggs [, options [, exclude]])`
 
@@ -345,7 +414,7 @@ Unsupported query types and parameters fail rather than being silently ignored:
 | `multi_match` | named `fields` (with `^boost`), `best_fields`, `most_fields`, `phrase`, `phrase_prefix`; applicable match parameters, `tie_breaker` |
 | `term`, `terms` | exact typed values, without analysis |
 | `prefix`, `wildcard`, `regexp`, `fuzzy` | text `value`; wildcard `*`, `?`, escapes; fuzzy `fuzziness`, `transpositions` |
-| `exists` | `field` (must be fast) |
+| `exists` | `field`: a fast field, or an indexed text field (slower: any term in its dictionary), or a JSON field (any path in it) |
 | `range` | `gt`, `gte`, `lt`, `lte` |
 | `constant_score`, `dis_max` | `filter`; `queries` and `tie_breaker`, respectively |
 | `match_all`, `match_none` | |
@@ -357,6 +426,19 @@ conditional expressions. Fuzziness is `0`, `1`, `2` or `AUTO[:low,high]`.
 `bool.filter` and `must_not` do not contribute scores. Numeric values, booleans,
 RFC 3339 dates (or epoch milliseconds), facets and IP addresses are typed by
 the schema. Regular expressions and scoring follow tantivy's behaviour.
+
+**JSON fields.** A path inside a `json_object` field is a field name:
+`{"term": {"attributes.contractor": "acme"}}`. `term`, `terms`, `match`
+(analyzed by the JSON field's tokenizer), `match_phrase`, `range` (fast, numeric
+bounds typed by their JSON literal) and `exists` accept paths, as do
+`multi_match` fields. Free-form attributes then need no field per attribute
+in the schema, and splits with different attribute sets share one schema.
+`prefix`, `wildcard`, `regexp`, `fuzzy`, `match_phrase_prefix` and fuzziness on
+a path are not supported and fail.
+
+**Missing fields.** A field the schema lacks is an error, so a typo cannot
+quietly match nothing. `ignore_unmapped` (a search option) makes it match
+nothing instead, as in OpenSearch, for splits built with different schemas.
 
 ### `tantivy_drop(index)`
 
@@ -403,8 +485,36 @@ with the lake.
   aggregations skip the document store. An open split is
   checked for a change (size, modification time, version tag) at most every
   10 s, so another process's rebuild at the same path shows up within that.
+- **Parallel searches.** A call over a list of splits searches them on up to
+  `threads` threads (each split reads its file through its own handle), then
+  merges. Documents of the hits are read in parallel too, one thread a split.
+- **Exclusions** are alive bitsets built once per split and set, as above. On
+  4 million documents in 4 splits, 60% of them excluded, a count of 2.8 million
+  matches takes 9 ms (1.4 ms with nothing excluded), a top 10 takes 6 ms (5 ms),
+  and a new set costs 25 ms the first time (`bench/search.py` measures these).
 - **Drops** remove the file. On pgvfs its rows stay for the usual 10-minute
   grace, so searches already running finish; object stores delete at once,
   so there drop replaced splits a while after swapping them out.
 - **Storage.** On pgvfs a split is an ordinary file; the storage layout is
   unchanged.
+
+## Roadmap
+
+What a real workload (a 12.5M-document index in 13 splits, read through pgvfs,
+replaced documents excluded by key) still lacks, most valuable first.
+
+**Pattern queries on JSON paths.** `prefix`, `wildcard`, `regexp`, `fuzzy` and
+`match_phrase_prefix` need a field, not a path inside a JSON field: tantivy's
+`RegexQuery` and `FuzzyTermQuery` match a field's whole term dictionary. A path's
+terms share a prefix in that dictionary, so a query restricted to it would do,
+but it needs a query of our own (or a change in tantivy). Today a free-form
+attribute can be matched exactly, analysed, by range and by existence.
+
+**A faster merge.** `tantivy_merge` is one thread (see "What a merge costs").
+Merging halves of the list at once and then their results would use more cores
+at the price of a second pass; measure it on the real splits before building it.
+
+**A community release that includes tantivy.** The signed `INSTALL pgvfs FROM
+community` build predates the search functions, so projects that need them
+load a local build with `allow_unsigned_extensions`. The next release, and its
+submission to the community repository, fixes that.

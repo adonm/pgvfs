@@ -1,16 +1,22 @@
 //! Searching splits: a tantivy query string, or OpenSearch query DSL (`dsl`),
-//! over one or more splits, for hits, counts or aggregations. Several splits
-//! merge natively: hits by score, counts summed, aggregations through
-//! tantivy's intermediate results. Each split scores with its own term
-//! statistics unless `global_stats` asks for the splits' combined ones.
+//! over one or more splits, for hits, counts or aggregations. Splits are
+//! searched in parallel and merged natively: hits by score, counts summed,
+//! aggregations through tantivy's intermediate results. Each split scores with
+//! its own term statistics unless `global_stats` asks for the splits' combined
+//! ones.
 //!
-//! An `Exclude` set leaves out documents by a fast field's value, before
-//! `top_k`, counts and aggregations: dead row ids, for per-snapshot liveness.
+//! An `Exclude` set leaves out documents by a fast field's value: dead row
+//! ids, for per-snapshot liveness. It becomes a per-segment alive bitset, as
+//! tantivy's own deletes are, built once per split and set and kept, so
+//! scoring skips dead documents and `top_k`, counts and aggregations never
+//! see them.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasher, Hasher, RandomState};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{Context as _, Result};
+use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -19,17 +25,20 @@ use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResult
 use tantivy::aggregation::{
     AggContextParams, AggregationLimitsGuard, DistributedAggregationCollector,
 };
-use tantivy::collector::{Collector, Count, FilterCollector, SegmentCollector, TopDocs};
-use tantivy::columnar::{Cardinality, DynamicColumn};
+use tantivy::collector::{Collector, Count, SegmentCollector, TopDocs};
+use tantivy::columnar::{Cardinality, Column, DynamicColumn, StrColumn};
+use tantivy::directory::OwnedBytes;
+use tantivy::fastfield::{write_alive_bitset, AliveBitSet};
 use tantivy::query::{
     Bm25StatisticsProvider, ConstScorer, EnableScoring, Explanation, Query, QueryParser, Scorer,
     Weight,
 };
 use tantivy::schema::{Field, FieldType, Schema};
 use tantivy::{
-    DocAddress, DocId, DocSet, Document, Score, Searcher, SegmentOrdinal, SegmentReader,
-    TantivyDocument, Term, TERMINATED,
+    f64_to_u64, i64_to_u64, u64_to_i64, DateTime, DocAddress, DocId, DocSet, Document, Score,
+    Searcher, SegmentOrdinal, SegmentReader, TantivyDocument, Term, TERMINATED,
 };
+use tantivy_common::BitSet;
 
 use crate::split::{options, Split};
 
@@ -39,6 +48,16 @@ use crate::split::{options, Split};
 pub(crate) struct SearchOptions {
     /// The number of top hits, across all the splits (default: every hit).
     top_k: Option<usize>,
+    /// Hits to skip before `top_k`, across all the splits.
+    #[serde(default)]
+    offset: usize,
+    /// Counts only: stop after this many matches; the result is then
+    /// `limit + 1` if there are more.
+    limit: Option<u64>,
+    /// Counts only: the exact number of distinct values of this fast field.
+    distinct: Option<String>,
+    /// Hits only: the best hit of each distinct value of this fast field.
+    collapse: Option<String>,
     /// The default fields for query-string terms that name none.
     fields: Option<Vec<String>>,
     #[serde(default)]
@@ -52,11 +71,31 @@ pub(crate) struct SearchOptions {
     /// Score with the splits' combined term statistics.
     #[serde(default)]
     global_stats: bool,
+    /// In OpenSearch query DSL, a field a split lacks matches nothing.
+    #[serde(default)]
+    ignore_unmapped: bool,
 }
 
 /// Values of a fast field whose documents to leave out.
 #[derive(Clone)]
-pub struct Exclude(Arc<RoaringTreemap>);
+pub struct Exclude {
+    set: Arc<RoaringTreemap>,
+    /// Identifies the input, for the alive bitsets built from it.
+    digest: u128,
+}
+
+fn digest(kind: u8, bytes: &[u8]) -> u128 {
+    static KEYS: OnceLock<(RandomState, RandomState)> = OnceLock::new();
+    let (a, b) = KEYS.get_or_init(|| (RandomState::new(), RandomState::new()));
+    let hash = |state: &RandomState| {
+        let mut h = state.build_hasher();
+        h.write_u8(kind);
+        h.write_usize(bytes.len());
+        h.write(bytes);
+        h.finish()
+    };
+    (u128::from(hash(a)) << 64) | u128::from(hash(b))
+}
 
 impl Exclude {
     /// A serialized roaring bitmap, 32-bit or 64-bit (treemap), in the
@@ -68,14 +107,14 @@ impl Exclude {
         let bitmap = || -> Result<RoaringTreemap> {
             let mut remaining = bytes;
             let set = RoaringBitmap::deserialize_from(&mut remaining)?;
-            anyhow::ensure!(remaining.is_empty(), "trailing bytes in exclude bitmap");
+            ensure!(remaining.is_empty(), "trailing bytes in exclude bitmap");
             Ok(RoaringTreemap::from_bitmaps([(0, set)]))
         };
         let treemap = || -> Result<RoaringTreemap> {
             let mut remaining = bytes;
             let set = RoaringTreemap::deserialize_from(&mut remaining)
                 .context("exclude is not a serialized roaring bitmap")?;
-            anyhow::ensure!(remaining.is_empty(), "trailing bytes in exclude bitmap");
+            ensure!(remaining.is_empty(), "trailing bytes in exclude bitmap");
             Ok(set)
         };
         let set = match cookie {
@@ -85,115 +124,236 @@ impl Exclude {
             }
             _ => treemap()?,
         };
-        Ok(Exclude(Arc::new(set)))
-    }
-
-    pub fn from_ids(ids: impl IntoIterator<Item = i64>) -> Exclude {
-        Exclude(Arc::new(ids.into_iter().map(|id| id as u64).collect()))
-    }
-
-    fn contains_i64(&self, v: i64) -> bool {
-        self.0.contains(v as u64)
-    }
-}
-
-/// A segment's open fast fields, by name.
-type FastColumns = Vec<(String, Vec<DynamicColumn>)>;
-
-/// The exclusion for one split: the field must be an i64 or u64 fast field.
-pub(crate) enum Filter {
-    None,
-    I64(String, Exclude),
-    U64(String, Exclude),
-}
-
-impl Filter {
-    pub(crate) fn new(
-        schema: &Schema,
-        field: Option<&str>,
-        exclude: Option<&Exclude>,
-    ) -> Result<Filter> {
-        let Some(exclude) = exclude else {
-            return Ok(Filter::None);
-        };
-        let name = field.context("exclude needs options.exclude_field")?;
-        let entry = schema.get_field_entry(schema.get_field(name)?);
-        anyhow::ensure!(
-            entry.is_fast(),
-            "exclude_field {name:?} is not a fast field"
-        );
-        Ok(match entry.field_type() {
-            FieldType::I64(_) => Filter::I64(name.to_owned(), exclude.clone()),
-            FieldType::U64(_) => Filter::U64(name.to_owned(), exclude.clone()),
-            _ => anyhow::bail!("exclude_field {name:?} must be an i64 or u64 field"),
+        Ok(Exclude {
+            set: Arc::new(set),
+            digest: digest(1, bytes),
         })
     }
 
-    // FilterCollector tests one value at a time and rejects missing values.
-    // An exclusion key must therefore have exactly one value per document.
-    pub(crate) fn validate(&self, searcher: &Searcher) -> Result<()> {
-        for reader in searcher.segment_readers() {
-            let (name, cardinality) = match self {
-                Filter::None => return Ok(()),
-                Filter::I64(name, _) => (
-                    name,
-                    reader.fast_fields().i64(name)?.index.get_cardinality(),
-                ),
-                Filter::U64(name, _) => (
-                    name,
-                    reader.fast_fields().u64(name)?.index.get_cardinality(),
-                ),
-            };
-            anyhow::ensure!(
-                cardinality == Cardinality::Full,
-                "exclude_field {name:?} must have exactly one value on every document"
-            );
+    pub fn from_id_slice(ids: &[i64]) -> Exclude {
+        // SAFETY: any initialized i64s are valid bytes; only hashed.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), size_of_val(ids)) };
+        Exclude {
+            set: Arc::new(ids.iter().map(|&id| id as u64).collect()),
+            digest: digest(2, bytes),
         }
-        Ok(())
+    }
+
+    pub fn from_ids(ids: impl IntoIterator<Item = i64>) -> Exclude {
+        Exclude::from_id_slice(&ids.into_iter().collect::<Vec<_>>())
     }
 }
 
-fn collect<C: Collector>(
-    searcher: &Searcher,
-    query: &dyn Query,
-    collector: C,
-    filter: &Filter,
-    stats: Option<&dyn Bm25StatisticsProvider>,
-) -> Result<C::Fruit> {
-    fn run<C: Collector>(
-        searcher: &Searcher,
-        query: &dyn Query,
-        collector: &C,
-        stats: Option<&dyn Bm25StatisticsProvider>,
-    ) -> tantivy::Result<C::Fruit> {
-        match stats {
-            Some(stats) => searcher.search_with_statistics_provider(query, collector, stats),
-            None => searcher.search(query, collector),
+/// The key `exclude_field` names: `true` for an i64 field, `false` for u64.
+fn key_is_signed(schema: &Schema, name: &str) -> Result<bool> {
+    let field = schema
+        .get_field(name)
+        .map_err(|_| anyhow!("no field {name:?}"))?;
+    let entry = schema.get_field_entry(field);
+    ensure!(
+        entry.is_fast(),
+        "exclude_field {name:?} is not a fast field"
+    );
+    match entry.field_type() {
+        FieldType::I64(_) => Ok(true),
+        FieldType::U64(_) => Ok(false),
+        _ => bail!("exclude_field {name:?} must be an i64 or u64 field"),
+    }
+}
+
+/// An exclusion key needs exactly one value on every document: a missing one
+/// would be neither kept nor dropped by anything principled.
+pub(crate) fn check_exclusion_key(split: &Split, name: &str) -> Result<()> {
+    let signed = key_is_signed(&split.index.schema(), name)?;
+    for reader in split.reader.searcher().segment_readers() {
+        let cardinality = if signed {
+            reader.fast_fields().i64(name)?.get_cardinality()
+        } else {
+            reader.fast_fields().u64(name)?.get_cardinality()
+        };
+        ensure!(
+            cardinality == Cardinality::Full,
+            "exclude_field {name:?} must have exactly one value on every document"
+        );
+    }
+    Ok(())
+}
+
+/// A split's segments with an exclusion's documents deleted.
+pub(crate) struct Alive {
+    readers: Vec<SegmentReader>,
+}
+
+const BLOCK: usize = 4096;
+
+fn mark_dead<T>(
+    column: &Column<T>,
+    max_doc: u32,
+    is_dead: impl Fn(T) -> bool,
+    alive: &mut BitSet,
+) -> Result<()>
+where
+    T: PartialOrd + Copy + Default + std::fmt::Debug + Send + Sync + 'static,
+{
+    let mut values = [T::default(); BLOCK];
+    for start in (0..max_doc).step_by(BLOCK) {
+        let n = ((max_doc - start) as usize).min(BLOCK);
+        column.values.get_range(u64::from(start), &mut values[..n]);
+        for (offset, &value) in values[..n].iter().enumerate() {
+            if is_dead(value) {
+                alive.remove(start + offset as u32);
+            }
         }
     }
-    Ok(match filter {
-        Filter::None => run(searcher, query, &collector, stats)?,
-        Filter::I64(field, ex) => {
-            let ex = ex.clone();
-            let keep = move |v: i64| !ex.contains_i64(v);
-            run(
-                searcher,
-                query,
-                &FilterCollector::new(field.clone(), keep, collector),
-                stats,
-            )?
+    Ok(())
+}
+
+fn build_alive(split: &Split, name: &str, exclude: &Exclude) -> Result<Alive> {
+    check_exclusion_key(split, name)?;
+    let signed = key_is_signed(&split.index.schema(), name)?;
+    let searcher = split.reader.searcher();
+    let segments = split.index.searchable_segments()?;
+    ensure!(
+        segments.len() == searcher.segment_readers().len(),
+        "the split changed while it was open"
+    );
+    let mut readers = Vec::with_capacity(segments.len());
+    for (segment, reader) in segments.iter().zip(searcher.segment_readers()) {
+        let max_doc = reader.max_doc();
+        let mut alive = BitSet::with_max_value_and_full(max_doc);
+        if signed {
+            let column = reader.fast_fields().i64(name)?;
+            mark_dead(
+                &column,
+                max_doc,
+                |v| exclude.set.contains(v as u64),
+                &mut alive,
+            )?;
+        } else {
+            let column = reader.fast_fields().u64(name)?;
+            mark_dead(&column, max_doc, |v| exclude.set.contains(v), &mut alive)?;
         }
-        Filter::U64(field, ex) => {
-            let ex = ex.clone();
-            let keep = move |v: u64| !ex.0.contains(v);
-            run(
-                searcher,
-                query,
-                &FilterCollector::new(field.clone(), keep, collector),
-                stats,
-            )?
+        let mut bytes = Vec::new();
+        write_alive_bitset(&alive, &mut bytes)?;
+        readers.push(SegmentReader::open_with_custom_alive_set(
+            segment,
+            Some(AliveBitSet::open(OwnedBytes::new(bytes))),
+        )?);
+    }
+    Ok(Alive { readers })
+}
+
+type AliveSlot = Arc<OnceLock<std::result::Result<Arc<Alive>, String>>>;
+
+/// The alive bitsets of one split, for the last few exclusions searched.
+#[derive(Default)]
+pub(crate) struct AliveCache(Mutex<VecDeque<((String, u128), AliveSlot)>>);
+
+const ALIVE_SETS_PER_SPLIT: usize = 4;
+
+impl AliveCache {
+    fn get(&self, split: &Split, name: &str, exclude: &Exclude) -> Result<Arc<Alive>> {
+        let key = (name.to_owned(), exclude.digest);
+        let slot = {
+            let mut entries = self.0.lock().unwrap();
+            match entries.iter().position(|(k, _)| *k == key) {
+                Some(at) => {
+                    let entry = entries.remove(at).unwrap();
+                    let slot = entry.1.clone();
+                    entries.push_back(entry);
+                    slot
+                }
+                None => {
+                    let slot = AliveSlot::default();
+                    entries.push_back((key.clone(), slot.clone()));
+                    if entries.len() > ALIVE_SETS_PER_SPLIT {
+                        entries.pop_front();
+                    }
+                    slot
+                }
+            }
+        };
+        let built = slot.get_or_init(|| {
+            build_alive(split, name, exclude)
+                .map(Arc::new)
+                .map_err(|e| format!("{e:#}"))
+        });
+        match built {
+            Ok(alive) => Ok(alive.clone()),
+            Err(message) => {
+                // A failure (an unreadable file, say) may not repeat.
+                let mut entries = self.0.lock().unwrap();
+                entries.retain(|(k, s)| !(*k == key && Arc::ptr_eq(s, &slot)));
+                Err(anyhow!("{message}"))
+            }
         }
-    })
+    }
+}
+
+/// One split being searched: its searcher, and its segments without the
+/// documents an exclusion deletes.
+struct Run<'a> {
+    searcher: &'a Searcher,
+    alive: Option<Arc<Alive>>,
+}
+
+impl Run<'_> {
+    fn readers(&self) -> &[SegmentReader] {
+        match &self.alive {
+            Some(alive) => &alive.readers,
+            None => self.searcher.segment_readers(),
+        }
+    }
+
+    fn num_docs(&self) -> u64 {
+        self.readers().iter().map(|r| u64::from(r.num_docs())).sum()
+    }
+}
+
+type Stats<'a> = Option<&'a (dyn Bm25StatisticsProvider + Sync)>;
+
+/// What `Searcher::search` does, over a run's segments.
+fn collect<C: Collector>(
+    run: &Run,
+    query: &dyn Query,
+    collector: &C,
+    stats: Stats,
+) -> Result<C::Fruit> {
+    let scoring = match (collector.requires_scoring(), stats) {
+        (false, _) => EnableScoring::disabled_from_searcher(run.searcher),
+        (true, None) => EnableScoring::enabled_from_searcher(run.searcher),
+        (true, Some(stats)) => EnableScoring::enabled_from_statistics_provider(stats, run.searcher),
+    };
+    let weight = query.weight(scoring)?;
+    let fruits = run
+        .readers()
+        .iter()
+        .enumerate()
+        .map(|(ord, reader)| collector.collect_segment(&*weight, ord as u32, reader))
+        .collect::<tantivy::Result<Vec<_>>>()?;
+    Ok(collector.merge_fruits(fruits)?)
+}
+
+/// The matches of a run, counted up to `cap`.
+fn count_up_to(run: &Run, query: &dyn Query, cap: u64) -> Result<u64> {
+    let weight = query.weight(EnableScoring::disabled_from_searcher(run.searcher))?;
+    let mut n = 0;
+    for reader in run.readers() {
+        let alive = reader.alive_bitset();
+        let mut scorer = weight.scorer(reader, 1.0)?;
+        let mut doc = scorer.doc();
+        while doc != TERMINATED {
+            if alive.is_none_or(|a| a.is_alive(doc)) {
+                n += 1;
+                if n >= cap {
+                    return Ok(n);
+                }
+            }
+            doc = scorer.advance();
+        }
+    }
+    Ok(n)
 }
 
 /// A query string in tantivy's syntax, or (starting with `{`) OpenSearch
@@ -201,7 +361,7 @@ fn collect<C: Collector>(
 fn query(split: &Split, text: &str, options: &SearchOptions) -> Result<Box<dyn Query>> {
     if text.trim_start().starts_with('{') {
         let dsl: Value = serde_json::from_str(text).context("OpenSearch query DSL")?;
-        return crate::dsl::compile(&split.index, &dsl);
+        return crate::dsl::compile(&split.index, &dsl, options.ignore_unmapped);
     }
     let schema = split.index.schema();
     let fields = match &options.fields {
@@ -233,7 +393,9 @@ pub(crate) fn text_fields(schema: &Schema) -> Vec<Field> {
         .collect()
 }
 
-/// BM25 statistics summed over several splits (of one schema).
+/// BM25 statistics summed over several splits (of one schema). Like
+/// tantivy's own, they count a split's deleted (here: excluded) documents
+/// until it is merged.
 struct GlobalStats<'a>(&'a [Searcher]);
 
 impl Bm25StatisticsProvider for GlobalStats<'_> {
@@ -248,6 +410,41 @@ impl Bm25StatisticsProvider for GlobalStats<'_> {
     }
 }
 
+/// `f(0..n)` on up to `threads` threads; the results in order, or the first
+/// error in order.
+fn par_map<T: Send>(
+    n: usize,
+    threads: usize,
+    f: impl Fn(usize) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    let workers = threads.min(n);
+    if workers <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let slots: Vec<Mutex<Option<Result<T>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n || failed.load(Ordering::Relaxed) {
+                    break;
+                }
+                let result = f(i);
+                if result.is_err() {
+                    failed.store(true, Ordering::Relaxed);
+                }
+                *slots[i].lock().unwrap() = Some(result);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .filter_map(|slot| slot.into_inner().unwrap())
+        .collect()
+}
+
 /// A search request over some splits.
 pub struct Request<'a> {
     splits: &'a [&'a Split],
@@ -255,7 +452,10 @@ pub struct Request<'a> {
     text: &'a str,
     options: SearchOptions,
     exclude: Option<&'a Exclude>,
+    threads: usize,
 }
+
+type Found = (Score, usize, DocAddress, Option<Key>);
 
 impl<'a> Request<'a> {
     pub fn new(
@@ -267,7 +467,7 @@ impl<'a> Request<'a> {
         let options: SearchOptions = options(options_json, "search")?;
         if options.global_stats {
             if let Some(first) = splits.first() {
-                anyhow::ensure!(
+                ensure!(
                     splits
                         .iter()
                         .all(|s| s.index.schema() == first.index.schema()),
@@ -283,7 +483,7 @@ impl<'a> Request<'a> {
                         .find_field(name)
                         .with_context(|| format!("no fast field {name:?}"))?;
                     let entry = schema.get_field_entry(field);
-                    anyhow::ensure!(
+                    ensure!(
                         entry.is_fast()
                             && (path.is_empty()
                                 || matches!(entry.field_type(), FieldType::JsonObject(_))),
@@ -298,111 +498,203 @@ impl<'a> Request<'a> {
             text,
             options,
             exclude,
+            threads: 1,
         })
     }
 
-    /// Run `per_split` on each split with its query and filter.
-    fn each(
+    /// Search up to this many splits at a time (default 1).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
+        self
+    }
+
+    fn run(&self, i: usize) -> Result<Run<'_>> {
+        let alive = match (self.exclude, self.options.exclude_field.as_deref()) {
+            (Some(exclude), Some(name)) => {
+                Some(self.splits[i].alive.get(self.splits[i], name, exclude)?)
+            }
+            (Some(_), None) => bail!("exclude needs options.exclude_field"),
+            (None, _) => None,
+        };
+        Ok(Run {
+            searcher: &self.searchers[i],
+            alive,
+        })
+    }
+
+    /// Run `f` on each split with its run, query and statistics.
+    fn each<T: Send>(
         &self,
-        mut per_split: impl FnMut(
-            usize,
-            &Searcher,
-            &dyn Query,
-            &Filter,
-            Option<&dyn Bm25StatisticsProvider>,
-        ) -> Result<()>,
-    ) -> Result<()> {
+        f: impl Fn(usize, &Run, &dyn Query, Stats) -> Result<T> + Sync,
+    ) -> Result<Vec<T>> {
         let global = GlobalStats(&self.searchers);
-        let stats: Option<&dyn Bm25StatisticsProvider> =
-            (self.options.global_stats && self.splits.len() > 1).then_some(&global);
-        for (i, (split, searcher)) in self.splits.iter().zip(&self.searchers).enumerate() {
-            let q = query(split, self.text, &self.options)?;
-            let schema = split.index.schema();
-            let filter = Filter::new(&schema, self.options.exclude_field.as_deref(), self.exclude)?;
-            filter.validate(searcher)?;
-            per_split(i, searcher, &*q, &filter, stats)?;
-        }
-        Ok(())
+        let stats: Stats = (self.options.global_stats && self.splits.len() > 1).then_some(&global);
+        par_map(self.splits.len(), self.threads, |i| {
+            let run = self.run(i)?;
+            let q = query(self.splits[i], self.text, &self.options)?;
+            f(i, &run, &*q, stats)
+        })
     }
 
     /// Hits, best first: (split, score, doc as a JSON object).
     pub fn hits(&self) -> Result<Vec<(usize, Score, String)>> {
-        let top_k = self.options.top_k;
-        let mut found: Vec<(Score, usize, DocAddress)> = Vec::new();
-        self.each(|i, searcher, q, filter, stats| {
-            let hits = match top_k {
-                Some(0) => Vec::new(),
-                // TopDocs allocates for k: no more than the split holds.
-                Some(k) => {
-                    let k = k.min(searcher.num_docs() as usize).max(1);
-                    collect(
-                        searcher,
-                        q,
-                        TopDocs::with_limit(k).order_by_score(),
-                        filter,
-                        stats,
-                    )?
+        let o = &self.options;
+        ensure!(
+            o.limit.is_none() && o.distinct.is_none(),
+            "limit and distinct are options of tantivy_count"
+        );
+        let want = o.top_k.map(|k| o.offset.saturating_add(k));
+        let per_split = self.each(|i, run, q, stats| {
+            let hits: Vec<(Score, DocAddress, Option<Key>)> = match (&o.collapse, want) {
+                (_, Some(0)) => Vec::new(),
+                (Some(field), _) => {
+                    let collapse = Collapse {
+                        field: field.clone(),
+                        groups: want.unwrap_or(usize::MAX),
+                    };
+                    collect(run, q, &collapse, stats)?
+                        .into_iter()
+                        .map(|(score, key, addr)| (score, addr, Some(key)))
+                        .collect()
                 }
-                None => collect(searcher, q, AllHits, filter, stats)?,
+                // TopDocs allocates for k: no more than the split holds.
+                (None, Some(k)) => {
+                    let k = k.min(run.num_docs() as usize).max(1);
+                    let top = TopDocs::with_limit(k).order_by_score();
+                    collect(run, q, &top, stats)?
+                        .into_iter()
+                        .map(|(score, addr)| (score, addr, None))
+                        .collect()
+                }
+                (None, None) => collect(run, q, &AllHits, stats)?
+                    .into_iter()
+                    .map(|(score, addr)| (score, addr, None))
+                    .collect(),
             };
-            found.extend(hits.into_iter().map(|(score, addr)| (score, i, addr)));
-            Ok(())
+            Ok(hits
+                .into_iter()
+                .map(|(score, addr, key)| (score, i, addr, key))
+                .collect::<Vec<Found>>())
         })?;
-        found.sort_by(|a, b| b.0.total_cmp(&a.0));
-        if let Some(k) = top_k {
-            found.truncate(k);
-        }
-        let mut columns: HashMap<(usize, SegmentOrdinal), FastColumns> = HashMap::new();
-        found
-            .into_iter()
-            .map(|(score, i, addr)| {
-                let searcher = &self.searchers[i];
-                let doc = match &self.options.fast {
-                    Some(names) => {
-                        let cols = match columns.entry((i, addr.segment_ord)) {
-                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                            std::collections::hash_map::Entry::Vacant(e) => e.insert(fast_columns(
-                                searcher.segment_reader(addr.segment_ord),
-                                names,
-                            )?),
-                        };
-                        fast_json(cols, addr.doc_id)?
+        let mut found: Vec<Found> = per_split.into_iter().flatten().collect();
+        if o.collapse.is_some() {
+            // A value's best hit over all the splits.
+            let mut best: HashMap<Key, usize> = HashMap::new();
+            let mut groups: Vec<Found> = Vec::new();
+            for hit in found {
+                let key = hit.3.clone().unwrap_or(Key::Missing);
+                match best.get(&key) {
+                    Some(&at) if groups[at].0 >= hit.0 => {}
+                    Some(&at) => groups[at] = hit,
+                    None => {
+                        best.insert(key, groups.len());
+                        groups.push(hit);
                     }
-                    None => stored_json(&searcher.doc(addr)?, &self.splits[i].index.schema())?,
-                };
-                Ok((i, score, doc))
-            })
-            .collect()
+                }
+            }
+            found = groups;
+        }
+        found.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let found: Vec<Found> = found
+            .into_iter()
+            .skip(o.offset)
+            .take(o.top_k.unwrap_or(usize::MAX))
+            .collect();
+        // Documents, only for the hits kept, a split at a time.
+        let mut positions: Vec<Vec<usize>> = vec![Vec::new(); self.splits.len()];
+        for (at, hit) in found.iter().enumerate() {
+            positions[hit.1].push(at);
+        }
+        let docs = par_map(self.splits.len(), self.threads, |i| {
+            let searcher = &self.searchers[i];
+            let mut columns: HashMap<SegmentOrdinal, FastColumns> = HashMap::new();
+            positions[i]
+                .iter()
+                .map(|&at| {
+                    let addr = found[at].2;
+                    Ok(match &o.fast {
+                        Some(names) => {
+                            let cols = match columns.entry(addr.segment_ord) {
+                                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                std::collections::hash_map::Entry::Vacant(e) => e.insert(
+                                    fast_columns(searcher.segment_reader(addr.segment_ord), names)?,
+                                ),
+                            };
+                            fast_json(cols, addr.doc_id)?
+                        }
+                        None => stored_json(&searcher.doc(addr)?, &self.splits[i].index.schema())?,
+                    })
+                })
+                .collect::<Result<Vec<String>>>()
+        })?;
+        let mut out: Vec<(usize, Score, String)> = found
+            .iter()
+            .map(|hit| (hit.1, hit.0, String::new()))
+            .collect();
+        for (split_positions, split_docs) in positions.iter().zip(docs) {
+            for (&at, doc) in split_positions.iter().zip(split_docs) {
+                out[at].2 = doc;
+            }
+        }
+        Ok(out)
     }
 
-    /// The number of matches.
+    /// The number of matches: exact, or capped by `limit`, or the distinct
+    /// values of a field.
     pub fn count(&self) -> Result<u64> {
-        let mut count = 0;
-        self.each(|_, searcher, q, filter, _| {
-            count += collect(searcher, q, Count, filter, None)? as u64;
-            Ok(())
-        })?;
-        Ok(count)
+        let o = &self.options;
+        ensure!(
+            o.offset == 0 && o.collapse.is_none(),
+            "offset and collapse are options of tantivy_search"
+        );
+        ensure!(
+            o.limit.is_none() || o.distinct.is_none(),
+            "limit and distinct cannot be combined"
+        );
+        if let Some(field) = &o.distinct {
+            let distinct = Distinct {
+                field: field.clone(),
+            };
+            let mut all: HashSet<Key> = HashSet::new();
+            for values in self.each(|_, run, q, _| collect(run, q, &distinct, None))? {
+                all.extend(values);
+            }
+            return Ok(all.len() as u64);
+        }
+        if let Some(limit) = o.limit {
+            let cap = limit.saturating_add(1);
+            let counts = self.each(|_, run, q, _| count_up_to(run, q, cap))?;
+            return Ok(counts.into_iter().sum::<u64>().min(cap));
+        }
+        Ok(self
+            .each(|_, run, q, _| Ok(collect(run, q, &Count, None)? as u64))?
+            .into_iter()
+            .sum())
     }
 
     /// Tantivy aggregations (Elasticsearch's JSON) over the matches.
     pub fn aggregate(&self, aggs_json: &str) -> Result<String> {
+        let o = &self.options;
+        ensure!(
+            o.offset == 0 && o.collapse.is_none() && o.limit.is_none() && o.distinct.is_none(),
+            "offset, limit, collapse and distinct are not options of tantivy_aggregate"
+        );
         let aggs: Aggregations = serde_json::from_str(aggs_json).context("tantivy aggregations")?;
-        let mut merged = IntermediateAggregationResults::default();
         let limits = AggregationLimitsGuard::default();
-        self.each(|i, searcher, q, filter, _| {
+        let results = self.each(|i, run, q, _| {
             let context =
                 AggContextParams::new(limits.clone(), self.splits[i].index.tokenizers().clone());
-            let result = collect(
-                searcher,
+            collect(
+                run,
                 q,
-                DistributedAggregationCollector::from_aggs(aggs.clone(), context),
-                filter,
+                &DistributedAggregationCollector::from_aggs(aggs.clone(), context),
                 None,
-            )?;
-            merged.merge_fruits(result)?;
-            Ok(())
+            )
         })?;
+        let mut merged = IntermediateAggregationResults::default();
+        for result in results {
+            merged.merge_fruits(result)?;
+        }
         Ok(serde_json::to_string(
             &merged.into_final_result(aggs, limits)?,
         )?)
@@ -426,6 +718,9 @@ fn stored_json(doc: &TantivyDocument, schema: &Schema) -> Result<String> {
         .collect::<Result<Map<_, _>, _>>()?;
     Ok(serde_json::to_string(&fields)?)
 }
+
+/// A segment's open fast fields, by name.
+type FastColumns = Vec<(String, Vec<DynamicColumn>)>;
 
 fn fast_columns(reader: &SegmentReader, names: &[String]) -> Result<FastColumns> {
     names
@@ -532,9 +827,247 @@ impl SegmentCollector for SegmentHits {
     }
 }
 
+/// A value of a single-valued fast field, comparable across segments and
+/// splits.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Key {
+    Missing,
+    I64(i64),
+    U64(u64),
+    F64(u64),
+    Bool(bool),
+    Date(i64),
+    Str(Box<str>),
+}
+
+/// A fast field read as one key per document: by a raw number within a
+/// segment (a string's term ordinal), resolved to a `Key` only when needed.
+enum KeyColumn {
+    Str(StrColumn),
+    I64(Column<i64>),
+    U64(Column<u64>),
+    F64(Column<f64>),
+    Bool(Column<bool>),
+    Date(Column<DateTime>),
+}
+
+impl KeyColumn {
+    fn open(reader: &SegmentReader, name: &str) -> Result<KeyColumn> {
+        let mut handles = reader.fast_fields().dynamic_column_handles(name)?;
+        ensure!(
+            handles.len() == 1,
+            "{name:?} is not a fast field of one type"
+        );
+        let (column, cardinality) = match handles.pop().unwrap().open()? {
+            DynamicColumn::Str(c) => (KeyColumn::Str(c.clone()), c.ords().get_cardinality()),
+            DynamicColumn::I64(c) => (KeyColumn::I64(c.clone()), c.get_cardinality()),
+            DynamicColumn::U64(c) => (KeyColumn::U64(c.clone()), c.get_cardinality()),
+            DynamicColumn::F64(c) => (KeyColumn::F64(c.clone()), c.get_cardinality()),
+            DynamicColumn::Bool(c) => (KeyColumn::Bool(c.clone()), c.get_cardinality()),
+            DynamicColumn::DateTime(c) => (KeyColumn::Date(c.clone()), c.get_cardinality()),
+            _ => bail!("{name:?}: only text, numbers, booleans and dates can be grouped"),
+        };
+        ensure!(
+            cardinality != Cardinality::Multivalued,
+            "{name:?} has several values on a document"
+        );
+        Ok(column)
+    }
+
+    fn raw(&self, doc: DocId) -> Option<u64> {
+        match self {
+            KeyColumn::Str(c) => c.ords().first(doc),
+            KeyColumn::I64(c) => c.first(doc).map(i64_to_u64),
+            KeyColumn::U64(c) => c.first(doc),
+            KeyColumn::F64(c) => c.first(doc).map(f64_to_u64),
+            KeyColumn::Bool(c) => c.first(doc).map(u64::from),
+            KeyColumn::Date(c) => c.first(doc).map(|d| i64_to_u64(d.into_timestamp_nanos())),
+        }
+    }
+
+    /// Keys for distinct raw values: text by one pass over the dictionary's
+    /// blocks, not a block read for each.
+    fn keys(&self, raws: &[Option<u64>]) -> Vec<Key> {
+        let KeyColumn::Str(column) = self else {
+            return raws.iter().map(|&raw| self.key(raw)).collect();
+        };
+        let mut order: Vec<usize> = (0..raws.len()).filter(|&i| raws[i].is_some()).collect();
+        order.sort_unstable_by_key(|&i| raws[i]);
+        let mut keys = vec![Key::Missing; raws.len()];
+        let mut at = order.iter();
+        column
+            .dictionary()
+            .sorted_ords_to_term_cb(order.iter().map(|&i| raws[i].unwrap()), |term| {
+                keys[*at.next().unwrap()] = Key::Str(String::from_utf8_lossy(term).into());
+                Ok(())
+            })
+            .expect("term ordinals of the column's own dictionary");
+        keys
+    }
+
+    fn key(&self, raw: Option<u64>) -> Key {
+        let Some(raw) = raw else {
+            return Key::Missing;
+        };
+        match self {
+            KeyColumn::Str(c) => {
+                let mut s = String::new();
+                c.ord_to_str(raw, &mut s)
+                    .expect("a term ordinal of the column's own dictionary");
+                Key::Str(s.into())
+            }
+            KeyColumn::I64(_) => Key::I64(u64_to_i64(raw)),
+            KeyColumn::U64(_) => Key::U64(raw),
+            KeyColumn::F64(_) => Key::F64(raw),
+            KeyColumn::Bool(_) => Key::Bool(raw != 0),
+            KeyColumn::Date(_) => Key::Date(u64_to_i64(raw)),
+        }
+    }
+}
+
+/// The best hit of each distinct value of a fast field, at most `groups` of
+/// them, best first. A document without a value is in a group of its own.
+struct Collapse {
+    field: String,
+    groups: usize,
+}
+
+struct SegmentCollapse {
+    segment: SegmentOrdinal,
+    column: KeyColumn,
+    groups: usize,
+    best: HashMap<Option<u64>, (Score, DocId)>,
+}
+
+impl Collector for Collapse {
+    type Fruit = Vec<(Score, Key, DocAddress)>;
+    type Child = SegmentCollapse;
+
+    fn for_segment(
+        &self,
+        segment: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<SegmentCollapse> {
+        Ok(SegmentCollapse {
+            segment,
+            column: KeyColumn::open(reader, &self.field)
+                .map_err(|e| tantivy::TantivyError::InvalidArgument(format!("{e:#}")))?,
+            groups: self.groups,
+            best: HashMap::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        true
+    }
+
+    fn merge_fruits(&self, fruits: Vec<Self::Fruit>) -> tantivy::Result<Self::Fruit> {
+        let mut best: HashMap<Key, (Score, DocAddress)> = HashMap::new();
+        for (score, key, addr) in fruits.into_iter().flatten() {
+            match best.get(&key) {
+                Some(&(kept, _)) if kept >= score => {}
+                _ => {
+                    best.insert(key, (score, addr));
+                }
+            }
+        }
+        let mut groups: Vec<_> = best
+            .into_iter()
+            .map(|(key, (score, addr))| (score, key, addr))
+            .collect();
+        groups.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2.cmp(&b.2)));
+        groups.truncate(self.groups);
+        Ok(groups)
+    }
+}
+
+impl SegmentCollector for SegmentCollapse {
+    type Fruit = Vec<(Score, Key, DocAddress)>;
+
+    fn collect(&mut self, doc: DocId, score: Score) {
+        let entry = self.best.entry(self.column.raw(doc));
+        entry
+            .and_modify(|best| {
+                if score > best.0 {
+                    *best = (score, doc);
+                }
+            })
+            .or_insert((score, doc));
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        let mut groups: Vec<_> = self.best.into_iter().collect();
+        if groups.len() > self.groups {
+            // Best first, and the lowest document among equals, as in TopDocs.
+            groups.select_nth_unstable_by(self.groups - 1, |a, b| {
+                b.1 .0.total_cmp(&a.1 .0).then(a.1 .1.cmp(&b.1 .1))
+            });
+            groups.truncate(self.groups);
+        }
+        let keys = self
+            .column
+            .keys(&groups.iter().map(|g| g.0).collect::<Vec<_>>());
+        groups
+            .into_iter()
+            .zip(keys)
+            .map(|((_, (score, doc)), key)| (score, key, DocAddress::new(self.segment, doc)))
+            .collect()
+    }
+}
+
+/// The distinct values of a fast field among the matches (not the missing).
+struct Distinct {
+    field: String,
+}
+
+struct SegmentDistinct {
+    column: KeyColumn,
+    seen: HashSet<u64>,
+}
+
+impl Collector for Distinct {
+    type Fruit = HashSet<Key>;
+    type Child = SegmentDistinct;
+
+    fn for_segment(
+        &self,
+        _: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<SegmentDistinct> {
+        Ok(SegmentDistinct {
+            column: KeyColumn::open(reader, &self.field)
+                .map_err(|e| tantivy::TantivyError::InvalidArgument(format!("{e:#}")))?,
+            seen: HashSet::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(&self, fruits: Vec<Self::Fruit>) -> tantivy::Result<Self::Fruit> {
+        Ok(fruits.into_iter().flatten().collect())
+    }
+}
+
+impl SegmentCollector for SegmentDistinct {
+    type Fruit = HashSet<Key>;
+
+    fn collect(&mut self, doc: DocId, _: Score) {
+        if let Some(raw) = self.column.raw(doc) {
+            self.seen.insert(raw);
+        }
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        let raws: Vec<Option<u64>> = self.seen.into_iter().map(Some).collect();
+        self.column.keys(&raws).into_iter().collect()
+    }
+}
+
 /// Matches documents whose fast field value is in a set, by scanning the
 /// field: for deleting excluded documents in a merge, which reads every
-/// document anyway. (Searches filter matches instead.)
+/// document anyway.
 #[derive(Clone, Debug)]
 pub(crate) struct InSetQuery {
     field: String,
@@ -545,7 +1078,7 @@ impl InSetQuery {
     pub(crate) fn new(field: String, exclude: &Exclude) -> InSetQuery {
         InSetQuery {
             field,
-            set: exclude.0.clone(),
+            set: exclude.set.clone(),
         }
     }
 }
@@ -669,7 +1202,7 @@ mod tests {
                 .hits()
                 .is_err()
         );
-        assert!(Request::new(s, "x", r#"{"limit": 1}"#, None).is_err());
+        assert!(Request::new(s, "x", r#"{"nope": 1}"#, None).is_err());
         let scores: Vec<f32> = hits(s, "fox cats", "", None)
             .into_iter()
             .map(|h| h.1)
@@ -862,12 +1395,12 @@ mod tests {
         bytes.push(0);
         assert!(Exclude::from_roaring(&bytes).is_err());
         for bytes in [vec![0; 8], vec![58, 48, 0, 0, 0, 0, 0, 0]] {
-            assert_eq!(Exclude::from_roaring(&bytes).unwrap().0.len(), 0);
+            assert_eq!(Exclude::from_roaring(&bytes).unwrap().set.len(), 0);
         }
         let set: RoaringTreemap = (0..12346u64).map(|i| i << 32).collect();
         let mut bytes = Vec::new();
         set.serialize_into(&mut bytes).unwrap();
-        assert_eq!(*Exclude::from_roaring(&bytes).unwrap().0, set);
+        assert_eq!(*Exclude::from_roaring(&bytes).unwrap().set, set);
     }
 
     #[test]
@@ -915,5 +1448,300 @@ mod tests {
             Request::new(&[], "fox", "", None).unwrap().count().unwrap(),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+    use crate::split::testing::{build_with, open, split, OPTIONS};
+
+    const GROUPED: &str = r#"[
+        {"name": "id", "type": "i64", "options": {"stored": true, "indexed": true, "fast": true}},
+        {"name": "body", "type": "text", "options": {"stored": false,
+            "indexing": {"record": "position", "fieldnorms": true, "tokenizer": "fts"}}},
+        {"name": "group", "type": "text", "options": {"stored": true, "fast": true,
+            "indexing": {"record": "basic", "tokenizer": "raw"}}}
+    ]"#;
+
+    const GROUP_DOCS: &[&str] = &[
+        r#"{"id": 1, "body": "fox", "group": "a"}"#,
+        r#"{"id": 2, "body": "fox fox fox", "group": "a"}"#,
+        r#"{"id": 3, "body": "fox", "group": "b"}"#,
+        r#"{"id": 4, "body": "fox fox", "group": "c"}"#,
+        r#"{"id": 5, "body": "fox"}"#,
+        r#"{"id": 6, "body": "cat", "group": "d"}"#,
+    ];
+
+    fn grouped(docs: &[&str]) -> Split {
+        open(build_with(GROUPED, OPTIONS, docs))
+    }
+
+    /// (id, group) of each hit, best first.
+    fn found(
+        splits: &[&Split],
+        query: &str,
+        options: &str,
+        ex: Option<&Exclude>,
+    ) -> Vec<(i64, Option<String>)> {
+        Request::new(splits, query, options, ex)
+            .unwrap()
+            .hits()
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, doc)| {
+                let doc: Value = serde_json::from_str(&doc).unwrap();
+                (
+                    doc["id"].as_i64().unwrap(),
+                    doc.get("group").map(|g| g.as_str().unwrap().to_owned()),
+                )
+            })
+            .collect()
+    }
+
+    const FAST: &str = r#""fast": ["id", "group"]"#;
+
+    #[test]
+    fn collapses_to_the_best_hit_of_each_value() {
+        let s = grouped(GROUP_DOCS);
+        let all = found(&[&s], "fox", &format!("{{{FAST}}}"), None);
+        assert_eq!(all.len(), 5);
+        // The best of each group is its first hit in the ranking.
+        let mut best: Vec<(i64, Option<String>)> = Vec::new();
+        for hit in &all {
+            if !best.iter().any(|b| b.1 == hit.1) {
+                best.push(hit.clone());
+            }
+        }
+        assert_eq!(best.len(), 4); // a, b, c and the one without a group
+        let collapsed = found(
+            &[&s],
+            "fox",
+            &format!(r#"{{"collapse": "group", {FAST}}}"#),
+            None,
+        );
+        assert_eq!(collapsed, best);
+        // top_k and offset count groups.
+        let page = |opts: &str| {
+            found(
+                &[&s],
+                "fox",
+                &format!(r#"{{"collapse": "group", {FAST}, {opts}}}"#),
+                None,
+            )
+        };
+        assert_eq!(page(r#""top_k": 2"#), best[..2]);
+        assert_eq!(page(r#""top_k": 2, "offset": 1"#), best[1..3]);
+        assert_eq!(page(r#""offset": 3"#), best[3..]);
+        assert!(page(r#""top_k": 0"#).is_empty());
+        // Over splits, a value's best hit wins, wherever it is.
+        let (a, b) = (grouped(&GROUP_DOCS[..3]), grouped(&GROUP_DOCS[3..]));
+        let split_up = found(
+            &[&a, &b],
+            "fox",
+            &format!(r#"{{"collapse": "group", {FAST}}}"#),
+            None,
+        );
+        let ids = |v: &[(i64, Option<String>)]| v.iter().map(|h| h.0).collect::<HashSet<_>>();
+        assert_eq!(ids(&split_up), ids(&best));
+        // Excluded documents are not in a group: the next best takes over.
+        let ex = Exclude::from_ids([2]);
+        let opts = format!(r#"{{"collapse": "group", {FAST}, "exclude_field": "id"}}"#);
+        let without = found(&[&s], "fox", &opts, Some(&ex));
+        assert!(without.contains(&(1, Some("a".into()))) && !without.iter().any(|h| h.0 == 2));
+        // Groups need a single-valued fast field.
+        let collapse = |field: &str| {
+            Request::new(&[&s], "fox", &format!(r#"{{"collapse": "{field}"}}"#), None)
+                .unwrap()
+                .hits()
+        };
+        assert!(collapse("body").is_err() && collapse("nosuch").is_err());
+        let multi = split(&[r#"{"id": 1, "body": "fox", "tag": ["x", "y"]}"#]);
+        let err = Request::new(&[&multi], "fox", r#"{"collapse": "tag"}"#, None)
+            .unwrap()
+            .hits()
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("several values"), "{err:#}");
+    }
+
+    #[test]
+    fn counts_distinct_values_exactly() {
+        let (a, b) = (grouped(&GROUP_DOCS[..3]), grouped(&GROUP_DOCS[2..]));
+        let distinct = |splits: &[&Split], query: &str, field: &str, ex: Option<&Exclude>| {
+            let options = format!(r#"{{"distinct": "{field}", "exclude_field": "id"}}"#);
+            Request::new(splits, query, &options, ex).unwrap().count()
+        };
+        // a, b, c: documents without a value, and the unmatched d, are not values.
+        assert_eq!(distinct(&[&a, &b], "fox", "group", None).unwrap(), 3);
+        assert_eq!(distinct(&[&a, &b], "*", "group", None).unwrap(), 4);
+        // Document 3 is in both splits and is the only one of group b.
+        assert_eq!(
+            distinct(&[&a, &b], "fox", "group", Some(&Exclude::from_ids([3]))).unwrap(),
+            2
+        );
+        assert_eq!(distinct(&[&a, &b], "fox", "id", None).unwrap(), 5);
+        assert_eq!(distinct(&[&a], "nomatch", "group", None).unwrap(), 0);
+        assert!(distinct(&[&a], "fox", "body", None).is_err());
+        let only_a = [&a];
+        let combined =
+            Request::new(&only_a, "fox", r#"{"distinct": "id", "limit": 3}"#, None).unwrap();
+        assert!(combined.count().is_err());
+        assert!(Request::new(&[&a], "fox", r#"{"distinct": "id"}"#, None)
+            .unwrap()
+            .hits()
+            .is_err());
+    }
+
+    #[test]
+    fn caps_counts_with_a_limit() {
+        let s = grouped(GROUP_DOCS);
+        let (a, b) = (grouped(&GROUP_DOCS[..3]), grouped(&GROUP_DOCS[3..]));
+        let count = |splits: &[&Split], limit: Option<u64>, ex: Option<&Exclude>| {
+            let options = match limit {
+                Some(n) => format!(r#"{{"limit": {n}, "exclude_field": "id"}}"#),
+                None => r#"{"exclude_field": "id"}"#.to_owned(),
+            };
+            Request::new(splits, "fox", &options, ex)
+                .unwrap()
+                .count()
+                .unwrap()
+        };
+        assert_eq!(count(&[&s], None, None), 5);
+        // The count, or one more than the limit if there are more matches.
+        for (limit, want) in [(0, 1), (1, 2), (4, 5), (5, 5), (6, 5), (u64::MAX, 5)] {
+            assert_eq!(count(&[&s], Some(limit), None), want, "limit {limit}");
+        }
+        assert_eq!(count(&[&a, &b], Some(2), None), 3);
+        assert_eq!(count(&[&a, &b], Some(9), None), 5);
+        let dead = Exclude::from_ids([1, 2, 3]);
+        assert_eq!(count(&[&s], Some(2), Some(&dead)), 2);
+        assert_eq!(count(&[&s], Some(3), Some(&dead)), 2);
+        assert!(Request::new(&[&s], "fox", r#"{"limit": 1}"#, None)
+            .unwrap()
+            .hits()
+            .is_err());
+        assert!(Request::new(&[&s], "fox", r#"{"limit": 1}"#, None)
+            .unwrap()
+            .aggregate("{}")
+            .is_err());
+        let only_s = [&s];
+        let offset = Request::new(&only_s, "fox", r#"{"offset": 1}"#, None).unwrap();
+        assert!(offset.count().is_err() && offset.aggregate("{}").is_err());
+    }
+
+    #[test]
+    fn pages_with_an_offset() {
+        let s = grouped(GROUP_DOCS);
+        let (a, b) = (grouped(&GROUP_DOCS[..3]), grouped(&GROUP_DOCS[3..]));
+        for splits in [&[&s][..], &[&a, &b][..]] {
+            let all = found(splits, "fox", &format!("{{{FAST}}}"), None);
+            for (offset, size) in [(0, 2), (1, 2), (3, 2), (4, 3), (5, 1), (9, 2)] {
+                let options = format!(r#"{{{FAST}, "top_k": {size}, "offset": {offset}}}"#);
+                let page = found(splits, "fox", &options, None);
+                let want: Vec<_> = all.iter().skip(offset).take(size).cloned().collect();
+                assert_eq!(page, want, "offset {offset} top_k {size}");
+            }
+            let options = format!(r#"{{{FAST}, "offset": 2}}"#);
+            assert_eq!(found(splits, "fox", &options, None), all[2..]);
+        }
+        let huge = format!(r#"{{{FAST}, "top_k": 2, "offset": {}}}"#, usize::MAX);
+        assert!(found(&[&s], "fox", &huge, None).is_empty());
+    }
+
+    #[test]
+    fn searches_splits_in_parallel_as_it_does_serially() {
+        let docs: Vec<String> = (0..60)
+            .map(|i| {
+                format!(
+                    r#"{{"id": {i}, "body": "{} cat", "group": "g{}"}}"#,
+                    "fox ".repeat(i % 4),
+                    i % 7
+                )
+            })
+            .collect();
+        let splits: Vec<Split> = docs
+            .chunks(10)
+            .map(|chunk| grouped(&chunk.iter().map(String::as_str).collect::<Vec<_>>()))
+            .collect();
+        let refs: Vec<&Split> = splits.iter().collect();
+        let ex = Exclude::from_ids((0..60).filter(|i| i % 5 == 0));
+        let request = |threads: usize, options: &str| {
+            Request::new(&refs, "fox", options, Some(&ex))
+                .unwrap()
+                .with_threads(threads)
+        };
+        for options in [
+            r#"{"exclude_field": "id", "fast": ["id"]}"#,
+            r#"{"exclude_field": "id", "fast": ["id"], "top_k": 7, "offset": 2}"#,
+            r#"{"exclude_field": "id", "fast": ["id", "group"], "collapse": "group", "top_k": 4}"#,
+            r#"{"exclude_field": "id", "fast": ["id"], "global_stats": true, "top_k": 9}"#,
+        ] {
+            let serial = request(1, options).hits().unwrap();
+            for threads in [2, 4, 64] {
+                assert_eq!(
+                    request(threads, options).hits().unwrap(),
+                    serial,
+                    "{options} on {threads}"
+                );
+            }
+        }
+        let count = |threads, options| request(threads, options).count().unwrap();
+        let by = r#"{"exclude_field": "id"}"#;
+        assert_eq!(count(1, by), count(8, by));
+        let distinct = r#"{"exclude_field": "id", "distinct": "group"}"#;
+        assert_eq!(count(1, distinct), count(8, distinct));
+        let aggs = r#"{"g": {"terms": {"field": "group", "size": 20}}}"#;
+        let aggregate = |threads| request(threads, by).aggregate(aggs).unwrap();
+        assert_eq!(aggregate(1), aggregate(8));
+        // An error in any split is the call's error.
+        let missing = split(&[r#"{"body": "fox"}"#]);
+        let mixed = [&splits[0], &missing, &splits[1]];
+        let err = Request::new(&mixed, "fox", by, Some(&ex))
+            .unwrap()
+            .with_threads(4)
+            .count();
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn keeps_alive_sets_per_split_and_exclusion() {
+        let s = grouped(GROUP_DOCS);
+        let cached = || s.alive.0.lock().unwrap().len();
+        let one = Exclude::from_ids([1, 2]);
+        let first = s.alive.get(&s, "id", &one).unwrap();
+        assert!(Arc::ptr_eq(&first, &s.alive.get(&s, "id", &one).unwrap()));
+        assert_eq!(cached(), 1);
+        // The same ids, however they came, are the same exclusion.
+        assert!(Arc::ptr_eq(
+            &first,
+            &s.alive.get(&s, "id", &Exclude::from_ids([1, 2])).unwrap()
+        ));
+        let other = Exclude::from_ids([3]);
+        assert!(!Arc::ptr_eq(
+            &first,
+            &s.alive.get(&s, "id", &other).unwrap()
+        ));
+        assert_eq!(cached(), 2);
+        // A failure is reported, and not kept.
+        assert!(s.alive.get(&s, "body", &one).is_err());
+        assert!(s.alive.get(&s, "nosuch", &one).is_err());
+        assert_eq!(cached(), 2);
+        // The most recent few are kept.
+        for i in 10..20 {
+            s.alive.get(&s, "id", &Exclude::from_ids([i])).unwrap();
+        }
+        assert_eq!(cached(), ALIVE_SETS_PER_SPLIT);
+        // Dead documents do not count, or crowd out the living, or score.
+        let options = r#"{"exclude_field": "id", "top_k": 1, "fast": ["id"]}"#;
+        let best = |ex: &Exclude| found(&[&s], "fox", options, Some(ex))[0].0;
+        assert_eq!(best(&Exclude::from_ids([])), 2);
+        assert_eq!(best(&one), 4);
+        assert_eq!(best(&Exclude::from_ids([2, 4])), 1);
+        // 32-bit ids are not 64-bit ones: a bitmap and ids agree.
+        let mut bytes = Vec::new();
+        RoaringBitmap::from_iter([2u32, 4])
+            .serialize_into(&mut bytes)
+            .unwrap();
+        assert_eq!(best(&Exclude::from_roaring(&bytes).unwrap()), 1);
     }
 }

@@ -37,18 +37,20 @@ void tantivy_split_close(TantivySplit *s);
 
 /* Over n splits: a query in tantivy's syntax or OpenSearch query DSL (JSON),
  * options (may be NULL) as JSON, and an exclude set: kind 0 none, 1 a roaring
- * bitmap of len bytes, 2 len int64 values. */
+ * bitmap of len bytes, 2 len int64 values. Up to `threads` splits are
+ * searched at once. */
 /* cb per hit, best first: split position, score, doc as JSON; 0 ok, -1 error */
 int tantivy_search(const TantivySplit *const *splits, size_t n, const char *query, const char *options,
-                   int exclude_kind, const void *exclude, size_t exclude_len, tantivy_hit_cb cb, void *ctx, char **err);
+                   int exclude_kind, const void *exclude, size_t exclude_len, size_t threads, tantivy_hit_cb cb, void *ctx,
+                   char **err);
 /* the number of matches, or -1 */
 int64_t tantivy_count(const TantivySplit *const *splits, size_t n, const char *query, const char *options,
-                      int exclude_kind, const void *exclude, size_t exclude_len, char **err);
+                      int exclude_kind, const void *exclude, size_t exclude_len, size_t threads, char **err);
 /* tantivy aggregations (Elasticsearch JSON) over the matches; *out freed with
  * tantivy_free_str; 0 ok, -1 error */
 int tantivy_aggregate(const TantivySplit *const *splits, size_t n, const char *query, const char *aggs,
-                      const char *options, int exclude_kind, const void *exclude, size_t exclude_len, char **out,
-                      char **err);
+                      const char *options, int exclude_kind, const void *exclude, size_t exclude_len, size_t threads,
+                      char **out, char **err);
 /* merges the splits into one written to cb, without excluded documents;
  * documents kept, or -1 */
 int64_t tantivy_merge(const TantivySplit *const *splits, size_t n, const char *options, int exclude_kind,

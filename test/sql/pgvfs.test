@@ -77,6 +77,47 @@ SELECT round((tantivy_aggregate('__TEST_DIR__/docs.tantivy', '*',
 ----
 2
 
+query I
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '*', '{"limit": 1}')
+----
+2
+
+query I
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '*', '{"limit": 5}')
+----
+2
+
+query I
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '*', '{"distinct": "id"}')
+----
+2
+
+query I
+SELECT count(*) FROM tantivy_search('__TEST_DIR__/docs.tantivy', 'fox cat', '{"top_k": 5, "offset": 1}')
+----
+1
+
+query I
+SELECT count(*) FROM tantivy_search('__TEST_DIR__/docs.tantivy', 'fox cat',
+    '{"collapse": "id", "fast": ["id"]}')
+----
+2
+
+query I
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '{"term": {"nosuch": "x"}}', '{"ignore_unmapped": true}')
+----
+0
+
+statement error
+SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '{"term": {"nosuch": "x"}}')
+----
+no field
+
+statement error
+FROM tantivy_search('__TEST_DIR__/docs.tantivy', 'fox', '{"limit": 1}')
+----
+options of tantivy_count
+
 statement error
 SELECT tantivy_count('__TEST_DIR__/docs.tantivy', '{"bool":{"filters":{"term":{"id":1}}}}')
 ----

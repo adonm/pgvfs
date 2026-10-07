@@ -25,6 +25,23 @@ Storage layout: **v2** (unchanged).
   error in every thread; before, other threads reused the failed entry and
   crashed.
   Rust panics at the tantivy C boundary become errors; oversized top-k is clamped.
+- Exclusion is now an alive bitset per segment, built once per split and set
+  and kept (the last four), as tantivy's own deletes are, instead of a lookup
+  per candidate: with 60% of 4 million documents excluded, a count of 2.8
+  million matches takes 9 ms (was 61), a top 10 takes 6 ms (was 64).
+- A list of splits is searched in parallel, up to DuckDB's `threads`, and the
+  hits' documents are read in parallel too. Equal scores order the same at any
+  thread count.
+- Search options `offset` (a page reads documents only for its own hits),
+  `collapse` (the best hit of each value of a fast field) and `ignore_unmapped`;
+  count options `limit` (stop after `limit + 1`) and `distinct` (the exact
+  number of distinct values). `limit` was an unknown option before.
+- Query DSL: paths inside JSON fields in `term`, `terms`, `match`,
+  `match_phrase`, `range`, `exists` and `multi_match`; `exists` on an indexed
+  text field without a fast column falls back to its terms.
+- `bench/search.py` and `bench/index_memory.py`: timings, compaction cost and
+  build memory (documented with `memory_budget`; a `TMPDIR` on a tmpfs counts
+  as memory).
 - `pgvfs_drop_volume` removes one volume through the writer and invalidates
   caches. Directory removal unpublishes a key prefix.
 - DuckDB 2.0 scalar error declarations and filesystem access checks, including

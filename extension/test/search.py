@@ -78,6 +78,96 @@ def check_parallel_failures(con, root):
     assert con.execute(f"SELECT count(*) FROM glob({sql_text(root + '/par*')})").fetchone() == (0,)
 
 
+def check_new_options(con, root):
+    """Pages, caps, distinct values, collapse, JSON paths and missing fields."""
+
+    def one(sql, *args):
+        return con.execute(sql, args).fetchone()
+
+    def fails(sql, message, *args):
+        try:
+            con.execute(sql, args).fetchall()
+            raise AssertionError("succeeded: " + sql)
+        except duckdb.Error as e:
+            assert message in str(e), (sql, str(e))
+
+    root = root.rstrip("/")
+    schema = json.dumps(
+        [
+            {"name": "id", "type": "i64", "options": {"stored": True, "indexed": True, "fast": True}},
+            {"name": "body", "type": "text", "options": {"indexing": {"record": "position", "tokenizer": "default"}}},
+            {
+                "name": "building",
+                "type": "text",
+                "options": {"fast": True, "indexing": {"record": "basic", "tokenizer": "raw"}},
+            },
+            {
+                "name": "meta",
+                "type": "json_object",
+                "options": {
+                    "stored": False,
+                    "indexing": {"record": "position", "fieldnorms": True, "tokenizer": "default"},
+                    "fast": True,
+                    "expand_dots_enabled": False,
+                },
+            },
+        ]
+    )
+    con.execute(
+        """CREATE OR REPLACE TEMP TABLE fts_roofs AS SELECT i AS id, 'roof ' || CASE WHEN i % 4 = 0 THEN 'tile' ELSE 'slate' END AS body,
+        'b' || (i % 7) AS building,
+        {'color': CASE WHEN i % 3 = 0 THEN 'red' ELSE 'blue' END, 'area': i, 'flat': i % 2 = 0} AS meta FROM range(200) t(i)"""
+    ).fetchall()
+    paths = [f"{root}/new{k}.tantivy" for k in range(2)]
+    for k, path in enumerate(paths):
+        assert one(f"SELECT tantivy_index({sql_text(path)}, ?, t) FROM fts_roofs t WHERE id % 2 = {k}", schema) == (
+            100,
+        )
+    lst = "[" + ", ".join(map(sql_text, paths)) + "]"
+    search = lambda q, o="{}": con.execute(f"SELECT doc FROM tantivy_search({lst}, ?, ?)", [q, o]).fetchall()
+    ids = lambda rows: [json.loads(r[0])["id"] for r in rows]
+
+    # Pages: the ranking, cut anywhere, with the same ties in the same order.
+    options = lambda extra: json.dumps({"fast": ["id"], **extra})
+    ranking = ids(search("roof", options({})))
+    assert len(ranking) == 200 and sorted(ranking) == list(range(200))
+    for offset, size in [(0, 10), (10, 10), (95, 20), (190, 50), (500, 5)]:
+        assert ids(search("roof", options({"top_k": size, "offset": offset}))) == ranking[offset : offset + size]
+
+    # Caps and distinct values, exact, over both splits.
+    assert one(f"SELECT tantivy_count({lst}, 'roof', '{{\"limit\": 10}}')") == (11,)
+    assert one(f"SELECT tantivy_count({lst}, 'roof', '{{\"limit\": 1000}}')") == (200,)
+    assert one(f"SELECT tantivy_count({lst}, 'tile', '{{\"distinct\": \"building\"}}')") == (7,)
+    assert one(f"SELECT tantivy_count({lst}, 'tile', '{{\"distinct\": \"id\"}}')") == (50,)
+    fails(f'SELECT tantivy_count({lst}, \'tile\', \'{{"limit": 3, "distinct": "id"}}\')', "cannot be combined")
+
+    # Collapse: one hit per building, the best of its documents.
+    rows = search("tile", options({"collapse": "building", "fast": ["id", "building"]}))
+    docs = [json.loads(r[0]) for r in rows]
+    assert sorted(d["building"] for d in docs) == [f"b{k}" for k in range(7)], docs
+    best = {}
+    for doc in [json.loads(r[0]) for r in search("tile", options({"fast": ["id", "building"]}))]:
+        best.setdefault(doc["building"], doc["id"])
+    assert {d["building"]: d["id"] for d in docs} == best
+    assert len(search("tile", options({"collapse": "building", "top_k": 3, "offset": 2}))) == 3
+
+    # Paths inside a JSON field, and fields a split lacks.
+    count = lambda q, o="{}": one(f"SELECT tantivy_count({lst}, ?, ?)", q, o)[0]
+    assert count(json.dumps({"term": {"meta.color": "red"}})) == len([i for i in range(200) if i % 3 == 0])
+    assert count(json.dumps({"range": {"meta.area": {"gte": 10, "lt": 20}}})) == 10
+    assert count(json.dumps({"term": {"meta.flat": True}})) == 100
+    assert count(json.dumps({"exists": {"field": "meta.color"}})) == 200
+    assert count(json.dumps({"match": {"body": "tile"}})) == 50
+    fails(f"SELECT tantivy_count({lst}, ?)", "no field", json.dumps({"term": {"nosuch": "x"}}))
+    assert count(json.dumps({"term": {"nosuch": "x"}}), '{"ignore_unmapped": true}') == 0
+    fails(f"SELECT tantivy_count({lst}, ?)", "path inside a JSON field", json.dumps({"prefix": {"meta.color": "r"}}))
+    # An indexed text field has no fast column: its terms say which documents have it.
+    assert count(json.dumps({"exists": {"field": "body"}})) == 200
+    for path in paths:
+        assert one(f"SELECT tantivy_drop({sql_text(path)})") == (True,)
+    con.execute("DROP TABLE fts_roofs").fetchall()
+
+
 def check_search(con, root):
     def one(sql, *args):
         return con.execute(sql, args).fetchone()
@@ -90,6 +180,7 @@ def check_search(con, root):
             assert message in str(e), (sql, str(e))
 
     check_parallel_failures(con, root)
+    check_new_options(con, root)
     root = root.rstrip("/")
     schema = json.dumps(
         [

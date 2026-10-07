@@ -36,7 +36,7 @@ use tantivy::{
     HasLen, Index, IndexReader, IndexSettings, IndexWriter, ReloadPolicy, TantivyDocument,
 };
 
-use crate::search::{Exclude, Filter, InSetQuery};
+use crate::search::{check_exclusion_key, AliveCache, Exclude, InSetQuery};
 
 const MAGIC: &[u8; 8] = b"tantivy1";
 
@@ -329,7 +329,15 @@ pub fn merge(
     );
     let payload = first.index.load_metas()?.payload.unwrap_or_default();
     let build_options: BuildOptions = self::options(&payload, "index")?;
-    let filter = Filter::new(&schema, options.exclude_field.as_deref(), exclude)?;
+    let exclude_field = match exclude {
+        Some(_) => Some(
+            options
+                .exclude_field
+                .as_deref()
+                .context("tantivy_merge: exclude needs options.exclude_field")?,
+        ),
+        None => None,
+    };
     for split in splits {
         let payload = split.index.load_metas()?.payload.unwrap_or_default();
         let source_options: BuildOptions = self::options(&payload, "index")?;
@@ -337,7 +345,9 @@ pub fn merge(
             source_options.tokenizers == build_options.tokenizers,
             "tantivy_merge: the splits have different tokenizers"
         );
-        filter.validate(&split.reader.searcher())?;
+        if let Some(field) = exclude_field {
+            check_exclusion_key(split, field)?;
+        }
     }
     let dir = tempfile::Builder::new()
         .prefix("duckdb-tantivy-")
@@ -368,11 +378,8 @@ pub fn merge(
             writer.add_segment(index.new_segment_meta(meta.id(), meta.max_doc()))?;
         }
     }
-    if let Some(exclude) = exclude {
-        let field = options
-            .exclude_field
-            .context("tantivy_merge: exclude needs options.exclude_field")?;
-        writer.delete_query(Box::new(InSetQuery::new(field, exclude)))?;
+    if let (Some(exclude), Some(field)) = (exclude, exclude_field) {
+        writer.delete_query(Box::new(InSetQuery::new(field.to_owned(), exclude)))?;
     }
     let mut commit = writer.prepare_commit()?;
     commit.set_payload(&payload);
@@ -405,6 +412,7 @@ pub struct Split {
     pub(crate) index: Index,
     pub(crate) reader: IndexReader,
     pub(crate) bundle: Bundle,
+    pub(crate) alive: AliveCache,
 }
 
 impl Split {
@@ -448,6 +456,7 @@ impl Split {
             index,
             reader,
             bundle,
+            alive: AliveCache::default(),
         })
     }
 }

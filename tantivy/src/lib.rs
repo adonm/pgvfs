@@ -9,7 +9,8 @@
 //! nonzero.
 //!
 //! Exclude sets (`kind`, `data`, `len`): 0 none; 1 a serialized roaring
-//! bitmap of `len` bytes; 2 `len` int64 values.
+//! bitmap of `len` bytes; 2 `len` int64 values. `threads` is how many splits
+//! a call may search at once.
 //!
 //! Safety (every function): handles are those this library returned and not
 //! yet freed; strings are NUL-terminated or come with their length; a split's
@@ -117,9 +118,7 @@ fn exclude(kind: c_int, data: *const c_void, len: usize) -> Result<Option<Exclud
     Ok(match kind {
         0 => None,
         1 => Some(Exclude::from_roaring(self::data(data.cast::<u8>(), len)?)?),
-        2 => Some(Exclude::from_ids(
-            self::data(data.cast::<i64>(), len)?.iter().copied(),
-        )),
+        2 => Some(Exclude::from_id_slice(self::data(data.cast::<i64>(), len)?)),
         _ => return Err(anyhow!("unknown exclude kind {kind}")),
     })
 }
@@ -257,6 +256,7 @@ pub unsafe extern "C" fn tantivy_search(
     exclude_kind: c_int,
     exclude_data: *const c_void,
     exclude_len: usize,
+    threads: usize,
     cb: HitCb,
     ctx: *mut c_void,
     err: *mut *mut c_char,
@@ -264,7 +264,8 @@ pub unsafe extern "C" fn tantivy_search(
     guard(err, -1, || {
         let splits = splits(s, n)?;
         let exclude = exclude(exclude_kind, exclude_data, exclude_len)?;
-        let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?;
+        let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?
+            .with_threads(threads);
         for (split, score, doc) in request.hits()? {
             cb(ctx, split, score as f64, doc.as_ptr().cast(), doc.len());
         }
@@ -282,12 +283,14 @@ pub unsafe extern "C" fn tantivy_count(
     exclude_kind: c_int,
     exclude_data: *const c_void,
     exclude_len: usize,
+    threads: usize,
     err: *mut *mut c_char,
 ) -> i64 {
     guard(err, -1, || {
         let splits = splits(s, n)?;
         let exclude = exclude(exclude_kind, exclude_data, exclude_len)?;
-        let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?;
+        let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?
+            .with_threads(threads);
         Ok(request.count()? as i64)
     })
 }
@@ -305,6 +308,7 @@ pub unsafe extern "C" fn tantivy_aggregate(
     exclude_kind: c_int,
     exclude_data: *const c_void,
     exclude_len: usize,
+    threads: usize,
     out: *mut *mut c_char,
     err: *mut *mut c_char,
 ) -> c_int {
@@ -312,7 +316,8 @@ pub unsafe extern "C" fn tantivy_aggregate(
         anyhow::ensure!(!out.is_null(), "null tantivy result pointer");
         let splits = splits(s, n)?;
         let exclude = exclude(exclude_kind, exclude_data, exclude_len)?;
-        let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?;
+        let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?
+            .with_threads(threads);
         let json = request.aggregate(text(aggs)?)?;
         unsafe { *out = CString::new(json)?.into_raw() };
         Ok(0)

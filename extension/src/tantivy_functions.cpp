@@ -17,9 +17,11 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -246,6 +248,11 @@ struct Exclude {
 	string bytes;
 	vector<int64_t> ids;
 };
+
+// How many splits one call may search at once: DuckDB's threads.
+size_t SearchThreads(ClientContext &context) {
+	return std::max<idx_t>(1, TaskScheduler::GetScheduler(context).NumberOfThreads());
+}
 
 string Text(const Value &v) {
 	auto text = v.IsNull() ? string() : v.ToString();
@@ -546,7 +553,8 @@ OperatorResultType SearchInOut(ExecutionContext &context, TableFunctionInput &da
 				Exclude exclude(input.ColumnCount() > 3 ? input.GetValue(3, state.row) : Value());
 				char *err = nullptr;
 				if (tantivy_search(splits.handles.data(), splits.handles.size(), text.c_str(), options.c_str(),
-				                   exclude.kind, exclude.Data(), exclude.Len(), CollectHit, &state, &err) != 0) {
+				                   exclude.kind, exclude.Data(), exclude.Len(), SearchThreads(context.client),
+				                   CollectHit, &state, &err) != 0) {
 					Fail("search", splits.Name(), err);
 				}
 			}
@@ -587,7 +595,7 @@ void CountFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 		Exclude exclude(args.ColumnCount() > 3 ? args.data[3].GetValue(i) : Value());
 		char *err = nullptr;
 		auto n = tantivy_count(splits.handles.data(), splits.handles.size(), text.c_str(), options.c_str(),
-		                       exclude.kind, exclude.Data(), exclude.Len(), &err);
+		                       exclude.kind, exclude.Data(), exclude.Len(), SearchThreads(context), &err);
 		if (n < 0) {
 			Fail("count", splits.Name(), err);
 		}
@@ -618,7 +626,8 @@ void AggregateJsonFunction(DataChunk &args, ExpressionState &state, Vector &resu
 		char *json = nullptr;
 		char *err = nullptr;
 		if (tantivy_aggregate(splits.handles.data(), splits.handles.size(), text.c_str(), aggs_json.c_str(),
-		                      options.c_str(), exclude.kind, exclude.Data(), exclude.Len(), &json, &err) != 0) {
+		                      options.c_str(), exclude.kind, exclude.Data(), exclude.Len(), SearchThreads(context),
+		                      &json, &err) != 0) {
 			Fail("aggregate", splits.Name(), err);
 		}
 		out[i] = StringVector::AddString(result, json);

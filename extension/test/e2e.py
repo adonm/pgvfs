@@ -344,7 +344,7 @@ assert live_count("fox") == 1
 for sql, msg in [
     (f"FROM tantivy_search('{root}/fts/missing.tantivy', 'x')", "no tantivy split"),
     (f"""FROM tantivy_search('{idx}', 'nosuch:x', '{{"strict": true}}')""", "nosuch"),
-    (f"""FROM tantivy_search('{idx}', 'x', '{{"limit": 1}}')""", "unknown field"),
+    (f"""FROM tantivy_search('{idx}', 'x', '{{"nope": 1}}')""", "unknown field"),
     (
         f"SELECT tantivy_index('{root}/fts/x' || id || '.tantivy', {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t",
         "one split per group",
