@@ -829,21 +829,23 @@ impl<'a> Request<'a> {
         })?;
         let mut found: Vec<Found> = per_split.into_iter().flatten().collect();
         if o.collapse.is_some() {
-            // A value's best hit over all the splits.
+            // A value's best hit over all the splits, in the order the splits
+            // gave them, so equal scores keep it whatever the page.
             let mut best: HashMap<Key, usize> = HashMap::new();
-            let mut groups: Vec<Found> = Vec::new();
-            for hit in found {
+            let mut groups: Vec<(usize, Found)> = Vec::new();
+            for (at, hit) in found.into_iter().enumerate() {
                 let key = hit.key.clone().unwrap_or(Key::Missing);
                 match best.get(&key) {
-                    Some(&at) if groups[at].score >= hit.score => {}
-                    Some(&at) => groups[at] = hit,
+                    Some(&g) if groups[g].1.score >= hit.score => {}
+                    Some(&g) => groups[g] = (at, hit),
                     None => {
                         best.insert(key, groups.len());
-                        groups.push(hit);
+                        groups.push((at, hit));
                     }
                 }
             }
-            found = groups;
+            groups.sort_by_key(|(at, _)| *at);
+            found = groups.into_iter().map(|(_, hit)| hit).collect();
         }
         // Equal hits stay in split order, then the order a split gave them.
         match &o.sort {
@@ -2327,3 +2329,6 @@ mod sort_and_highlight_tests {
         assert!(format!("{e:#}").contains("not a stored text field"));
     }
 }
+
+#[cfg(test)]
+mod properties;

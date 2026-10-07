@@ -28,3 +28,6 @@ regex-syntax = "0.8"
 [dev-dependencies]
 # The C header is generated from the FFI and checked by tests/headers.rs.
 cbindgen = { version = "0.29", default-features = false }
+# Properties of the search (src/search/properties.rs) over random queries and
+# options. No fork or timeout: they need nothing the tests do not.
+proptest = { version = "1", default-features = false, features = ["std"] }

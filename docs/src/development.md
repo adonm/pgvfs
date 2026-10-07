@@ -2,7 +2,7 @@
 
 ```sh
 mise install                 # rust, just, uv, python, mdbook
-just check                   # fmt, clippy, unit tests, and that the C headers match the FFI
+just check                   # fmt, clippy, unit and property tests, and that the C headers match the FFI
 just headers                 # regenerate the C headers from the Rust FFI
 just ext                     # extension for DuckDB 1.5.6 -> target/ext/release/
 just ext nightly [WHEEL]     # for a DuckDB 2.0 dev wheel (default: newest) -> target/ext/nightly/
@@ -45,6 +45,15 @@ that differs between Rust and C++ still compiles on both sides and crashes at
 run time, so `just check` fails when a header is out of date: run `just headers`
 and commit the result. Document an FFI function in Rust; its comment becomes the
 header's.
+
+**Properties.** `tantivy/src/search/properties.rs` runs proptest over random
+queries, options and exclusions on four splits: the answer is the same on one
+thread and on many; a page is a slice of the ranking; excluded documents are the
+ranking without them (and never crowd out `top_k`); collapse keeps the best hit
+of each group; bytes and JSON that are not a bitmap or a query are refused, not
+a panic. `PROPTEST_CASES=3000 cargo test -p duckdb-tantivy properties` runs them
+longer. A failure prints a minimal case and saves its seed in
+`tantivy/proptest-regressions/`: commit that file with the fix.
 
 **Supply chain.** CI runs `cargo deny check licenses bans sources` on every
 change and the RustSec advisories weekly. Dependencies must be permissively
