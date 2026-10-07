@@ -21,6 +21,9 @@ Storage layout: **v2** (unchanged).
   documents. `tantivy_index` accepts rows/structs directly.
 - Prepared index plans own their execution resources correctly: repeated
   execution and retries after errors neither crash nor keep partial documents.
+  A failed build open under a parallel `GROUP BY` (a bad schema) is a clean
+  error in every thread; before, other threads reused the failed entry and
+  crashed.
   Rust panics at the tantivy C boundary become errors; oversized top-k is clamped.
 - `pgvfs_drop_volume` removes one volume through the writer and invalidates
   caches. Directory removal unpublishes a key prefix.

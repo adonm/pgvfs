@@ -36,6 +36,48 @@ def roaring(ids):
     return out
 
 
+def check_parallel_failures(con, root):
+    """Failed builds under a parallel GROUP BY must be clean errors, not crashes."""
+    root = root.rstrip("/")
+    good = [
+        {"name": "id", "type": "i64", "options": {"stored": True, "indexed": True}},
+        {"name": "body", "type": "text", "options": {"indexing": {"record": "position", "tokenizer": "default"}}},
+    ]
+    bad_schema = json.dumps([good[0], {**good[1], "options": {**good[1]["options"], "fast": {"tokenizer": "raw"}}}])
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE fts_parallel AS SELECT i AS id, i % 8 AS g, 'doc ' || i AS body "
+        "FROM range(3000000) t(i)"
+    ).fetchall()
+    con.execute("SET threads = 8").fetchall()
+    try:
+        for attempt in range(6):
+            # The schema fails when a group's build opens, in several threads at once.
+            sql = (
+                f"SELECT g, tantivy_index({sql_text(root)} || '/par' || g || '.tantivy', ?, to_json(t)) "
+                "FROM fts_parallel t GROUP BY g"
+            )
+            try:
+                con.execute(sql, [bad_schema]).fetchall()
+                raise AssertionError("a bad schema was accepted")
+            except duckdb.Error as e:
+                assert "tantivy schema" in str(e), str(e)
+            # A bad document fails one thread while the others keep adding to the same builds.
+            sql = (
+                f"SELECT g, tantivy_index({sql_text(root)} || '/par' || g || '.tantivy', ?, "
+                "to_json({'id': CASE WHEN id = 2999999 THEN 'x' ELSE id::VARCHAR END, 'body': body})) "
+                "FROM fts_parallel t GROUP BY g"
+            )
+            try:
+                con.execute(sql, [json.dumps(good)]).fetchall()
+                raise AssertionError("a bad document was accepted")
+            except duckdb.Error as e:
+                assert "id" in str(e), str(e)
+    finally:
+        con.execute("RESET threads").fetchall()
+        con.execute("DROP TABLE fts_parallel").fetchall()
+    assert con.execute(f"SELECT count(*) FROM glob({sql_text(root + '/par*')})").fetchone() == (0,)
+
+
 def check_search(con, root):
     def one(sql, *args):
         return con.execute(sql, args).fetchone()
@@ -47,6 +89,7 @@ def check_search(con, root):
         except duckdb.Error as e:
             assert message in str(e), (sql, str(e))
 
+    check_parallel_failures(con, root)
     root = root.rstrip("/")
     schema = json.dumps(
         [
