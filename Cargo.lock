@@ -422,11 +422,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cbindgen",
+ "regex-syntax",
  "roaring",
  "serde",
  "serde_json",
  "tantivy",
  "tantivy-common",
+ "tantivy-fst",
  "tempfile",
 ]
 

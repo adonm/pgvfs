@@ -18,6 +18,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod dsl;
+mod pattern;
 pub mod search;
 pub mod split;
 

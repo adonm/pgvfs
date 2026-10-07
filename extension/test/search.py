@@ -160,7 +160,20 @@ def check_new_options(con, root):
     assert count(json.dumps({"match": {"body": "tile"}})) == 50
     fails(f"SELECT tantivy_count({lst}, ?)", "no field", json.dumps({"term": {"nosuch": "x"}}))
     assert count(json.dumps({"term": {"nosuch": "x"}}), '{"ignore_unmapped": true}') == 0
-    fails(f"SELECT tantivy_count({lst}, ?)", "path inside a JSON field", json.dumps({"prefix": {"meta.color": "r"}}))
+    # Pattern queries on a JSON path see that path's strings only, and are literal unless asked.
+    red = len([i for i in range(200) if i % 3 == 0])
+    assert count(json.dumps({"prefix": {"meta.color": "r"}})) == red
+    assert count(json.dumps({"wildcard": {"meta.color": "*lu*"}})) == 200 - red
+    assert count(json.dumps({"regexp": {"meta.color": "(red|blue)"}})) == 200
+    assert count(json.dumps({"prefix": {"meta.color": "R"}})) == 0
+    assert count(json.dumps({"prefix": {"meta.color": {"value": "R", "case_insensitive": True}}})) == red
+    assert count(json.dumps({"term": {"building": {"value": "B3", "case_insensitive": True}}})) == len(
+        [i for i in range(200) if i % 7 == 3]
+    )
+    assert count(json.dumps({"fuzzy": {"meta.color": {"value": "rde"}}})) == red
+    fails(
+        f"SELECT tantivy_count({lst}, ?)", "not a path inside", json.dumps({"match_phrase_prefix": {"meta.color": "r"}})
+    )
     # An indexed text field has no fast column: its terms say which documents have it.
     assert count(json.dumps({"exists": {"field": "body"}})) == 200
     for path in paths:

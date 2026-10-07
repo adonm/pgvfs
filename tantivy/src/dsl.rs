@@ -7,8 +7,9 @@
 //! (operator, minimum_should_match, fuzziness), match_phrase (slop),
 //! match_phrase_prefix, multi_match (best_fields, most_fields, phrase,
 //! phrase_prefix), prefix, wildcard, regexp, fuzzy, exists, range,
-//! query_string and simple_query_string; `boost` where Elasticsearch takes it.
-//! Filters (`bool.filter`, `constant_score`) do not score.
+//! query_string and simple_query_string; `boost` where Elasticsearch takes it,
+//! `case_insensitive` on term, prefix, wildcard and regexp. Filters
+//! (`bool.filter`, `constant_score`) do not score.
 
 use std::ops::Bound;
 
@@ -17,10 +18,12 @@ use serde_json::Value;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery,
     ExistsQuery, FuzzyTermQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, QueryParser,
-    RangeQuery, RegexQuery, TermQuery, TermSetQuery,
+    RangeQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{Facet, Field, FieldType, IndexRecordOption, Schema};
 use tantivy::{DateTime, Index, Term};
+
+use crate::pattern::PatternQuery;
 
 /// `ignore_unmapped`: a field the split lacks matches nothing, as in
 /// Elasticsearch, instead of failing the query.
@@ -94,7 +97,7 @@ fn parameters(body: &Value, kind: &str, allowed: &[&str]) -> Result<()> {
             "slop" | "max_expansions" => value
                 .as_u64()
                 .is_some_and(|n| n <= u32::MAX as u64 && (name != "max_expansions" || n > 0)),
-            "fuzzy_transpositions" | "transpositions" => value.is_boolean(),
+            "fuzzy_transpositions" | "transpositions" | "case_insensitive" => value.is_boolean(),
             "fields" => value
                 .as_array()
                 .is_some_and(|a| !a.is_empty() && a.iter().all(Value::is_string)),
@@ -176,25 +179,19 @@ fn distance(spec: &Value, word: &str) -> Result<u8> {
     }
 }
 
-/// A wildcard pattern (`*`, `?`) as a regular expression.
+/// A wildcard pattern (`*`, `?`, `\` to escape) as a regular expression.
 fn wildcard_regex(pattern: &str) -> Result<String> {
     let mut out = String::new();
-    let literal = |out: &mut String, c| {
-        if "\\.+*?()|[]{}^$".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    };
     let mut chars = pattern.chars();
     while let Some(c) = chars.next() {
         match c {
             '*' => out.push_str(".*"),
             '?' => out.push('.'),
-            '\\' => literal(
-                &mut out,
-                chars.next().context("wildcard has a trailing escape")?,
-            ),
-            c => literal(&mut out, c),
+            '\\' => {
+                let escaped = chars.next().context("wildcard has a trailing escape")?;
+                out.push_str(&regex_syntax::escape(&escaped.to_string()));
+            }
+            c => out.push_str(&regex_syntax::escape(&c.to_string())),
         }
     }
     Ok(out)
@@ -272,7 +269,7 @@ impl Compiler<'_> {
             | "range" => {
                 let (name, target, params) = self.field_body(kind, body)?;
                 let allowed: &[&str] = match kind.as_str() {
-                    "term" | "prefix" | "wildcard" | "regexp" => &["value"],
+                    "term" | "prefix" | "wildcard" | "regexp" => &["value", "case_insensitive"],
                     "match" => &[
                         "query",
                         "operator",
@@ -296,20 +293,33 @@ impl Compiler<'_> {
                 let Some(target) = target else {
                     return Ok(Box::new(EmptyQuery));
                 };
-                let entry = self.schema.get_field_entry(target.field);
-                if matches!(
-                    kind.as_str(),
-                    "prefix" | "wildcard" | "regexp" | "fuzzy" | "match_phrase_prefix"
-                ) {
+                let case_insensitive = params
+                    .get("case_insensitive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if matches!(kind.as_str(), "prefix" | "wildcard" | "regexp" | "fuzzy") {
                     anyhow::ensure!(
-                        target.path.is_none()
-                            && entry.is_indexed()
-                            && matches!(entry.field_type(), FieldType::Str(_)),
-                        "{kind} needs an indexed text field, not a path inside a JSON field"
+                        self.is_text(&target),
+                        "{kind} needs an indexed text field, or a path in a JSON field with text indexing"
                     );
                 }
-                let field = target.field;
+                if kind == "match_phrase_prefix" {
+                    anyhow::ensure!(
+                        target.path.is_none() && self.is_text(&target),
+                        "match_phrase_prefix needs an indexed text field, not a path inside a JSON field"
+                    );
+                }
+                if kind == "term" && case_insensitive {
+                    anyhow::ensure!(
+                        self.is_text(&target),
+                        "case_insensitive needs a text field, or a path in a JSON field with text indexing"
+                    );
+                }
                 let q = match kind.as_str() {
+                    "term" if case_insensitive => {
+                        let value = text(short(params, "value"))?;
+                        self.pattern(&target, &regex_syntax::escape(&value), true)?
+                    }
                     "term" => Box::new(TermQuery::new(
                         self.term(&target, short(params, "value"))?,
                         IndexRecordOption::WithFreqs,
@@ -326,17 +336,17 @@ impl Compiler<'_> {
                     "match_phrase" => self.phrase(&target, params, false)?,
                     "match_phrase_prefix" => self.phrase(&target, params, true)?,
                     "prefix" => {
-                        let term = self.term(&target, short(params, "value"))?;
-                        Box::new(FuzzyTermQuery::new_prefix(term, 0, false))
+                        let prefix = regex_syntax::escape(&text(short(params, "value"))?);
+                        self.pattern(&target, &format!("{prefix}.*"), case_insensitive)?
                     }
                     "wildcard" => {
-                        let pattern = text(short(params, "value"))?;
-                        Box::new(RegexQuery::from_pattern(&wildcard_regex(&pattern)?, field)?)
+                        let pattern = wildcard_regex(&text(short(params, "value"))?)?;
+                        self.pattern(&target, &pattern, case_insensitive)?
                     }
-                    "regexp" => Box::new(RegexQuery::from_pattern(
-                        &text(short(params, "value"))?,
-                        field,
-                    )?),
+                    "regexp" => {
+                        let pattern = text(short(params, "value"))?;
+                        self.pattern(&target, &pattern, case_insensitive)?
+                    }
                     "fuzzy" => {
                         let value = text(short(params, "value"))?;
                         let d = distance(
@@ -363,6 +373,41 @@ impl Compiler<'_> {
             }
             other => bail!("unsupported query type {other:?}"),
         }
+    }
+
+    /// Whether the target's terms are text: an indexed text field, or a path in
+    /// a JSON field that indexes text.
+    fn is_text(&self, target: &Target) -> bool {
+        let entry = self.schema.get_field_entry(target.field);
+        match (entry.field_type(), &target.path) {
+            (FieldType::Str(_), None) => entry.is_indexed(),
+            (FieldType::JsonObject(options), Some(_)) => {
+                options.get_text_indexing_options().is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// A regular expression over the target's terms.
+    fn pattern(
+        &self,
+        target: &Target,
+        regex: &str,
+        case_insensitive: bool,
+    ) -> Result<Box<dyn Query>> {
+        let json = match (
+            self.schema.get_field_entry(target.field).field_type(),
+            &target.path,
+        ) {
+            (FieldType::JsonObject(options), Some(path)) => Some((path.as_str(), options)),
+            _ => None,
+        };
+        Ok(Box::new(PatternQuery::new(
+            target.field,
+            json,
+            regex,
+            case_insensitive,
+        )?))
     }
 
     /// `{"<field>": params}` of a field-level query: the field's name, what it
@@ -516,9 +561,9 @@ impl Compiler<'_> {
         })
     }
 
-    /// The field's analyzer applied to `text`: (position, term) per token.
+    /// The field's analyzer applied to `text`: (position, term, text) per token.
     /// Values that are not analyzed text give the value itself.
-    fn tokens(&self, target: &Target, v: &Value) -> Result<Vec<(usize, Term)>> {
+    fn tokens(&self, target: &Target, v: &Value) -> Result<Vec<(usize, Term, String)>> {
         let analyzed = match (
             &target.path,
             self.schema.get_field_entry(target.field).field_type(),
@@ -528,7 +573,7 @@ impl Compiler<'_> {
             _ => false,
         };
         if !analyzed {
-            return Ok(vec![(0, self.term(target, v)?)]);
+            return Ok(vec![(0, self.term(target, v)?, text(v)?)]);
         }
         let mut analyzer = self.index.tokenizer_for_field(target.field)?;
         let text = text(v)?;
@@ -542,7 +587,7 @@ impl Compiler<'_> {
                     self.json_term(target.field, path, &Value::from(token.text.clone()))?
                 }
             };
-            out.push((token.position, term));
+            out.push((token.position, term, token.text.clone()));
         }
         Ok(out)
     }
@@ -550,26 +595,19 @@ impl Compiler<'_> {
     fn match_query(&self, target: &Target, params: &Value) -> Result<Box<dyn Query>> {
         let tokens = self.tokens(target, short(params, "query"))?;
         let fuzziness = params.get("fuzziness");
-        anyhow::ensure!(
-            fuzziness.is_none() || target.path.is_none(),
-            "fuzziness is not supported on a path inside a JSON field"
-        );
         let transpositions = params
             .get("fuzzy_transpositions")
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let clauses = tokens
             .into_iter()
-            .map(|(_, term)| {
+            .map(|(_, term, word)| {
                 Ok(match fuzziness {
-                    Some(f) => {
-                        let word = term.value().as_str().unwrap_or_default().to_owned();
-                        Box::new(FuzzyTermQuery::new(
-                            term,
-                            distance(f, &word)?,
-                            transpositions,
-                        )) as Box<dyn Query>
-                    }
+                    Some(f) => Box::new(FuzzyTermQuery::new(
+                        term,
+                        distance(f, &word)?,
+                        transpositions,
+                    )) as Box<dyn Query>,
                     None => Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
                 })
             })
@@ -594,7 +632,11 @@ impl Compiler<'_> {
     }
 
     fn phrase(&self, target: &Target, params: &Value, prefix: bool) -> Result<Box<dyn Query>> {
-        let tokens = self.tokens(target, short(params, "query"))?;
+        let tokens: Vec<(usize, Term)> = self
+            .tokens(target, short(params, "query"))?
+            .into_iter()
+            .map(|(position, term, _)| (position, term))
+            .collect();
         Ok(match tokens.len() {
             0 => Box::new(EmptyQuery),
             1 if !prefix => Box::new(TermQuery::new(
@@ -802,7 +844,7 @@ impl Compiler<'_> {
                 && matches!(entry.field_type(), FieldType::Str(_)),
             "exists needs a fast field, or an indexed text field: {name:?} is neither"
         );
-        Ok(Box::new(RegexQuery::from_pattern("(?s).*", target.field)?))
+        self.pattern(&target, "(?s).*", false)
     }
 
     fn query_string(&self, body: &Value, strict: bool) -> Result<Box<dyn Query>> {
@@ -935,6 +977,34 @@ mod tests {
         assert_eq!(ids(json!({"terms": {"tag": ["beta", "delta"]}})), [2, 4]);
         assert_eq!(ids(json!({"prefix": {"tag": "al"}})), [1, 3]);
         assert_eq!(ids(json!({"wildcard": {"tag": {"value": "?amm*"}}})), [2]);
+        // Term-level queries are not analyzed; case_insensitive opts out of case.
+        assert_eq!(ids(json!({"prefix": {"tag": "AL"}})), Vec::<i64>::new());
+        assert_eq!(
+            ids(json!({"prefix": {"tag": {"value": "AL", "case_insensitive": true}}})),
+            [1, 3]
+        );
+        assert_eq!(
+            ids(json!({"wildcard": {"tag": {"value": "*MM*", "case_insensitive": true}}})),
+            [2]
+        );
+        assert_eq!(
+            ids(json!({"regexp": {"tag": {"value": "D.L.A", "case_insensitive": true}}})),
+            [4]
+        );
+        assert_eq!(
+            ids(json!({"term": {"tag": {"value": "ALPHA", "case_insensitive": true}}})),
+            [1, 3]
+        );
+        assert_eq!(
+            ids(json!({"term": {"tag": {"value": "ALPHA"}}})),
+            Vec::<i64>::new()
+        );
+        // The value is literal: no expression in a prefix or a case-insensitive term.
+        assert_eq!(ids(json!({"prefix": {"tag": ".*"}})), Vec::<i64>::new());
+        assert_eq!(
+            ids(json!({"term": {"tag": {"value": "al.*", "case_insensitive": true}}})),
+            Vec::<i64>::new()
+        );
         assert_eq!(ids(json!({"regexp": {"tag": "d.l.a"}})), [4]);
         assert_eq!(ids(json!({"fuzzy": {"tag": {"value": "alpah"}}})), [1, 3]);
         assert_eq!(ids(json!({"exists": {"field": "tag"}})), [1, 2, 3, 4]);
@@ -1037,7 +1107,11 @@ mod tests {
             json!({"match_all": {"filter": {"term": {"id": 1}}}}),
             json!({"match": {"body": {"query": "fox", "operator": "xor"}}}),
             json!({"match": {"body": {"query": "fox", "fuzziness": 3}}}),
-            json!({"prefix": {"tag": {"value": "a", "case_insensitive": true}}}),
+            json!({"prefix": {"tag": {"value": "a", "case_insensitive": "yes"}}}),
+            json!({"term": {"id": {"value": 1, "case_insensitive": true}}}),
+            json!({"fuzzy": {"tag": {"value": "a", "case_insensitive": true}}}),
+            json!({"regexp": {"tag": "("}}),
+            json!({"match_phrase_prefix": {"body": "quick bro", "case_insensitive": true}}),
             json!({"prefix": {"id": "1"}}),
             json!({"range": {"id": {}}}),
             json!({"range": {"id": {"gt": 1, "gte": 2}}}),
@@ -1156,16 +1230,55 @@ mod json_tests {
             ),
             [3]
         );
-        assert!(
-            fails(json!({"prefix": {"meta.color": "re"}}), "").contains("path inside a JSON field")
+        // Pattern queries see the strings at their own path only.
+        assert_eq!(ok(json!({"prefix": {"meta.color": "re"}})), [1, 3]);
+        assert_eq!(ok(json!({"prefix": {"meta.color": "b"}})), [2]); // blue, not "big" of tags
+        assert_eq!(ok(json!({"prefix": {"meta.tags": "b"}})), [1]);
+        assert_eq!(ok(json!({"wildcard": {"meta.color": "*e*"}})), [1, 2, 3]);
+        assert_eq!(ok(json!({"wildcard": {"meta.color": "*ed"}})), [1, 3]);
+        assert_eq!(ok(json!({"regexp": {"meta.color": "r.d|blue"}})), [1, 2, 3]);
+        assert_eq!(
+            ok(json!({"regexp": {"meta.color": "e.*"}})),
+            Vec::<i64>::new()
+        ); // anchored
+        assert_eq!(ok(json!({"prefix": {"meta.n": "5"}})), Vec::<i64>::new()); // a number, not a string
+        assert_eq!(
+            ok(json!({"prefix": {"meta.nosuch": "r"}})),
+            Vec::<i64>::new()
         );
-        assert!(fails(json!({"regexp": {"meta.color": "r.*"}}), "")
-            .contains("path inside a JSON field"));
-        assert!(fails(
-            json!({"match": {"meta.tags": {"query": "roof", "fuzziness": 1}}}),
-            ""
-        )
-        .contains("fuzziness"));
+        assert_eq!(
+            ok(json!({"prefix": {"meta.color": "RE"}})),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            ok(json!({"prefix": {"meta.color": {"value": "RE", "case_insensitive": true}}})),
+            [1, 3]
+        );
+        assert_eq!(
+            ok(json!({"term": {"meta.color": {"value": "BLUE", "case_insensitive": true}}})),
+            [2]
+        );
+        assert_eq!(
+            ok(json!({"fuzzy": {"meta.color": {"value": "rde"}}})),
+            [1, 3]
+        ); // a transposition
+        assert_eq!(
+            ok(json!({"match": {"meta.tags": {"query": "rooof", "fuzziness": 1}}})),
+            [1, 2]
+        );
+        assert_eq!(
+            ok(
+                json!({"match": {"meta.tags": {"query": "BIG roof", "fuzziness": "AUTO", "operator": "and"}}})
+            ),
+            [1]
+        );
+        assert!(
+            fails(json!({"match_phrase_prefix": {"meta.tags": "big r"}}), "")
+                .contains("not a path inside")
+        );
+        assert!(fails(json!({"prefix": {"meta": "x"}}), "").contains("needs an indexed text field"));
+        assert!(fails(json!({"prefix": {"id": "1"}}), "").contains("needs an indexed text field"));
+        assert!(fails(json!({"regexp": {"meta.color": "("}}), "").contains("regular expression"));
         assert!(fails(json!({"term": {"meta.color": null}}), "").contains("cannot use"));
         // A path inside something that is not a JSON field is not a field.
         assert!(fails(json!({"term": {"body.x": "a"}}), "").contains("no field"));

@@ -39,6 +39,10 @@ Storage layout: **v2** (unchanged).
 - Query DSL: paths inside JSON fields in `term`, `terms`, `match`,
   `match_phrase`, `range`, `exists` and `multi_match`; `exists` on an indexed
   text field without a fast column falls back to its terms.
+- Query DSL: `prefix`, `wildcard`, `regexp` and `fuzzy` on paths inside JSON
+  fields (the path's strings only; the path-skipping automaton is adapted from
+  Quickwit, Apache-2.0), and `case_insensitive` on `term`, `prefix`, `wildcard`
+  and `regexp`.
 - `bench/search.py` and `bench/index_memory.py`: timings, compaction cost and
   build memory (documented with `memory_budget`; a `TMPDIR` on a tmpfs counts
   as memory).

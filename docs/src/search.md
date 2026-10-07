@@ -412,8 +412,9 @@ Unsupported query types and parameters fail rather than being silently ignored:
 | `match` | `query`, `operator` (`and`/`or`), `minimum_should_match`, `fuzziness`, `fuzzy_transpositions` |
 | `match_phrase`, `match_phrase_prefix` | `query`; `slop` for phrases, `max_expansions` for phrase prefixes |
 | `multi_match` | named `fields` (with `^boost`), `best_fields`, `most_fields`, `phrase`, `phrase_prefix`; applicable match parameters, `tie_breaker` |
-| `term`, `terms` | exact typed values, without analysis |
-| `prefix`, `wildcard`, `regexp`, `fuzzy` | text `value`; wildcard `*`, `?`, escapes; fuzzy `fuzziness`, `transpositions` |
+| `term`, `terms` | exact typed values, without analysis; `term` takes `case_insensitive` for text |
+| `prefix`, `wildcard`, `regexp` | text `value`, `case_insensitive`; wildcard `*`, `?`, `\` escapes; a regular expression matches a whole term |
+| `fuzzy` | text `value`, `fuzziness`, `transpositions` |
 | `exists` | `field`: a fast field, or an indexed text field (slower: any term in its dictionary), or a JSON field (any path in it) |
 | `range` | `gt`, `gte`, `lt`, `lte` |
 | `constant_score`, `dis_max` | `filter`; `queries` and `tie_breaker`, respectively |
@@ -431,10 +432,17 @@ the schema. Regular expressions and scoring follow tantivy's behaviour.
 `{"term": {"attributes.contractor": "acme"}}`. `term`, `terms`, `match`
 (analyzed by the JSON field's tokenizer), `match_phrase`, `range` (fast, numeric
 bounds typed by their JSON literal) and `exists` accept paths, as do
-`multi_match` fields. Free-form attributes then need no field per attribute
-in the schema, and splits with different attribute sets share one schema.
-`prefix`, `wildcard`, `regexp`, `fuzzy`, `match_phrase_prefix` and fuzziness on
-a path are not supported and fail.
+`multi_match` fields. So do `prefix`, `wildcard`, `regexp` and `fuzzy` (and
+`match`'s `fuzziness`), which see only the strings at their own path. Free-form
+attributes then need no field per attribute in the schema, and splits with
+different attribute sets share one schema. `match_phrase_prefix` on a path
+fails.
+
+**Case.** Term-level queries (`term`, `terms`, `prefix`, `wildcard`, `regexp`)
+are not analyzed, as in OpenSearch: on a field whose tokenizer lowercases,
+`{"prefix": {"title": "Big"}}` finds nothing. `case_insensitive: true` matches
+the indexed terms in any case. The value of a `prefix` or a case-insensitive
+`term` is literal; in `regexp` it is an expression.
 
 **Missing fields.** A field the schema lacks is an error, so a typo cannot
 quietly match nothing. `ignore_unmapped` (a search option) makes it match
@@ -501,14 +509,7 @@ with the lake.
 ## Roadmap
 
 What a real workload (a 12.5M-document index in 13 splits, read through pgvfs,
-replaced documents excluded by key) still lacks, most valuable first.
-
-**Pattern queries on JSON paths.** `prefix`, `wildcard`, `regexp`, `fuzzy` and
-`match_phrase_prefix` need a field, not a path inside a JSON field: tantivy's
-`RegexQuery` and `FuzzyTermQuery` match a field's whole term dictionary. A path's
-terms share a prefix in that dictionary, so a query restricted to it would do,
-but it needs a query of our own (or a change in tantivy). Today a free-form
-attribute can be matched exactly, analysed, by range and by existence.
+replaced documents excluded by key) still lacks.
 
 **A faster merge.** `tantivy_merge` is one thread (see "What a merge costs").
 Merging halves of the list at once and then their results would use more cores
