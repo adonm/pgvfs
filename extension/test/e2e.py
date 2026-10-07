@@ -284,7 +284,7 @@ for sql, msg in [
         assert msg in str(e), (sql, e)
 assert one(con, f"SELECT count(*) FROM glob('{root}/fts/x*')") == (0,), "failed builds left files"
 try:  # only the pgvfs writer writes to pgvfs
-    con2.execute(f"SELECT tantivy_index('{root}/fts/y.tantivy', {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t")
+    con2.execute(f"SELECT tantivy_index('{root}/fts/y.tantivy', {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t").fetchall()
     raise AssertionError("a second process wrote a split")
 except duckdb.Error as e:
     assert "writer" in str(e), e
