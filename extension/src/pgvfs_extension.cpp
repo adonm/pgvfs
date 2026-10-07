@@ -613,7 +613,13 @@ void LoadInternal(ExtensionLoader &loader) {
 #if __has_include("duckdb/function/aggregate_state_layout.hpp")
 	drop_volume.SetFallible();
 #endif
-	loader.RegisterFunction(std::move(drop_volume));
+	CreateScalarFunctionInfo drop_volume_info(drop_volume);
+	FunctionDescription drop_volume_doc;
+	drop_volume_doc.description =
+	    "Removes every file in a pgvfs volume, through the writer. Returns the number of files.";
+	drop_volume_doc.examples = {"SELECT pgvfs_drop_volume('scratch')"};
+	drop_volume_info.descriptions.push_back(std::move(drop_volume_doc));
+	loader.RegisterFunction(std::move(drop_volume_info));
 
 	ScalarFunction stats("pgvfs_stats", vector<LogicalType> {}, LogicalType::VARCHAR, StatsFunction);
 	stats.SetVolatile();

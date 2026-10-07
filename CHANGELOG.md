@@ -49,6 +49,9 @@ Storage layout: **v2** (unchanged).
 - `bench/search.py` and `bench/index_memory.py`: timings, compaction cost and
   build memory (documented with `memory_budget`; a `TMPDIR` on a tmpfs counts
   as memory).
+- Every function registers a description and an example, so DuckDB's
+  `duckdb_functions()` and the community docs page list them (they showed
+  `NULL` for all but `pgvfs_stats`).
 - `pgvfs_drop_volume` removes one volume through the writer and invalidates
   caches. Directory removal unpublishes a key prefix.
 - DuckDB 2.0 scalar error declarations and filesystem access checks, including

@@ -18,6 +18,9 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
@@ -747,6 +750,21 @@ FROM (
 WHERE __tantivy_key = input_id::VARCHAR
 ))"};
 
+// What DuckDB's documentation and duckdb_functions() show for a function.
+FunctionDescription Describe(const char *text, vector<string> examples) {
+	FunctionDescription doc;
+	doc.description = text;
+	doc.examples = std::move(examples);
+	return doc;
+}
+
+template <class Info, class Set>
+void RegisterDescribed(ExtensionLoader &loader, Set set, const char *text, vector<string> examples) {
+	Info info(std::move(set));
+	info.descriptions.push_back(Describe(text, std::move(examples)));
+	loader.RegisterFunction(std::move(info));
+}
+
 } // namespace
 
 void ForgetTantivyPrefix(ClientContext &context, const string &prefix) {
@@ -779,7 +797,11 @@ void RegisterTantivy(ExtensionLoader &loader) {
 #endif
 		index.AddFunction(fn);
 	}
-	loader.RegisterFunction(std::move(index));
+	RegisterDescribed<CreateAggregateFunctionInfo>(
+	    loader, std::move(index),
+	    "Builds one immutable tantivy split file at `index` from the documents of each group (a row, or JSON text), "
+	    "with a tantivy schema as JSON and optional options as JSON. Returns the number of documents.",
+	    {"SELECT tantivy_index('docs.tantivy', schema, t) FROM docs t"});
 
 	// Every search-like function: (index, query, [options, [exclude]]), the
 	// index a path or a list of them, the exclude set a roaring BLOB or ids.
@@ -806,7 +828,12 @@ void RegisterTantivy(ExtensionLoader &loader) {
 		fn.in_out_function = SearchInOut;
 		search.AddFunction(fn);
 	}
-	loader.RegisterFunction(std::move(search));
+	RegisterDescribed<CreateTableFunctionInfo>(
+	    loader, std::move(search),
+	    "Searches a split, or a list of splits in parallel, with tantivy's query syntax or OpenSearch query DSL "
+	    "(JSON). Returns score, doc (JSON), path and highlight per hit, best first. Options (JSON): top_k, offset, "
+	    "sort, collapse, highlight, fast, exclude_field. exclude: a roaring BLOB or BIGINT[] of documents to skip.",
+	    {"SELECT score, doc FROM tantivy_search('docs.tantivy', 'small cats', '{\"top_k\": 10}')"});
 
 	ScalarFunctionSet count("tantivy_count");
 	for (auto &types : signatures({})) {
@@ -818,7 +845,11 @@ void RegisterTantivy(ExtensionLoader &loader) {
 #endif
 		count.AddFunction(fn);
 	}
-	loader.RegisterFunction(std::move(count));
+	RegisterDescribed<CreateScalarFunctionInfo>(
+	    loader, std::move(count),
+	    "The exact number of documents matching a query in a split or a list of splits. Options (JSON): limit "
+	    "(stop counting after limit + 1), distinct (the number of distinct values of a fast field).",
+	    {"SELECT tantivy_count('docs.tantivy', 'cats')"});
 
 	ScalarFunctionSet aggregate("tantivy_aggregate");
 	for (auto &types : signatures({LogicalType::VARCHAR})) {
@@ -830,7 +861,11 @@ void RegisterTantivy(ExtensionLoader &loader) {
 #endif
 		aggregate.AddFunction(fn);
 	}
-	loader.RegisterFunction(std::move(aggregate));
+	RegisterDescribed<CreateScalarFunctionInfo>(
+	    loader, std::move(aggregate),
+	    "Tantivy aggregations (an Elasticsearch-shaped JSON request: terms, histograms, statistics, cardinality) "
+	    "over the documents matching a query, as JSON.",
+	    {"SELECT tantivy_aggregate('docs.tantivy', 'cats', '{\"by_tag\": {\"terms\": {\"field\": \"tag\"}}}')"});
 
 	ScalarFunctionSet merge("tantivy_merge");
 	for (auto &types : signatures({})) {
@@ -844,17 +879,34 @@ void RegisterTantivy(ExtensionLoader &loader) {
 			merge.AddFunction(fn);
 		}
 	}
-	loader.RegisterFunction(std::move(merge));
+	RegisterDescribed<CreateScalarFunctionInfo>(
+	    loader, std::move(merge),
+	    "Merges a list of splits into one new split at the target, optionally leaving out excluded documents. "
+	    "Returns the number of documents kept.",
+	    {"SELECT tantivy_merge(['a.tantivy', 'b.tantivy'], 'ab.tantivy')"});
 
 	ScalarFunction drop("tantivy_drop", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, DropFunction);
 	drop.SetVolatile();
 #ifdef PGVFS_DUCKDB_V2
 	drop.SetFallible();
 #endif
-	loader.RegisterFunction(std::move(drop));
+	RegisterDescribed<CreateScalarFunctionInfo>(loader, std::move(drop),
+	                                            "Removes the split at `index`. Returns whether there was one.",
+	                                            {"SELECT tantivy_drop('docs.tantivy')"});
 
-	loader.RegisterFunction(*DefaultTableFunctionGenerator::CreateTableMacroInfo(CREATE_INDEX_MACRO));
-	loader.RegisterFunction(*DefaultFunctionGenerator::CreateInternalMacroInfo(MATCH_BM25_MACRO));
+	auto create_index = DefaultTableFunctionGenerator::CreateTableMacroInfo(CREATE_INDEX_MACRO);
+	create_index->descriptions.push_back(
+	    Describe("Builds a split of the given text columns of a table, keyed by an id column, like DuckDB's fts "
+		         "create_fts_index. Named parameters: stemmer, stopwords, strip_accents, lower. Returns the number of "
+		         "rows indexed.",
+		         {"FROM tantivy_create_index('docs.tantivy', 'docs', 'id', ['body'])"}));
+	loader.RegisterFunction(*create_index);
+	auto match_bm25 = DefaultFunctionGenerator::CreateInternalMacroInfo(MATCH_BM25_MACRO);
+	match_bm25->descriptions.push_back(
+	    Describe("The BM25 score of the row with this id for a query against a split, or NULL when it does not match, "
+		         "like DuckDB's fts match_bm25.",
+		         {"SELECT id, tantivy_match_bm25('docs.tantivy', id, 'cats') AS score FROM docs"}));
+	loader.RegisterFunction(*match_bm25);
 }
 
 } // namespace duckdb
