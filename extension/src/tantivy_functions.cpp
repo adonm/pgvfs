@@ -14,15 +14,51 @@
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include <chrono>
 #include <cstring>
 #include <mutex>
 
+// DuckDB 2.0 reworked its C++ function API; the few differences are marked.
+#if __has_include("duckdb/function/aggregate_state_layout.hpp")
+#define PGVFS_DUCKDB_V2 1
+#endif
+
 namespace duckdb {
 
 namespace {
+
+template <class T>
+T *MutableData(Vector &vector) {
+#ifdef PGVFS_DUCKDB_V2
+	return FlatVector::GetDataMutable<T>(vector);
+#else
+	return FlatVector::GetData<T>(vector);
+#endif
+}
+
+void Unified(Vector &vector, idx_t count, UnifiedVectorFormat &format) {
+#ifdef PGVFS_DUCKDB_V2
+	vector.ToUnifiedFormat(format);
+#else
+	vector.ToUnifiedFormat(count, format);
+#endif
+}
+
+#ifdef PGVFS_DUCKDB_V2
+using ColumnNames = vector<Identifier>;
+#else
+using ColumnNames = vector<string>;
+#endif
+
+void SetRows(DataChunk &chunk, idx_t count) {
+#ifdef PGVFS_DUCKDB_V2
+	chunk.SetCardinalityUnsafe(count); // child vectors were written in place
+#else
+	chunk.SetCardinality(count);
+#endif
+}
 
 [[noreturn]] void Fail(const string &what, const string &path, char *err) {
 	string msg = err ? string(err) : "unknown error";
@@ -62,10 +98,23 @@ int ReadSplit(void *ctx, uint8_t *buf, uint64_t len, uint64_t offset, char *msg,
 	}
 }
 
-// This database's splits open for search, by path. A split is checked for a
-// change (size, modification time, version tag) at most every 10 s; this
-// database's own builds and drops forget it at once.
-struct Splits {
+// This database's splits open for search, by path, kept in its object cache.
+// A split is checked for a change (size, modification time, version tag) at
+// most every 10 s; this database's own builds and drops forget it at once.
+struct Splits : public ObjectCacheEntry {
+	static shared_ptr<Splits> Of(ClientContext &context) {
+		return ObjectCache::GetObjectCache(context).GetOrCreate<Splits>(ObjectType());
+	}
+	static string ObjectType() {
+		return "tantivy_splits";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // never evicted
+	}
+
 	shared_ptr<OpenSplit> Get(ClientContext &context, const string &path) {
 		auto now = std::chrono::steady_clock::now();
 		{
@@ -112,13 +161,6 @@ struct Splits {
 
 	std::mutex lock;
 	unordered_map<string, shared_ptr<OpenSplit>> open;
-};
-
-template <class INFO>
-struct SplitsInfo : public INFO {
-	explicit SplitsInfo(shared_ptr<Splits> splits) : splits(std::move(splits)) {
-	}
-	shared_ptr<Splits> splits;
 };
 
 // tantivy_index(index, schema, doc [, options]): an aggregate that builds a
@@ -231,24 +273,50 @@ struct IndexState {
 	int64_t docs;
 };
 
-unique_ptr<FunctionData> IndexBind(ClientContext &context, AggregateFunction &function,
-                                   vector<unique_ptr<Expression>> &) {
-	auto &splits = function.function_info->Cast<SplitsInfo<AggregateFunctionInfo>>().splits;
-	return make_uniq<IndexBindData>(make_shared_ptr<IndexJob>(context, splits));
+#ifdef PGVFS_DUCKDB_V2
+unique_ptr<FunctionData> IndexBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+#else
+unique_ptr<FunctionData> IndexBind(ClientContext &context, AggregateFunction &, vector<unique_ptr<Expression>> &) {
+#endif
+	return make_uniq<IndexBindData>(make_shared_ptr<IndexJob>(context, Splits::Of(context)));
 }
 
-void IndexInitialize(const AggregateFunction &, data_ptr_t state) {
-	*reinterpret_cast<IndexState *>(state) = {nullptr, 0};
-}
-
-void IndexUpdate(Vector inputs[], AggregateInputData &input, idx_t input_count, Vector &states, idx_t count) {
-	auto &job = *input.bind_data->Cast<IndexBindData>().job;
-	UnifiedVectorFormat args[4], state_format;
-	for (idx_t a = 0; a < input_count; a++) {
-		inputs[a].ToUnifiedFormat(count, args[a]);
+// For DuckDB's aggregate templates.
+struct IndexOp {
+	template <class STATE>
+	static void Initialize(STATE &state) {
+		state = {nullptr, 0};
 	}
-	states.ToUnifiedFormat(count, state_format);
-	auto state_ptrs = UnifiedVectorFormat::GetData<IndexState *>(state_format);
+	template <class STATE, class OP>
+	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
+		if (!target.build) {
+			target.build = source.build;
+		} else if (source.build && source.build != target.build) {
+			throw InvalidInputException("tantivy_index builds one split per group: %s and %s", target.build->url,
+			                            source.build->url);
+		}
+		target.docs += source.docs;
+	}
+	template <class T, class STATE>
+	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
+		// No documents, no split.
+		auto &job = *finalize_data.input.bind_data->template Cast<IndexBindData>().job;
+		target = state.build ? job.Commit(*state.build) : 0;
+	}
+	static bool IgnoreNull() {
+		return false;
+	}
+};
+
+// Add each row's document to its state's build; `state_of(i)` is row i's state.
+template <class STATE_OF>
+void AddRows(Vector inputs[], AggregateInputData &input, idx_t input_count, idx_t count, STATE_OF &&state_of) {
+	auto &job = *input.bind_data->Cast<IndexBindData>().job;
+	UnifiedVectorFormat args[4];
+	for (idx_t a = 0; a < input_count; a++) {
+		Unified(inputs[a], count, args[a]);
+	}
 	auto text = [&](idx_t a, idx_t i, const char *what) -> string {
 		auto row = args[a].sel->get_index(i);
 		if (!args[a].validity.RowIsValid(row)) {
@@ -264,7 +332,7 @@ void IndexUpdate(Vector inputs[], AggregateInputData &input, idx_t input_count, 
 		if (!args[2].validity.RowIsValid(doc_row)) {
 			continue;
 		}
-		auto &state = *state_ptrs[state_format.sel->get_index(i)];
+		IndexState &state = state_of(i);
 		auto url = text(0, i, "index");
 		if (!state.build) {
 			state.build = &job.Get(url, text(1, i, "schema"), input_count > 3 ? text(3, i, "options") : "");
@@ -281,47 +349,27 @@ void IndexUpdate(Vector inputs[], AggregateInputData &input, idx_t input_count, 
 	}
 }
 
+void IndexUpdate(Vector inputs[], AggregateInputData &input, idx_t input_count, Vector &states, idx_t count) {
+	UnifiedVectorFormat format;
+	Unified(states, count, format);
+	auto ptrs = UnifiedVectorFormat::GetData<IndexState *>(format);
+	AddRows(inputs, input, input_count, count, [&](idx_t i) -> IndexState & { return *ptrs[format.sel->get_index(i)]; });
+}
+
+#ifndef PGVFS_DUCKDB_V2
+// DuckDB 1.x updates ungrouped aggregates through this.
 void IndexSimpleUpdate(Vector inputs[], AggregateInputData &input, idx_t input_count, data_ptr_t state, idx_t count) {
-	Vector states(Value::POINTER(CastPointerToValue(state)));
-	IndexUpdate(inputs, input, input_count, states, count);
+	AddRows(inputs, input, input_count, count,
+	        [&](idx_t) -> IndexState & { return *reinterpret_cast<IndexState *>(state); });
 }
-
-void IndexCombine(Vector &source, Vector &target, AggregateInputData &, idx_t count) {
-	auto from = FlatVector::GetData<IndexState *>(source);
-	auto to = FlatVector::GetData<IndexState *>(target);
-	for (idx_t i = 0; i < count; i++) {
-		if (!to[i]->build) {
-			to[i]->build = from[i]->build;
-		} else if (from[i]->build && from[i]->build != to[i]->build) {
-			throw InvalidInputException("tantivy_index builds one split per group: %s and %s", to[i]->build->url,
-			                            from[i]->build->url);
-		}
-		to[i]->docs += from[i]->docs;
-	}
-}
-
-void IndexFinalize(Vector &states, AggregateInputData &input, Vector &result, idx_t count, idx_t offset) {
-	auto &job = *input.bind_data->Cast<IndexBindData>().job;
-	UnifiedVectorFormat state_format;
-	states.ToUnifiedFormat(count, state_format);
-	auto state_ptrs = UnifiedVectorFormat::GetData<IndexState *>(state_format);
-	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto docs = FlatVector::GetData<int64_t>(result);
-	for (idx_t i = 0; i < count; i++) {
-		auto &state = *state_ptrs[state_format.sel->get_index(i)];
-		// No documents, no split.
-		docs[offset + i] = state.build ? job.Commit(*state.build) : 0;
-	}
-}
+#endif
 
 // tantivy_search(index, query [, options]): tantivy's query language over a
 // split; (score, doc) per hit, best first, doc holding the stored fields. An
 // in-out function, so arguments may be columns: FROM splits s CROSS JOIN
 // tantivy_search(s.path, 'cats') searches every split listed. (In-out
 // functions take no named parameters, hence options as JSON.)
-struct SearchBindData : public TableFunctionData {
-	shared_ptr<Splits> splits;
-};
+struct SearchBindData : public TableFunctionData {};
 
 struct SearchState : public LocalTableFunctionState {
 	idx_t row = 0;
@@ -334,10 +382,9 @@ void CollectHit(void *ctx, double score, const char *doc, size_t len) {
 	static_cast<SearchState *>(ctx)->hits.emplace_back(score, string(doc, len));
 }
 
-unique_ptr<FunctionData> SearchBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
-                                    vector<string> &names) {
+unique_ptr<FunctionData> SearchBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &types,
+                                    ColumnNames &names) {
 	auto data = make_uniq<SearchBindData>();
-	data->splits = input.info->Cast<SplitsInfo<TableFunctionInfo>>().splits;
 	types = {LogicalType::DOUBLE, LogicalType::JSON()};
 	names = {"score", "doc"};
 	return std::move(data);
@@ -350,7 +397,6 @@ unique_ptr<LocalTableFunctionState> SearchInit(ExecutionContext &, TableFunction
 
 OperatorResultType SearchInOut(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
                                DataChunk &output) {
-	auto &bind = data.bind_data->Cast<SearchBindData>();
 	auto &state = data.local_state->Cast<SearchState>();
 	while (true) {
 		if (!state.searched) {
@@ -366,7 +412,7 @@ OperatorResultType SearchInOut(ExecutionContext &context, TableFunctionInput &da
 			auto options = input.ColumnCount() > 2 ? input.GetValue(2, state.row) : Value();
 			if (!index.IsNull() && !query.IsNull()) { // NULL finds nothing
 				auto path = index.ToString();
-				auto split = bind.splits->Get(context.client, path);
+				auto split = Splits::Of(context.client)->Get(context.client, path);
 				auto text = query.ToString();
 				auto json = options.IsNull() ? string() : options.ToString();
 				char *err = nullptr;
@@ -376,14 +422,14 @@ OperatorResultType SearchInOut(ExecutionContext &context, TableFunctionInput &da
 			}
 		}
 		if (state.next < state.hits.size()) {
-			auto scores = FlatVector::GetData<double>(output.data[0]);
-			auto docs = FlatVector::GetData<string_t>(output.data[1]);
+			auto scores = MutableData<double>(output.data[0]);
+			auto docs = MutableData<string_t>(output.data[1]);
 			idx_t n = 0;
 			for (; n < STANDARD_VECTOR_SIZE && state.next < state.hits.size(); n++, state.next++) {
 				scores[n] = state.hits[state.next].first;
 				docs[n] = StringVector::AddString(output.data[1], state.hits[state.next].second);
 			}
-			output.SetCardinality(n);
+			SetRows(output, n);
 			return OperatorResultType::HAVE_MORE_OUTPUT;
 		}
 		state.searched = false;
@@ -394,9 +440,8 @@ OperatorResultType SearchInOut(ExecutionContext &context, TableFunctionInput &da
 // tantivy_drop(index): remove a split; whether there was one. A scalar, so
 // SQL can drop many: SELECT tantivy_drop(path) FROM ...
 void DropFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &function = state.expr.Cast<BoundFunctionExpression>().function;
-	auto &splits = *function.function_info->Cast<SplitsInfo<ScalarFunctionInfo>>().splits;
 	auto &context = state.GetContext();
+	auto &splits = *Splits::Of(context);
 	auto &fs = FileSystem::GetFileSystem(context);
 	UnaryExecutor::Execute<string_t, bool>(args.data[0], result, args.size(), [&](string_t url) {
 		auto path = url.GetString();
@@ -442,8 +487,12 @@ FROM (
 const DefaultMacro MATCH_BM25_MACRO = {
     DEFAULT_SCHEMA,
     "tantivy_match_bm25",
+#ifdef PGVFS_DUCKDB_V2
+    "(index, input_id, query_string, fields := NULL, conjunctive := false) AS "
+#else
     {"index", "input_id", "query_string", nullptr},
     {{"fields", "NULL"}, {"conjunctive", "false"}, {nullptr, nullptr}},
+#endif
     R"((
 SELECT max(__tantivy_score)
 FROM (
@@ -458,31 +507,34 @@ WHERE __tantivy_key = input_id::VARCHAR
 } // namespace
 
 void RegisterTantivy(ExtensionLoader &loader) {
-	auto splits = make_shared_ptr<Splits>();
-
 	AggregateFunctionSet index("tantivy_index");
-	AggregateFunction index_fn({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
-	                           AggregateFunction::StateSize<IndexState>, IndexInitialize, IndexUpdate, IndexCombine,
-	                           IndexFinalize, FunctionNullHandling::SPECIAL_HANDLING, IndexSimpleUpdate, IndexBind);
-	index_fn.function_info = make_shared_ptr<SplitsInfo<AggregateFunctionInfo>>(splits);
-	index_fn.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
-	index_fn.SetVolatile();
-	index.AddFunction(index_fn);
-	index_fn.arguments.push_back(LogicalType::VARCHAR);
-	index.AddFunction(index_fn);
+	for (idx_t args : {3, 4}) {
+		AggregateFunction fn(vector<LogicalType>(args, LogicalType::VARCHAR), LogicalType::BIGINT,
+		                     AggregateFunction::StateSize<IndexState>,
+		                     AggregateFunction::StateInitialize<IndexState, IndexOp>, IndexUpdate,
+		                     AggregateFunction::StateCombine<IndexState, IndexOp>,
+		                     AggregateFunction::StateFinalize<IndexState, int64_t, IndexOp>,
+		                     FunctionNullHandling::SPECIAL_HANDLING,
+#ifdef PGVFS_DUCKDB_V2
+		                     nullptr,
+#else
+		                     IndexSimpleUpdate,
+#endif
+		                     IndexBind);
+		fn.SetVolatile();
+		index.AddFunction(fn);
+	}
 	loader.RegisterFunction(std::move(index));
 
 	TableFunctionSet search("tantivy_search");
-	TableFunction search_fn({LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, SearchBind, nullptr, SearchInit);
-	search_fn.in_out_function = SearchInOut;
-	search_fn.function_info = make_shared_ptr<SplitsInfo<TableFunctionInfo>>(splits);
-	search.AddFunction(search_fn);
-	search_fn.arguments.push_back(LogicalType::VARCHAR);
-	search.AddFunction(search_fn);
+	for (idx_t args : {2, 3}) {
+		TableFunction fn(vector<LogicalType>(args, LogicalType::VARCHAR), nullptr, SearchBind, nullptr, SearchInit);
+		fn.in_out_function = SearchInOut;
+		search.AddFunction(fn);
+	}
 	loader.RegisterFunction(std::move(search));
 
 	ScalarFunction drop("tantivy_drop", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, DropFunction);
-	drop.function_info = make_shared_ptr<SplitsInfo<ScalarFunctionInfo>>(splits);
 	drop.SetVolatile();
 	loader.RegisterFunction(std::move(drop));
 

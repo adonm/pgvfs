@@ -20,6 +20,8 @@ Storage layout: **v2** (unchanged).
 - Docs: vector search as plain SQL over a lake clustered by nearest centroid
   (IVF), with a synthetic check (`bench/ivf.py`).
 - The extension grows by about 5 MB (tantivy, without its zstd feature).
+  Built against DuckDB 2.0 (nightly), which embeds much less of DuckDB, it
+  is about 21 MB instead of 39 MB.
 
 ## 0.2.0-beta.3
 
