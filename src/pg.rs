@@ -14,6 +14,8 @@ use anyhow::Result;
 use deadpool_postgres::{
     Hook, HookError, Manager, ManagerConfig, Object, QueueMode, RecyclingMethod, Runtime,
 };
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::CertificateDer;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -122,7 +124,7 @@ fn tls_config() -> Result<rustls::ClientConfig> {
     }
     if let Ok(path) = std::env::var("PGVFS_DB_CA_FILE") {
         let pem = std::fs::read(path)?;
-        for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(pem)) {
+        for cert in CertificateDer::pem_slice_iter(&pem) {
             roots.add(cert?)?;
         }
     }

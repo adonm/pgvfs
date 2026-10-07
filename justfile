@@ -4,7 +4,12 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# fmt, clippy and unit tests (no database).
+# Regenerate the C headers from the Rust FFI (`just check` fails when they drift).
+headers:
+    UPDATE_HEADERS=1 cargo test --locked --test headers
+    UPDATE_HEADERS=1 cargo test --locked -p duckdb-tantivy --test headers
+
+# fmt, clippy and unit tests (no database), and that the C headers match the FFI.
 check:
     cargo fmt --all --check
     cargo clippy --locked --workspace --all-targets -- -D warnings

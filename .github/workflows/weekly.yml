@@ -18,6 +18,15 @@ defaults:
     shell: bash
 
 jobs:
+  # Not needed to publish: a new advisory turns this red without holding a build.
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
   compat:
     runs-on: ubuntu-latest
     steps:

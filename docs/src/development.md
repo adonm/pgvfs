@@ -2,7 +2,8 @@
 
 ```sh
 mise install                 # rust, just, uv, python, mdbook
-just check                   # fmt, clippy, unit tests
+just check                   # fmt, clippy, unit tests, and that the C headers match the FFI
+just headers                 # regenerate the C headers from the Rust FFI
 just ext                     # extension for DuckDB 1.5.6 -> target/ext/release/
 just ext nightly [WHEEL]     # for a DuckDB 2.0 dev wheel (default: newest) -> target/ext/nightly/
 just contract                # storage contract on a disposable PostgreSQL (PG_IMAGE=postgres:11..18)
@@ -28,13 +29,28 @@ writes, a lost writer lock, readers during writes, and offsets past 4 GiB.
 | `src/lib.rs` | the C interface used by the extension, the open cache, `pgvfs_stats()` |
 | `tantivy/` | tantivy splits (a workspace crate, linked into the same staticlib): build, bundle, search |
 | `extension/` | the C++ DuckDB `FileSystem` adapter, the tantivy SQL functions, the build and end-to-end test |
-| `tests/` | the storage contract, against real PostgreSQL |
+| `tests/` | the storage contract, against real PostgreSQL; `headers.rs` checks `pgvfs.h` against the FFI |
+| `cbindgen.toml`, `tantivy/cbindgen.toml` | how the two C headers in `extension/src/include/` are generated from the Rust FFI |
+| `deny.toml` | supply-chain policy for `cargo deny`: permissive licences, crates.io only, advisories |
 | `bench/` | benchmark harness (`lake.py`), datasets (`city.py`, `hits.py`), the IVF check (`ivf.py`) |
 | `scripts/` | build inputs, test and benchmark runners, release and site tools |
 | `docs/` | this site (mdbook) |
 
 The storage is Rust. The extension is a thin C++ layer because DuckDB's stable
 C API can use filesystems but cannot register one.
+
+**The C ABI.** `extension/src/include/pgvfs.h` and `tantivy.h` are generated
+from the `extern "C"` functions in Rust (cbindgen) and checked in. A signature
+that differs between Rust and C++ still compiles on both sides and crashes at
+run time, so `just check` fails when a header is out of date: run `just headers`
+and commit the result. Document an FFI function in Rust; its comment becomes the
+header's.
+
+**Supply chain.** CI runs `cargo deny check licenses bans sources` on every
+change and the RustSec advisories weekly. Dependencies must be permissively
+licensed and come from crates.io: no git dependencies, so nothing unreleased is
+linked into the extension. An accepted advisory goes in `deny.toml` with its
+reason.
 
 ## Building the extension
 

@@ -24,6 +24,16 @@ jobs:
       - uses: jdx/mise-action@v3
       - run: just check
 
+  # Permissive licences only, crates.io only (deny.toml). RustSec advisories are
+  # checked weekly (weekly.yml): a new advisory is not a reason to fail a change.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+
   e2e:
     runs-on: ubuntu-latest
     steps:

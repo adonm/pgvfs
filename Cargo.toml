@@ -4,6 +4,8 @@ version = "0.2.0"
 edition = "2021"
 description = "DuckDB pgvfs:// filesystem: DuckLake data files as PostgreSQL rows"
 license = "Apache-2.0"
+# Distributed as a DuckDB extension, not on crates.io.
+publish = false
 repository = "https://github.com/adonm/pgvfs"
 
 [lib]
@@ -20,10 +22,13 @@ deadpool-postgres = { version = "0.14", default-features = false, features = ["r
 futures = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
-rustls-pemfile = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tokio-postgres = "0.7.18"
 tokio-postgres-rustls = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+# The C headers are generated from the FFI and checked by tests/headers.rs.
+cbindgen = { version = "0.29", default-features = false }
 
 [workspace]
 members = ["tantivy"]

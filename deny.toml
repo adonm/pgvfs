@@ -1,0 +1,44 @@
+# Supply-chain checks: `cargo deny check`. CI runs licenses, bans and sources on
+# every change (ci.yml) and advisories weekly (weekly.yml), when the advisory
+# database has changed rather than the code.
+
+[graph]
+# cbindgen and proptest only run in tests; they are not shipped.
+exclude-dev = true
+
+[licenses]
+# Permissive only: the extension is Apache-2.0 and linked into DuckDB. A copyleft
+# dependency (AGPL, GPL) fails here instead of in review.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "zlib-acknowledgement",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: no git dependencies, so nothing unreleased (a tantivy main, as
+# Quickwit's crates use) ends up in the extension.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+# Unmaintained and unsound crates count in the whole tree, not only in ours.
+unmaintained = "all"
+unsound = "all"
+ignore = [
+    # Needs a panicking Drop on an LruCache key; tantivy's are integers. Fixed in
+    # lru 0.18.2, which tantivy 0.26 does not yet allow.
+    { id = "RUSTSEC-2026-0253", reason = "not reachable: tantivy's cache keys are integers" },
+]
