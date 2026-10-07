@@ -1,16 +1,19 @@
 # Full-text search
 
-pgvfs stores [tantivy](https://github.com/quickwit-oss/tantivy) search
-indexes in PostgreSQL alongside the lake. The writer builds them from any
-query; every reader searches them with BM25 ranking. There is no search
-cluster, and indexes share the lake's secret, backup and roles.
+The pgvfs extension also carries [tantivy](https://github.com/quickwit-oss/tantivy)
+search indexes: build them from any query, and search them with BM25 ranking.
+Stored in pgvfs, they live in PostgreSQL alongside the lake, with its secret,
+backup and roles, and no search cluster. They use only DuckDB's filesystem,
+though, so they work as well on local files or object storage.
 
 As in [Quickwit](https://quickwit.io/docs/overview/concepts/querying), an
-index is made of **splits**. A split is an immutable tantivy index under one
-`pgvfs://<volume>/<path>`. The extension builds, searches and drops splits.
-Everything else is SQL: which splits make up an index, when to add one
-(say, after each load), and when to merge them. A DuckLake table makes a good
-list of splits, versioned with the data it indexes.
+index is made of **splits**. A split is an immutable tantivy index in a single
+file, at any path DuckDB can write: `pgvfs://lake-fts/docs.tantivy`,
+`/data/docs.tantivy`, `s3://bucket/docs.tantivy`. The extension builds,
+searches and drops splits. Everything else is SQL: which splits make up an
+index, when to add one (say, after each load), and when to merge them. A
+DuckLake table makes a good list of splits, versioned with the data it
+indexes.
 
 | Function | |
 | --- | --- |
@@ -25,7 +28,7 @@ On the writer, index the `title` and `body` columns of `lake.docs` under its
 key `id`:
 
 ```sql
-FROM tantivy_create_index('pgvfs://lake-fts/docs', 'lake.docs', 'id', ['title', 'body']);
+FROM tantivy_create_index('pgvfs://lake-fts/docs.tantivy', 'lake.docs', 'id', ['title', 'body']);
 ```
 
 On any reader, score rows (`NULL` when they don't match):
@@ -33,7 +36,7 @@ On any reader, score rows (`NULL` when they don't match):
 ```sql
 SELECT id, title, score
 FROM (
-    SELECT *, tantivy_match_bm25('pgvfs://lake-fts/docs', id, 'small cats') AS score
+    SELECT *, tantivy_match_bm25('pgvfs://lake-fts/docs.tantivy', id, 'small cats') AS score
     FROM lake.docs
 )
 WHERE score IS NOT NULL
@@ -45,7 +48,7 @@ it:
 
 ```sql
 SELECT d.*, s.score
-FROM tantivy_search('pgvfs://lake-fts/docs', 'small cats', '{"top_k": 10}') s
+FROM tantivy_search('pgvfs://lake-fts/docs.tantivy', 'small cats', '{"top_k": 10}') s
 JOIN lake.docs d ON d.id = (s.doc->>'_key')::INTEGER
 ORDER BY s.score DESC;
 ```
@@ -55,9 +58,9 @@ DuckLake's `ducklake_delete_orphaned_files` deletes files under `DATA_PATH`
 that its catalog doesn't track.
 
 A split never changes, so to refresh this one, drop it and build it again:
-`SELECT tantivy_drop('pgvfs://lake-fts/docs')`. Readers see the new split
-within `PGVFS_OPEN_CACHE_S` (10 s). To keep searching without a gap, build
-new splits instead, as below.
+`SELECT tantivy_drop('pgvfs://lake-fts/docs.tantivy')`. Other readers see the
+new split within 10 s. To keep searching without a gap, build new splits
+instead, as below.
 
 ## Keeping an index current with DuckLake
 
@@ -77,7 +80,7 @@ SELECT path, getvariable('s1'), tantivy_index(path,
     '[{"name": "rowid", "type": "i64", "options": {"stored": true, "indexed": true}},
       {"name": "body", "type": "text", "options": {"indexing": {"record": "position", "tokenizer": "en_stem"}}}]',
     to_json(c))
-FROM (SELECT 'pgvfs://lake-fts/docs/' || getvariable('s1') AS path, rowid, * FROM lake.docs) c
+FROM (SELECT 'pgvfs://lake-fts/docs/' || getvariable('s1') || '.tantivy' AS path, rowid, * FROM lake.docs) c
 GROUP BY path;
 
 -- after each load, on the writer: a split of the rows changed since the last
@@ -87,7 +90,7 @@ SET VARIABLE s1 = (SELECT id::BIGINT FROM lake.current_snapshot());
 INSERT INTO lake.docs_splits
 SELECT path, getvariable('s1'), tantivy_index(path, '<the same schema>', to_json(c))
 FROM (
-    SELECT 'pgvfs://lake-fts/docs/' || getvariable('s1') AS path, *
+    SELECT 'pgvfs://lake-fts/docs/' || getvariable('s1') || '.tantivy' AS path, *
     FROM lake.table_changes('docs', getvariable('s0') + 1, getvariable('s1'))
     WHERE change_type IN ('insert', 'update_postimage')
     QUALIFY row_number() OVER (PARTITION BY rowid ORDER BY snapshot_id DESC) = 1
@@ -123,7 +126,7 @@ in and drop them:
 ```sql
 CREATE TEMP TABLE merged AS
 SELECT path, 1234 AS snapshot, tantivy_index(path, '<schema>', to_json(c)) AS docs
-FROM (<the query above over table_changes('docs', 1001, 1234), path 'pgvfs://lake-fts/docs/1001-1234'>) c
+FROM (<the query above over table_changes('docs', 1001, 1234), path 'pgvfs://lake-fts/docs/1001-1234.tantivy'>) c
 GROUP BY path;
 CREATE TEMP TABLE replaced AS FROM lake.docs_splits WHERE snapshot BETWEEN 1001 AND 1234;
 BEGIN;
@@ -140,7 +143,7 @@ selects the same rows by scanning the table.
 **Large tables.** A tantivy split holds at most 2³¹ documents, and a smaller
 one builds, merges and opens faster. Partition big builds: `GROUP BY` builds
 one split per group, so a path such as
-`'pgvfs://lake-fts/docs/' || s1 || '/' || rowid % 16` gives 16 splits per
+`'pgvfs://lake-fts/docs/' || s1 || '-' || rowid % 16 || '.tantivy'` gives 16 splits per
 build. Merge the per-load splits into larger ranges over time, keeping a few
 dozen in all, since a query searches each one.
 
@@ -148,12 +151,13 @@ dozen in all, since a query searches each one.
 
 ### `tantivy_index(index, schema, doc [, options])`
 
-An aggregate that builds a split at `index` from one JSON document per row
-and returns the number of documents. It commits when the aggregate finishes.
-The arguments are per row: with `GROUP BY`, each group builds its own split,
-and every row of a group must name the same `index`. No rows, no split. Only
-the writer can build, and `index` must not hold a split already. A failed or
-cancelled build leaves nothing behind.
+An aggregate that builds a split at `index`, a path DuckDB can write, from one
+JSON document per row, and returns the number of documents. The split is
+written as the aggregate finishes. The arguments are per row: with
+`GROUP BY`, each group builds its own split, and every row of a group must
+name the same `index`. No rows, no split. `index` must not exist yet (on
+pgvfs, only the writer can write). A failed or cancelled build leaves
+nothing behind.
 
 - `schema` is a tantivy schema as JSON: an array of
   [field entries](https://docs.rs/tantivy/latest/tantivy/schema/index.html).
@@ -200,9 +204,9 @@ ranges such as `id:[10 TO 20]`. `options`, as JSON:
 
 ### `tantivy_drop(index)`
 
-Removes the split at `index`, and returns whether there was one. On the
-writer. A scalar function, so `SELECT tantivy_drop(path) FROM ...` drops
-many.
+Removes the split at `index`, and returns whether there was one (on pgvfs,
+on the writer). A scalar function, so `SELECT tantivy_drop(path) FROM ...`
+drops many.
 
 ### The fts-style macros
 
@@ -225,22 +229,26 @@ is parsed leniently, so any user input works. BM25 uses tantivy's
 `k1 = 1.2` and `b = 0.75`.
 
 Both macros are short SQL over the functions above (`CREATE_INDEX_MACRO`
-and `MATCH_BM25_MACRO` in `extension/src/pgvfs_extension.cpp`). Copy and adapt
+and `MATCH_BM25_MACRO` in `extension/src/tantivy_functions.cpp`). Copy and adapt
 them for other schemas. DuckLake can store your own
 [macros](https://ducklake.select/docs/stable/duckdb/advanced_features/macros)
 with the lake.
 
 ## How it works
 
-- **Storage.** A split's files are ordinary pgvfs files, directly under its
-  path; the storage layout is unchanged. A split is one tantivy index with
-  one segment, written once by one tantivy `IndexWriter`. Dropping it
-  unpublishes its files, whose rows stay for the usual 10-minute grace for
-  searches already running.
-- **Builds** run on the pgvfs writer, using tantivy's indexing threads.
-  Each file is written to a local temporary file (`TMPDIR`) and uploaded when
-  complete, so a build needs free local disk about the size of the split.
-- **Searches** open each split once per DuckDB database and keep its term
-  dictionaries in memory. A search then reads each query term's postings,
-  plus the stored fields of the hits. A split dropped and rebuilt at the same
-  path by another process is picked up within `PGVFS_OPEN_CACHE_S`.
+- **Builds** use tantivy's own index directory in a local temporary one
+  (`TMPDIR`), with tantivy's indexing threads, so a build needs free local
+  disk about the size of the split. The finished index (merged to one
+  segment) is written to `index` as a single file: its files back to back
+  and a small footer naming them.
+- **Searches** read a split through DuckDB's filesystem, opening it once per
+  DuckDB database and keeping its term dictionaries in memory. A search then
+  reads each query term's postings, plus the stored fields of the hits: a
+  few range reads, so a search on pgvfs takes milliseconds. An open split is
+  checked for a change (size, modification time, version tag) at most every
+  10 s, so another process's rebuild at the same path shows up within that.
+- **Drops** remove the file. On pgvfs its rows stay for the usual 10-minute
+  grace, so searches already running finish; object stores delete at once,
+  so there drop replaced splits a while after swapping them out.
+- **Storage.** On pgvfs a split is an ordinary file; the storage layout is
+  unchanged.

@@ -57,7 +57,7 @@ corrosion_import_crate(
 set_target_properties(pgvfs PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/rust")
 
 include_directories(extension/src/include)
-set(EXTENSION_SOURCES extension/src/pgvfs_extension.cpp)
+set(EXTENSION_SOURCES extension/src/pgvfs_extension.cpp extension/src/tantivy_functions.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

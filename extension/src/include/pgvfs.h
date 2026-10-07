@@ -48,25 +48,6 @@ int pgvfs_writer_publish(PgvfsWriter *w, char **err);
 /* discards and frees w */
 void pgvfs_writer_abort(PgvfsWriter *w);
 
-/* Tantivy splits, each an immutable index at pgvfs://<volume>/<path>
- * (src/index.rs). Schema, documents and options are JSON; options may be NULL. */
-typedef struct PgvfsIndexBuild PgvfsIndexBuild;
-typedef void (*pgvfs_hit_cb)(void *ctx, double score, const char *doc, size_t len);
-
-PgvfsIndexBuild *pgvfs_index_open(const PgvfsConn *conn, const char *volume, const char *path, const char *schema,
-                                  const char *options, char **err);
-/* one JSON object; any thread; 0 ok, -1 error */
-int pgvfs_index_add(const PgvfsIndexBuild *b, const char *doc, size_t len, char **err);
-/* commits and frees b; documents indexed, or -1 (its files removed) */
-int64_t pgvfs_index_commit(PgvfsIndexBuild *b, char **err);
-/* discards and frees b, removing its files */
-void pgvfs_index_abort(PgvfsIndexBuild *b);
-/* cb per hit, best first: score and stored fields as JSON; 0 ok, -1 error */
-int pgvfs_index_search(const PgvfsConn *conn, const char *volume, const char *path, const char *query,
-                       const char *options, pgvfs_hit_cb cb, void *ctx, char **err);
-/* 0 dropped, 1 not found, -1 error */
-int pgvfs_index_drop(const PgvfsConn *conn, const char *volume, const char *path, char **err);
-
 #ifdef __cplusplus
 }
 #endif

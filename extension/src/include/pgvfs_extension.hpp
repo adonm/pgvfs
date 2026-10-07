@@ -11,4 +11,7 @@ public:
 	std::string Version() const override;
 };
 
+//! Tantivy search splits on any DuckDB filesystem (tantivy_functions.cpp).
+void RegisterTantivy(ExtensionLoader &loader);
+
 } // namespace duckdb

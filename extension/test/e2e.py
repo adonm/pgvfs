@@ -131,9 +131,9 @@ con2.execute(
 )
 assert one(con2, "SELECT count(*) FROM lake.t") == one(con, "SELECT count(*) FROM lake.t")
 
-# Full-text search: tantivy splits in pgvfs, built by the writer, searched by
-# any reader. Outside DATA_PATH, so DuckLake's cleanup leaves them alone.
-idx = f"{root}/fts/docs"
+# Tantivy search splits: one immutable file each, through DuckDB's filesystem,
+# so pgvfs:// (outside DATA_PATH, which DuckLake's cleanup owns) or anywhere.
+idx = f"{root}/fts/docs.tantivy"
 con.execute(
     "CREATE TABLE lake.docs AS SELECT * FROM (VALUES "
     "(1, 'The quick brown fox jumps over the lazy dog', 'Mühleisen'), "
@@ -166,8 +166,8 @@ assert sorted(json.loads(d)["_key"] for _, d in hits) == ["1", "2"], hits
 assert hits[0][0] >= hits[1][0]
 assert one(
     con,
-    f"SELECT d.id FROM tantivy_search('{idx}', '\"brown fox\"', '{{\"top_k\": 5}}') s "
-    "JOIN lake.docs d ON d.id = (s.doc->>'_key')::INTEGER",
+    f"""SELECT d.id FROM tantivy_search('{idx}', '"brown fox"', '{{"top_k": 5}}') s
+    JOIN lake.docs d ON d.id = (s.doc->>'_key')::INTEGER""",
 ) == (1,)
 assert con2.execute(f"SELECT count(*) FROM tantivy_search('{idx}', 'cats')").fetchone() == (2,)
 assert match(con2, "cat") == [2, 3]
@@ -176,16 +176,23 @@ try:
     con.execute(f"FROM tantivy_create_index('{idx}', 'lake.docs', 'id', ['body'])").fetchall()
     raise AssertionError("rebuilt a split in place")
 except duckdb.Error as e:
-    assert "already holds" in str(e), e
+    assert "already exists" in str(e), e
 assert con.execute(f"SELECT tantivy_drop('{idx}')").fetchall() == [(True,)]
 assert con.execute(f"SELECT tantivy_drop('{idx}')").fetchall() == [(False,)]
-assert one(con, f"SELECT count(*) FROM glob('{idx}/*')") == (0,)
+assert one(con, f"SELECT count(*) FROM glob('{idx}')") == (0,)
 assert one(con, f"FROM tantivy_create_index('{idx}', 'lake.docs', 'id', ['body'], stemmer := 'english')") == (3,)
 assert one(connect(), f"SELECT count(*) FROM tantivy_search('{idx}', 'fox')") == (1,)
 
-# Maintenance with DuckLake commits, all SQL: one split per range of
-# snapshots, listed in a lake table. A hit counts if its row still exists and
-# this split indexed its current version (rowid and snapshot_id are DuckLake's).
+# Any DuckDB filesystem: the same split on local disk.
+local = os.path.join(tempfile.mkdtemp(), "docs.tantivy")
+assert one(con, f"FROM tantivy_create_index('{local}', 'lake.docs', 'id', ['body'])") == (3,)
+assert os.path.getsize(local) > 0
+assert one(con, f"SELECT count(*) FROM tantivy_search('{local}', 'cats')") == (2,)
+assert one(con, f"SELECT tantivy_drop('{local}')") == (True,) and not os.path.exists(local)
+
+# Maintenance with DuckLake commits, all SQL: a split per range of snapshots,
+# listed in a lake table. A hit counts if its row still exists and the split
+# indexed its current version (rowid and snapshot_id are DuckLake's).
 splits = f"{root}/fts/splits"
 fts_schema = json.dumps([
     {"name": "rowid", "type": "i64", "options": {"stored": True, "indexed": True}},
@@ -211,9 +218,8 @@ def index_changes():
     con.execute("SET VARIABLE s1 = (SELECT id::BIGINT FROM lake.current_snapshot())")
     first = one(con, "SELECT getvariable('s0') IS NULL")[0]
     rows = "SELECT rowid, snapshot_id, * FROM lake.docs" if first else CHANGES
-    con.execute(
-        "INSERT INTO lake.docs_splits " + split_of(rows, "getvariable('s1')", f"'{splits}/' || getvariable('s1')")
-    )
+    path = f"'{splits}/' || getvariable('s1') || '.tantivy'"
+    con.execute("INSERT INTO lake.docs_splits " + split_of(rows, "getvariable('s1')", path))
 
 
 def search(c, query):
@@ -240,16 +246,16 @@ assert search(con, "fox") == [4]
 assert search(con, "longer") == [1]
 assert search(con2, "fox") == [4]
 assert one(con, "SELECT count(*), sum(docs) FROM lake.docs_splits") == (2, 5)
-# Compaction: one split for the whole range the others cover replaces them.
+# Compaction: one split for the range the others cover replaces them. (The
+# change feed for the range would do, had this lake not expired early
+# snapshots above.)
 con.execute("SET VARIABLE s1 = (SELECT max(snapshot) FROM lake.docs_splits)")
-# (The change feed for the range would do too, had this lake not expired
-# its early snapshots.)
 con.execute(
     "CREATE TEMP TABLE merged AS "
     + split_of(
         "SELECT rowid, snapshot_id, * FROM lake.docs WHERE snapshot_id <= getvariable('s1')",
         "getvariable('s1')",
-        f"'{splits}/0-' || getvariable('s1')",
+        f"'{splits}/0-' || getvariable('s1') || '.tantivy'",
     )
 )
 con.execute("CREATE TEMP TABLE replaced AS FROM lake.docs_splits")
@@ -259,28 +265,30 @@ con.execute("INSERT INTO lake.docs_splits FROM merged")
 con.execute("COMMIT")
 assert con.execute("SELECT bool_and(tantivy_drop(path)) FROM replaced").fetchall() == [(True,)]
 assert search(con, "fox") == [4] and search(con, "longer") == [1] and search(con, "cats") == [2]
-assert one(con, f"SELECT count(*) FROM glob('{splits}/*/*')")[0] > 0
-assert one(con, f"SELECT count(DISTINCT parse_dirpath(file)) FROM glob('{splits}/*/*')") == (1,)
+assert one(con, f"SELECT count(*) FROM glob('{splits}/*')") == (1,)
 
-# The primitive takes any rows: one split per group, tantivy's own schema.
 for sql, msg in [
-    (f"FROM tantivy_search('{root}/fts/missing', 'x')", "no tantivy index"),
-    (f"FROM tantivy_search('{idx}', 'nosuch:x', '{{\"strict\": true}}')", "nosuch"),
-    (f"FROM tantivy_search('{idx}', 'x', '{{\"limit\": 1}}')", "unknown field"),
-    (f"SELECT tantivy_index('{root}/fts/x' || id, {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t", "one split per group"),
-    (f"SELECT tantivy_index('{root}/fts/x', 'not json', '{{}}')", "schema"),
+    (f"FROM tantivy_search('{root}/fts/missing.tantivy', 'x')", "no tantivy split"),
+    (f"""FROM tantivy_search('{idx}', 'nosuch:x', '{{"strict": true}}')""", "nosuch"),
+    (f"""FROM tantivy_search('{idx}', 'x', '{{"limit": 1}}')""", "unknown field"),
+    (
+        f"SELECT tantivy_index('{root}/fts/x' || id || '.tantivy', {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t",
+        "one split per group",
+    ),
+    (f"SELECT tantivy_index('{root}/fts/x.tantivy', 'not json', '{{}}')", "schema"),
 ]:
     try:
         con.execute(sql).fetchall()
         raise AssertionError(f"succeeded: {sql}")
     except duckdb.Error as e:
         assert msg in str(e), (sql, e)
-assert one(con, f"SELECT count(*) FROM glob('{root}/fts/x*/*')") == (0,), "failed builds left files"
-try:  # only the writer builds
-    con2.execute(f"SELECT tantivy_index('{root}/fts/y', {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t")
-    raise AssertionError("a second process built an index")
+assert one(con, f"SELECT count(*) FROM glob('{root}/fts/x*')") == (0,), "failed builds left files"
+try:  # only the pgvfs writer writes to pgvfs
+    con2.execute(f"SELECT tantivy_index('{root}/fts/y.tantivy', {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t")
+    raise AssertionError("a second process wrote a split")
 except duckdb.Error as e:
     assert "writer" in str(e), e
+assert one(con, f"SELECT count(*) FROM glob('{root}/fts/y*')") == (0,)
 
 stats = json.loads(one(con, "SELECT pgvfs_stats()")[0])
 assert stats["reads"] > stats0["reads"] and stats["read_bytes"] > 0, stats

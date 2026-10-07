@@ -70,7 +70,9 @@ and pgvfs tables. Only one process writes. For remote PostgreSQL, add
 - [Loading data](https://pgvfs.adonm.dev/loading.html): lay out a lake for
   fast reads, load at scale, and keep it fast.
 - [Full-text search](https://pgvfs.adonm.dev/search.html): tantivy indexes
-  stored with the lake, built and searched from SQL.
+  built and searched from SQL, on pgvfs or any DuckDB filesystem.
+- [Vector search](https://pgvfs.adonm.dev/vectors.html): nearest neighbours
+  over a clustered lake, in plain SQL.
 - [How it works](https://pgvfs.adonm.dev/how-it-works.html): storage, one
   writer and many readers, credentials, configuration.
 - [Performance](https://pgvfs.adonm.dev/performance.html): benchmarks and

@@ -1,0 +1,20 @@
+[package]
+name = "duckdb-tantivy"
+version = "0.1.0"
+edition = "2021"
+description = "Tantivy full-text search splits for DuckDB, on any DuckDB filesystem"
+license = "Apache-2.0"
+repository = "https://github.com/adonm/pgvfs"
+
+[lib]
+name = "duckdb_tantivy"
+# Linked into the pgvfs staticlib (the DuckDB extension).
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# mmap: builds use tantivy's own directory in a local temporary one.
+# No zstd: a C build on every platform.
+tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "stemmer", "stopwords"] }
+tempfile = "3"

@@ -12,6 +12,7 @@ FROM rust:1-bookworm AS rust
 WORKDIR /src
 COPY Cargo.toml Cargo.lock schema.sql ./
 COPY src/ src/
+COPY tantivy/ tantivy/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --lib \
  && cp target/release/libpgvfs.a /libpgvfs.a

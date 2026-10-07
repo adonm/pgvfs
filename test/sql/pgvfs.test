@@ -22,17 +22,32 @@ SELECT * FROM 'pgvfs://lake/missing.parquet'
 ----
 pgvfs needs PostgreSQL credentials
 
+# Tantivy splits use any DuckDB filesystem; here, local files.
 query I
-SELECT count(DISTINCT function_name) FROM duckdb_functions() WHERE function_name LIKE 'tantivy\_%' ESCAPE '\'
+SELECT tantivy_index('__TEST_DIR__/docs.tantivy',
+    '[{"name": "id", "type": "i64", "options": {"stored": true, "indexed": true}},
+      {"name": "body", "type": "text", "options": {"indexing": {"record": "position", "tokenizer": "en_stem"}}}]',
+    to_json(t))
+FROM (VALUES (1, 'quick brown foxes'), (2, 'lazy cats')) t(id, body)
 ----
-5
+2
+
+query II
+SELECT score > 0, (doc->>'id')::INTEGER FROM tantivy_search('__TEST_DIR__/docs.tantivy', 'fox')
+----
+true	1
 
 statement error
-FROM tantivy_search('pgvfs://lake/fts', 'cats')
+SELECT tantivy_index('__TEST_DIR__/docs.tantivy', '[]', '{}')
 ----
-pgvfs needs PostgreSQL credentials
+already exists
+
+query I
+SELECT tantivy_drop('__TEST_DIR__/docs.tantivy')
+----
+true
 
 statement error
-SELECT tantivy_drop('pgvfs://lake/fts')
+FROM tantivy_search('__TEST_DIR__/docs.tantivy', 'fox')
 ----
-pgvfs needs PostgreSQL credentials
+no tantivy split

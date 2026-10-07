@@ -393,6 +393,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 
 [[package]]
+name = "duckdb-tantivy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tantivy",
+ "tempfile",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,6 +477,16 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "fs4"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
+dependencies = [
+ "rustix",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "futures"
@@ -739,6 +760,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -876,14 +906,11 @@ dependencies = [
  "anyhow",
  "bytes",
  "deadpool-postgres",
+ "duckdb-tantivy",
  "futures",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
- "serde",
- "serde_json",
- "tantivy",
- "tempfile",
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
@@ -1377,6 +1404,7 @@ dependencies = [
  "downcast-rs",
  "fastdivide",
  "fnv",
+ "fs4",
  "htmlescape",
  "itertools",
  "levenshtein_automata",
@@ -1384,6 +1412,7 @@ dependencies = [
  "lru",
  "lz4_flex",
  "measure_time",
+ "memmap2",
  "once_cell",
  "oneshot",
  "rayon",
@@ -1401,6 +1430,7 @@ dependencies = [
  "tantivy-query-grammar",
  "tantivy-stacker",
  "tantivy-tokenizer-api",
+ "tempfile",
  "thiserror",
  "time",
  "typetag",
@@ -1934,6 +1964,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]

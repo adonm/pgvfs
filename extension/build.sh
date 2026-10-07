@@ -26,7 +26,7 @@ fi
 # exported, so this copy of DuckDB never interposes on the host's.
 g++ -std=c++17 -O2 -fPIC -DNDEBUG -DDUCKDB_BUILD_LOADABLE_EXTENSION -fvisibility=hidden -shared \
   -I"$src/src/include" -I"$src/third_party/utf8proc/include" -I"$here/src/include" \
-  "$here/src/pgvfs_extension.cpp" "${loader[@]}" \
+  "$here/src/pgvfs_extension.cpp" "$here/src/tantivy_functions.cpp" "${loader[@]}" \
   -o "$work/pgvfs.duckdb_extension" \
   -Wl,--start-group "$libs"/libduckdb_*.a -Wl,--end-group "$rust" \
   -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,--no-undefined -lgcc_s -lutil -lrt -lpthread -lm -ldl

@@ -6,9 +6,9 @@ default:
 
 # fmt, clippy and unit tests (no database).
 check:
-    cargo fmt --check
-    cargo clippy --locked --all-targets -- -D warnings
-    cargo test --locked
+    cargo fmt --all --check
+    cargo clippy --locked --workspace --all-targets -- -D warnings
+    cargo test --locked --workspace
 
 # The DuckDB extension, built in a container -> target/ext/<TARGET>/:
 # `release` (pinned stable) or `nightly [WHEEL]` (a 2.0 dev wheel, default newest).
