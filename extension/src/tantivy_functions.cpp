@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 
@@ -60,7 +61,10 @@ using ColumnNames = vector<string>;
 
 void SetRows(DataChunk &chunk, idx_t count) {
 #ifdef PGVFS_DUCKDB_V2
-	chunk.SetCardinalityUnsafe(count); // child vectors were written in place
+	// The vectors were written in place: give them their size too, which DuckDB
+	// does only for an in-out function run by a join, not one run as a scan.
+	chunk.SetCardinalityUnsafe(count);
+	chunk.SetChildCardinality(count);
 #else
 	chunk.SetCardinality(count);
 #endif
@@ -496,10 +500,11 @@ void IndexSimpleUpdate(Vector inputs[], AggregateInputData &input, idx_t input_c
 
 // tantivy_search(index, query [, options [, exclude]]): a query in tantivy's
 // syntax, or OpenSearch query DSL (JSON), over a split or a list of them;
-// per hit, best first across them, (score, doc, path). An in-out function,
-// so arguments may be columns: FROM splits s CROSS JOIN tantivy_search(s.path,
-// 'cats') searches each split listed. (In-out functions take no named
-// parameters, hence options as JSON.)
+// per hit, best first across them, (score, doc, path, highlight): the score is
+// NULL when the hits are ordered by a field, the highlight when none was asked
+// for. An in-out function, so arguments may be columns: FROM splits s CROSS
+// JOIN tantivy_search(s.path, 'cats') searches each split listed. (In-out
+// functions take no named parameters, hence options as JSON.)
 struct SearchBindData : public TableFunctionData {};
 
 struct SearchState : public LocalTableFunctionState {
@@ -507,6 +512,8 @@ struct SearchState : public LocalTableFunctionState {
 		idx_t split;
 		double score;
 		string doc;
+		bool has_highlight;
+		string highlight;
 	};
 	idx_t row = 0;
 	bool searched = false;
@@ -515,14 +522,16 @@ struct SearchState : public LocalTableFunctionState {
 	idx_t next = 0;
 };
 
-void CollectHit(void *ctx, size_t split, double score, const char *doc, size_t len) {
-	static_cast<SearchState *>(ctx)->hits.push_back({split, score, string(doc, len)});
+void CollectHit(void *ctx, size_t split, double score, const char *doc, size_t len, const char *highlight,
+                size_t highlight_len) {
+	static_cast<SearchState *>(ctx)->hits.push_back({split, score, string(doc, len), highlight != nullptr,
+	                                                 highlight ? string(highlight, highlight_len) : string()});
 }
 
 unique_ptr<FunctionData> SearchBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &types,
                                     ColumnNames &names) {
-	types = {LogicalType::DOUBLE, LogicalType::JSON(), LogicalType::VARCHAR};
-	names = {"score", "doc", "path"};
+	types = {LogicalType::DOUBLE, LogicalType::JSON(), LogicalType::VARCHAR, LogicalType::JSON()};
+	names = {"score", "doc", "path", "highlight"};
 	return make_uniq<SearchBindData>();
 }
 
@@ -563,12 +572,21 @@ OperatorResultType SearchInOut(ExecutionContext &context, TableFunctionInput &da
 			auto scores = MutableData<double>(output.data[0]);
 			auto docs = MutableData<string_t>(output.data[1]);
 			auto paths = MutableData<string_t>(output.data[2]);
+			auto highlights = MutableData<string_t>(output.data[3]);
 			idx_t n = 0;
 			for (; n < STANDARD_VECTOR_SIZE && state.next < state.hits.size(); n++, state.next++) {
 				auto &hit = state.hits[state.next];
 				scores[n] = hit.score;
+				if (std::isnan(hit.score)) {
+					FlatVector::SetNull(output.data[0], n, true);
+				}
 				docs[n] = StringVector::AddString(output.data[1], hit.doc);
 				paths[n] = StringVector::AddString(output.data[2], state.paths[hit.split]);
+				if (hit.has_highlight) {
+					highlights[n] = StringVector::AddString(output.data[3], hit.highlight);
+				} else {
+					FlatVector::SetNull(output.data[3], n, true);
+				}
 			}
 			SetRows(output, n);
 			return OperatorResultType::HAVE_MORE_OUTPUT;

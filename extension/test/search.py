@@ -181,6 +181,117 @@ def check_new_options(con, root):
     con.execute("DROP TABLE fts_roofs").fetchall()
 
 
+def check_sort_highlight(con, root):
+    """Ordering by a fast field, snippets, and more-like-this."""
+
+    def one(sql, *args):
+        return con.execute(sql, args).fetchone()
+
+    def fails(sql, message, *args):
+        try:
+            con.execute(sql, args).fetchall()
+            raise AssertionError("succeeded: " + sql)
+        except duckdb.Error as e:
+            assert message in str(e), (sql, str(e))
+
+    root = root.rstrip("/")
+    schema = json.dumps(
+        [
+            {"name": "id", "type": "i64", "options": {"stored": True, "indexed": True, "fast": True}},
+            {"name": "price", "type": "f64", "options": {"stored": True, "indexed": False, "fast": True}},
+            {
+                "name": "name",
+                "type": "text",
+                "options": {"fast": True, "indexing": {"record": "basic", "tokenizer": "raw"}},
+            },
+            {
+                "name": "body",
+                "type": "text",
+                "options": {"stored": True, "indexing": {"record": "position", "tokenizer": "default"}},
+            },
+        ]
+    )
+    con.execute(
+        """CREATE OR REPLACE TEMP TABLE fts_goods AS SELECT i AS id,
+        CASE WHEN i % 10 = 0 THEN NULL ELSE (i * 37 % 101)::DOUBLE END AS price,
+        'n' || lpad((i * 13 % 50)::VARCHAR, 2, '0') AS name,
+        CASE WHEN i % 4 = 0 THEN 'slate roof <b> & tile' ELSE 'plain wall' END AS body FROM range(100) t(i)"""
+    ).fetchall()
+    paths = [f"{root}/sort{k}.tantivy" for k in range(2)]
+    for k, path in enumerate(paths):
+        assert one(f"SELECT tantivy_index({sql_text(path)}, ?, t) FROM fts_goods t WHERE id % 2 = {k}", schema) == (50,)
+    lst = "[" + ", ".join(map(sql_text, paths)) + "]"
+    rows = lambda q, o: con.execute(f"SELECT score, doc, highlight FROM tantivy_search({lst}, ?, ?)", [q, o]).fetchall()
+    ids = lambda rs: [json.loads(r[1])["id"] for r in rs]
+
+    # Hits ordered by a field, across both splits, missing values last; no score.
+    goods = {r[0]: r[1] for r in con.execute("SELECT id, price FROM fts_goods").fetchall()}
+    wanted = [i for i in range(100) if i % 4 == 0]
+    for order in ("asc", "desc"):
+        got = rows("roof", json.dumps({"fast": ["id"], "sort": {"field": "price", "order": order}}))
+        assert all(r[0] is None for r in got), got[:2]
+        assert sorted(ids(got)) == wanted
+        prices = [goods[i] for i in ids(got)]
+        present = [p for p in prices if p is not None]
+        assert prices[: len(present)] == present and all(p is None for p in prices[len(present) :]), prices
+        assert present == sorted(present, reverse=order == "desc"), present
+    named = rows("roof", json.dumps({"fast": ["id", "name"], "sort": "name", "top_k": 5, "offset": 3}))
+    every = rows("roof", json.dumps({"fast": ["id", "name"], "sort": "name"}))
+    assert ids(named) == ids(every)[3:8]
+    assert rows("roof", json.dumps({"fast": ["id"]}))[0][0] > 0  # unsorted hits are scored
+    fails(f"SELECT * FROM tantivy_search({lst}, 'roof', '{{\"sort\": \"body\"}}')", "not a fast field")
+    fails(
+        f'SELECT * FROM tantivy_search({lst}, \'roof\', \'{{"sort": "id", "collapse": "name"}}\')', "cannot be combined"
+    )
+    fails(f"SELECT tantivy_count({lst}, 'roof', '{{\"sort\": \"id\"}}')", "options of tantivy_search")
+
+    # Snippets of a stored text field: escaped, the match marked, NULL unless asked for.
+    got = rows("roof", json.dumps({"fast": ["id"], "highlight": {"fields": ["body"]}}))
+    assert len(got) == len(wanted) and all(
+        json.loads(r[2]) == {"body": "slate <b>roof</b> &lt;b&gt; &amp; tile"} for r in got
+    ), got[:1]
+    assert all(r[2] is None for r in rows("roof", json.dumps({"fast": ["id"]})))
+    wall = rows("wall", json.dumps({"highlight": {"fields": ["body"]}}))
+    assert len(wall) == 75 and all(json.loads(r[2]) == {"body": "plain <b>wall</b>"} for r in wall)
+    # A match elsewhere than the field leaves it out: an empty object, not NULL.
+    by_id = rows(json.dumps({"term": {"id": 3}}), json.dumps({"highlight": {"fields": ["body"]}}))
+    assert [r[2] for r in by_id] == ["{}"], by_id
+    fails(
+        f'SELECT * FROM tantivy_search({lst}, \'roof\', \'{{"highlight": {{"fields": ["price"]}}}}\')',
+        "not a stored text field",
+    )
+
+    # A join on the key of a hit, over an index made by tantivy_create_index: DuckDB 2.0
+    # needs the output vectors' sizes set, or a hash join on the key finds nothing.
+    con.execute(
+        "CREATE OR REPLACE TABLE fts_trio AS SELECT * FROM (VALUES (1, 'quick brown fox'), (2, 'small cats'), "
+        "(3, 'cafe for cats')) v(id, body)"
+    ).fetchall()
+    keyed = f"{root}/keyed.tantivy"
+    assert one(f"FROM tantivy_create_index({sql_text(keyed)}, 'fts_trio', 'id', ['body'])") == (3,)
+    for query, found in (("fox OR cats", 3), ('"brown fox"', 1), ("cats", 2)):
+        joined = one(
+            f"SELECT count(*) FROM tantivy_search({sql_text(keyed)}, '{query}') s "
+            "JOIN fts_trio t ON t.id = (s.doc->>'_key')::INTEGER"
+        )
+        assert joined == (found,), (query, joined)
+    assert one(f"SELECT tantivy_drop({sql_text(keyed)})") == (True,)
+    con.execute("DROP TABLE fts_trio").fetchall()
+
+    # More like this: a text, not a document of the index.
+    like = lambda extra={}: json.dumps(
+        {"more_like_this": {"like": "slate roof", "fields": ["body"], "min_term_freq": 1, "min_doc_freq": 1, **extra}}
+    )
+    count = lambda q: one(f"SELECT tantivy_count({lst}, ?)", q)[0]
+    assert count(like()) == len(wanted)
+    assert count(like({"stop_words": ["slate", "roof"]})) == 0
+    assert count(like({"min_doc_freq": 1000})) == 0
+    fails(f"SELECT tantivy_count({lst}, ?)", "needs `like`", json.dumps({"more_like_this": {"fields": ["body"]}}))
+    for path in paths:
+        assert one(f"SELECT tantivy_drop({sql_text(path)})") == (True,)
+    con.execute("DROP TABLE fts_goods").fetchall()
+
+
 def check_search(con, root):
     def one(sql, *args):
         return con.execute(sql, args).fetchone()
@@ -194,6 +305,7 @@ def check_search(con, root):
 
     check_parallel_failures(con, root)
     check_new_options(con, root)
+    check_sort_highlight(con, root)
     root = root.rstrip("/")
     schema = json.dumps(
         [

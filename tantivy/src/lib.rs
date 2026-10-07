@@ -45,8 +45,15 @@ pub type WriteCb = extern "C" fn(
     msg: *mut c_char,
     cap: usize,
 ) -> c_int;
-pub type HitCb =
-    extern "C" fn(ctx: *mut c_void, split: usize, score: f64, doc: *const c_char, len: usize);
+pub type HitCb = extern "C" fn(
+    ctx: *mut c_void,
+    split: usize,
+    score: f64,
+    doc: *const c_char,
+    len: usize,
+    highlight: *const c_char,
+    highlight_len: usize,
+);
 
 const MSG_CAP: usize = 1024;
 
@@ -246,8 +253,9 @@ pub unsafe extern "C" fn tantivy_split_close(s: *mut Split) {
 
 /// Search `n` splits with a query (tantivy's syntax, or OpenSearch query DSL
 /// as JSON); `options` (may be NULL) is search options as JSON. Calls `cb` per
-/// hit, best first: its split's position, score, and doc as a JSON object.
-/// 0 ok, -1 error.
+/// hit, best first: its split's position, score (NaN when the hits are ordered
+/// by a field), doc as a JSON object and, if asked for, its snippets as a JSON
+/// object (NULL otherwise). 0 ok, -1 error.
 #[no_mangle]
 pub unsafe extern "C" fn tantivy_search(
     s: *const *const Split,
@@ -267,8 +275,20 @@ pub unsafe extern "C" fn tantivy_search(
         let exclude = exclude(exclude_kind, exclude_data, exclude_len)?;
         let request = Request::new(&splits, text(query)?, text(options)?, exclude.as_ref())?
             .with_threads(threads);
-        for (split, score, doc) in request.hits()? {
-            cb(ctx, split, score as f64, doc.as_ptr().cast(), doc.len());
+        for hit in request.hits()? {
+            let (highlight, highlight_len) = match &hit.highlight {
+                Some(snippets) => (snippets.as_ptr().cast(), snippets.len()),
+                None => (std::ptr::null(), 0),
+            };
+            cb(
+                ctx,
+                hit.split,
+                hit.score as f64,
+                hit.doc.as_ptr().cast(),
+                hit.doc.len(),
+                highlight,
+                highlight_len,
+            );
         }
         Ok(0)
     })

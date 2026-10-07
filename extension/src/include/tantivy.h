@@ -25,7 +25,13 @@ typedef int (*tantivy_read_cb)(void *ctx,
                                char *msg,
                                size_t cap);
 
-typedef void (*tantivy_hit_cb)(void *ctx, size_t split, double score, const char *doc, size_t len);
+typedef void (*tantivy_hit_cb)(void *ctx,
+                               size_t split,
+                               double score,
+                               const char *doc,
+                               size_t len,
+                               const char *highlight,
+                               size_t highlight_len);
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,8 +72,9 @@ void tantivy_split_close(TantivySplit *s);
 /*
  Search `n` splits with a query (tantivy's syntax, or OpenSearch query DSL
  as JSON); `options` (may be NULL) is search options as JSON. Calls `cb` per
- hit, best first: its split's position, score, and doc as a JSON object.
- 0 ok, -1 error.
+ hit, best first: its split's position, score (NaN when the hits are ordered
+ by a field), doc as a JSON object and, if asked for, its snippets as a JSON
+ object (NULL otherwise). 0 ok, -1 error.
  */
 int tantivy_search(const TantivySplit *const *s,
                    size_t n,

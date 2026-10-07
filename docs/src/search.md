@@ -281,9 +281,10 @@ once. On a tmpfs (often `/tmp`) that is memory too, so point `TMPDIR` at a disk.
 ### `tantivy_search(index, query [, options [, exclude]])`
 
 Searches a path (`VARCHAR`) or a list of paths (`VARCHAR[]`). Returns
-`score DOUBLE`, `doc JSON`, and the hit's split `path VARCHAR` per hit,
-best first; `doc` holds the hit's stored fields, a value each or an array for
-several. All arguments may be columns, so a lateral join searches every split
+`score DOUBLE`, `doc JSON`, the hit's split `path VARCHAR` and
+`highlight JSON` per hit, best first; `doc` holds the hit's stored fields, a
+value each or an array for several. `score` is `NULL` when the hits are ordered
+by a field (`sort`), `highlight` unless asked for (`highlight`). All arguments may be columns, so a lateral join searches every split
 in a table (`FROM splits s CROSS JOIN tantivy_search(s.path, ...)`), or runs a
 query per row. A `NULL` index or query finds nothing. The query uses
 tantivy's
@@ -297,6 +298,8 @@ ranges such as `id:[10 TO 20]`. A query starting with `{` is instead
 | `top_k` | every hit | hits to return across the whole list of splits; use a bound on large indexes |
 | `offset` | `0` | hits to skip before `top_k`, across all the splits. Documents are read only for the hits returned, so a deep page costs its scoring, not its position |
 | `collapse` | none | return only the best hit of each distinct value of this fast field (text, number, boolean or date; one value per document), best first. `top_k` and `offset` then count values. Documents without a value form one group |
+| `sort` | by score | order by a fast field instead: a number, a date or text, as `"price"` (ascending) or `{"field": "price", "order": "desc"}`. Documents without a value come last either way; `score` is `NULL`. Applies across all the splits (they must agree on the field's type), with `top_k` and `offset`; not with `collapse` |
+| `highlight` | none | `{"fields": ["body"], "max_chars": 150}`: for these stored text fields, an HTML snippet of where the query's terms match, as a JSON object by field in the `highlight` column (`<b>` marks the match, the rest is escaped; a field the query does not match is left out). Replace the tag in SQL for another |
 | `fields` | every indexed text field | the fields to search for terms that name none |
 | `conjunctive` | `false` | every term must match |
 | `strict` | `false` | fail on query syntax errors instead of dropping what tantivy cannot parse |
@@ -415,6 +418,7 @@ Unsupported query types and parameters fail rather than being silently ignored:
 | `term`, `terms` | exact typed values, without analysis; `term` takes `case_insensitive` for text |
 | `prefix`, `wildcard`, `regexp` | text `value`, `case_insensitive`; wildcard `*`, `?`, `\` escapes; a regular expression matches a whole term |
 | `fuzzy` | text `value`, `fuzziness`, `transpositions` |
+| `more_like_this` | `like`: a text or a list of texts (not a document of the index: read its text with SQL and pass that); `fields` (text fields; default all), `min_term_freq`, `max_query_terms`, `min_doc_freq`, `max_doc_freq`, `min_word_length`, `max_word_length`, `boost_terms`, `stop_words` (compared with the analyzed term: `cat`, where the index stems) |
 | `exists` | `field`: a fast field, or an indexed text field (slower: any term in its dictionary), or a JSON field (any path in it) |
 | `range` | `gt`, `gte`, `lt`, `lte` |
 | `constant_score`, `dis_max` | `filter`; `queries` and `tie_breaker`, respectively |
@@ -443,6 +447,9 @@ are not analyzed, as in OpenSearch: on a field whose tokenizer lowercases,
 `{"prefix": {"title": "Big"}}` finds nothing. `case_insensitive: true` matches
 the indexed terms in any case. The value of a `prefix` or a case-insensitive
 `term` is literal; in `regexp` it is an expression.
+
+**What is not here.** Tantivy's `tweak_score` takes code, which JSON cannot
+carry: re-rank in SQL, over `score` and the fast fields `fast` projects.
 
 **Missing fields.** A field the schema lacks is an error, so a typo cannot
 quietly match nothing. `ignore_unmapped` (a search option) makes it match

@@ -43,6 +43,9 @@ Storage layout: **v2** (unchanged).
   fields (the path's strings only; the path-skipping automaton is adapted from
   Quickwit, Apache-2.0), and `case_insensitive` on `term`, `prefix`, `wildcard`
   and `regexp`.
+- `tantivy_search`: `sort` by a fast field (numbers, dates, text; missing values
+  last; `score` is `NULL`), and `highlight` (a fourth column: HTML snippets of
+  stored text fields). Query DSL: `more_like_this` for a text.
 - `bench/search.py` and `bench/index_memory.py`: timings, compaction cost and
   build memory (documented with `memory_budget`; a `TMPDIR` on a tmpfs counts
   as memory).

@@ -11,6 +11,7 @@
 //! scoring skips dead documents and `top_k`, counts and aggregations never
 //! see them.
 
+use std::cmp::Ordering as Cmp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -34,9 +35,10 @@ use tantivy::query::{
     Weight,
 };
 use tantivy::schema::{Field, FieldType, Schema};
+use tantivy::snippet::SnippetGenerator;
 use tantivy::{
-    f64_to_u64, i64_to_u64, u64_to_i64, DateTime, DocAddress, DocId, DocSet, Document, Score,
-    Searcher, SegmentOrdinal, SegmentReader, TantivyDocument, Term, TERMINATED,
+    f64_to_u64, i64_to_u64, u64_to_i64, DateTime, DocAddress, DocId, DocSet, Document, Order,
+    Score, Searcher, SegmentOrdinal, SegmentReader, TantivyDocument, Term, TERMINATED,
 };
 use tantivy_common::BitSet;
 
@@ -58,6 +60,10 @@ pub(crate) struct SearchOptions {
     distinct: Option<String>,
     /// Hits only: the best hit of each distinct value of this fast field.
     collapse: Option<String>,
+    /// Hits only: order by a fast field (numbers, dates, text), not by score.
+    sort: Option<SortSpec>,
+    /// Hits only: HTML snippets of stored text fields, as the query matches them.
+    highlight: Option<HighlightSpec>,
     /// The default fields for query-string terms that name none.
     fields: Option<Vec<String>>,
     #[serde(default)]
@@ -74,6 +80,54 @@ pub(crate) struct SearchOptions {
     /// In OpenSearch query DSL, a field a split lacks matches nothing.
     #[serde(default)]
     ignore_unmapped: bool,
+}
+
+/// `"price"` (ascending), or `{"field": "price", "order": "desc"}`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SortSpec {
+    Field(String),
+    By(SortBy),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SortBy {
+    field: String,
+    #[serde(default)]
+    order: SortOrder,
+}
+
+#[derive(Deserialize, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum SortOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl SortSpec {
+    fn field(&self) -> &str {
+        match self {
+            SortSpec::Field(field) => field,
+            SortSpec::By(by) => &by.field,
+        }
+    }
+
+    fn order(&self) -> SortOrder {
+        match self {
+            SortSpec::Field(_) => SortOrder::Asc,
+            SortSpec::By(by) => by.order,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HighlightSpec {
+    fields: Vec<String>,
+    /// The longest snippet (default: tantivy's 150).
+    max_chars: Option<usize>,
 }
 
 /// Values of a fast field whose documents to leave out.
@@ -445,6 +499,154 @@ fn par_map<T: Send>(
         .collect()
 }
 
+/// What a sort field holds: the types tantivy sorts by.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SortKind {
+    I64,
+    U64,
+    F64,
+    Date,
+    Str,
+}
+
+fn sort_kind(schema: &Schema, name: &str) -> Result<SortKind> {
+    let field = schema
+        .get_field(name)
+        .map_err(|_| anyhow!("sort: no field {name:?}"))?;
+    let entry = schema.get_field_entry(field);
+    ensure!(entry.is_fast(), "sort: {name:?} is not a fast field");
+    Ok(match entry.field_type() {
+        FieldType::I64(_) => SortKind::I64,
+        FieldType::U64(_) => SortKind::U64,
+        FieldType::F64(_) => SortKind::F64,
+        FieldType::Date(_) => SortKind::Date,
+        FieldType::Str(_) => SortKind::Str,
+        _ => bail!("sort: {name:?} is not a number, a date or text"),
+    })
+}
+
+/// A hit's value of the sort field; a document without one sorts last.
+#[derive(Clone, Debug)]
+enum SortKey {
+    I64(Option<i64>),
+    U64(Option<u64>),
+    F64(Option<f64>),
+    Date(Option<DateTime>),
+    Str(Option<String>),
+}
+
+fn compare<T: PartialOrd>(a: &Option<T>, b: &Option<T>, order: SortOrder) -> Cmp {
+    match (a, b) {
+        (None, None) => Cmp::Equal,
+        (None, Some(_)) => Cmp::Greater,
+        (Some(_), None) => Cmp::Less,
+        (Some(a), Some(b)) => {
+            let by = a.partial_cmp(b).unwrap_or(Cmp::Equal);
+            if order == SortOrder::Desc {
+                by.reverse()
+            } else {
+                by
+            }
+        }
+    }
+}
+
+impl SortKey {
+    fn compare(&self, other: &SortKey, order: SortOrder) -> Cmp {
+        match (self, other) {
+            (SortKey::I64(a), SortKey::I64(b)) => compare(a, b, order),
+            (SortKey::U64(a), SortKey::U64(b)) => compare(a, b, order),
+            (SortKey::F64(a), SortKey::F64(b)) => compare(a, b, order),
+            (SortKey::Date(a), SortKey::Date(b)) => compare(a, b, order),
+            (SortKey::Str(a), SortKey::Str(b)) => compare(a, b, order),
+            _ => Cmp::Equal, // one type across splits is checked up front
+        }
+    }
+}
+
+/// The `k` best documents of a run by a fast field.
+fn sorted(
+    run: &Run,
+    query: &dyn Query,
+    stats: Stats,
+    spec: &SortSpec,
+    k: usize,
+) -> Result<Vec<(SortKey, DocAddress)>> {
+    let order = match spec.order() {
+        SortOrder::Asc => Order::Asc,
+        SortOrder::Desc => Order::Desc,
+    };
+    let field = spec.field();
+    let top = TopDocs::with_limit(k);
+    Ok(match sort_kind(run.searcher.schema(), field)? {
+        SortKind::I64 => collect(
+            run,
+            query,
+            &top.order_by_fast_field::<i64>(field, order),
+            stats,
+        )?
+        .into_iter()
+        .map(|(v, a)| (SortKey::I64(v), a))
+        .collect(),
+        SortKind::U64 => collect(
+            run,
+            query,
+            &top.order_by_fast_field::<u64>(field, order),
+            stats,
+        )?
+        .into_iter()
+        .map(|(v, a)| (SortKey::U64(v), a))
+        .collect(),
+        SortKind::F64 => collect(
+            run,
+            query,
+            &top.order_by_fast_field::<f64>(field, order),
+            stats,
+        )?
+        .into_iter()
+        .map(|(v, a)| (SortKey::F64(v), a))
+        .collect(),
+        SortKind::Date => collect(
+            run,
+            query,
+            &top.order_by_fast_field::<DateTime>(field, order),
+            stats,
+        )?
+        .into_iter()
+        .map(|(v, a)| (SortKey::Date(v), a))
+        .collect(),
+        SortKind::Str => collect(
+            run,
+            query,
+            &top.order_by_string_fast_field(field, order),
+            stats,
+        )?
+        .into_iter()
+        .map(|(v, a)| (SortKey::Str(v), a))
+        .collect(),
+    })
+}
+
+/// A hit: the position of its split in the list, its score (NaN when hits are
+/// ordered by a field), its document as a JSON object, and its snippets.
+#[derive(Clone, Debug)]
+pub struct Hit {
+    pub split: usize,
+    pub score: Score,
+    pub doc: String,
+    pub highlight: Option<String>,
+}
+
+impl PartialEq for Hit {
+    fn eq(&self, other: &Hit) -> bool {
+        // Bit for bit, so that NaN scores of two equal searches are equal.
+        self.split == other.split
+            && self.score.to_bits() == other.score.to_bits()
+            && self.doc == other.doc
+            && self.highlight == other.highlight
+    }
+}
+
 /// A search request over some splits.
 pub struct Request<'a> {
     splits: &'a [&'a Split],
@@ -455,7 +657,14 @@ pub struct Request<'a> {
     threads: usize,
 }
 
-type Found = (Score, usize, DocAddress, Option<Key>);
+/// A hit before its document is read.
+struct Found {
+    score: Score,
+    split: usize,
+    addr: DocAddress,
+    key: Option<Key>,
+    sort: Option<SortKey>,
+}
 
 impl<'a> Request<'a> {
     pub fn new(
@@ -488,6 +697,38 @@ impl<'a> Request<'a> {
                             && (path.is_empty()
                                 || matches!(entry.field_type(), FieldType::JsonObject(_))),
                         "{name:?} is not a fast field"
+                    );
+                }
+            }
+        }
+        if let Some(sort) = &options.sort {
+            ensure!(
+                options.collapse.is_none(),
+                "sort and collapse cannot be combined"
+            );
+            let mut kind = None;
+            for split in splits {
+                let this = sort_kind(&split.index.schema(), sort.field())?;
+                ensure!(
+                    kind.is_none_or(|k| k == this),
+                    "sort: {:?} has different types in the splits",
+                    sort.field()
+                );
+                kind = Some(this);
+            }
+        }
+        if let Some(highlight) = &options.highlight {
+            ensure!(!highlight.fields.is_empty(), "highlight needs fields");
+            for split in splits {
+                let schema = split.index.schema();
+                for name in &highlight.fields {
+                    let field = schema
+                        .get_field(name)
+                        .map_err(|_| anyhow!("highlight: no field {name:?}"))?;
+                    let entry = schema.get_field_entry(field);
+                    ensure!(
+                        matches!(entry.field_type(), FieldType::Str(_)) && entry.is_stored(),
+                        "highlight: {name:?} is not a stored text field"
                     );
                 }
             }
@@ -537,7 +778,7 @@ impl<'a> Request<'a> {
     }
 
     /// Hits, best first: (split, score, doc as a JSON object).
-    pub fn hits(&self) -> Result<Vec<(usize, Score, String)>> {
+    pub fn hits(&self) -> Result<Vec<Hit>> {
         let o = &self.options;
         ensure!(
             o.limit.is_none() && o.distinct.is_none(),
@@ -545,36 +786,46 @@ impl<'a> Request<'a> {
         );
         let want = o.top_k.map(|k| o.offset.saturating_add(k));
         let per_split = self.each(|i, run, q, stats| {
-            let hits: Vec<(Score, DocAddress, Option<Key>)> = match (&o.collapse, want) {
-                (_, Some(0)) => Vec::new(),
-                (Some(field), _) => {
+            let found = |score, addr, key, sort| Found {
+                score,
+                split: i,
+                addr,
+                key,
+                sort,
+            };
+            Ok(match (&o.sort, &o.collapse, want) {
+                (_, _, Some(0)) => Vec::new(),
+                (Some(sort), _, _) => {
+                    let k = want.unwrap_or(usize::MAX).min(run.num_docs() as usize);
+                    sorted(run, q, stats, sort, k.max(1))?
+                        .into_iter()
+                        .map(|(key, addr)| found(Score::NAN, addr, None, Some(key)))
+                        .collect()
+                }
+                (None, Some(field), _) => {
                     let collapse = Collapse {
                         field: field.clone(),
                         groups: want.unwrap_or(usize::MAX),
                     };
                     collect(run, q, &collapse, stats)?
                         .into_iter()
-                        .map(|(score, key, addr)| (score, addr, Some(key)))
+                        .map(|(score, key, addr)| found(score, addr, Some(key), None))
                         .collect()
                 }
                 // TopDocs allocates for k: no more than the split holds.
-                (None, Some(k)) => {
+                (None, None, Some(k)) => {
                     let k = k.min(run.num_docs() as usize).max(1);
                     let top = TopDocs::with_limit(k).order_by_score();
                     collect(run, q, &top, stats)?
                         .into_iter()
-                        .map(|(score, addr)| (score, addr, None))
+                        .map(|(score, addr)| found(score, addr, None, None))
                         .collect()
                 }
-                (None, None) => collect(run, q, &AllHits, stats)?
+                (None, None, None) => collect(run, q, &AllHits, stats)?
                     .into_iter()
-                    .map(|(score, addr)| (score, addr, None))
+                    .map(|(score, addr)| found(score, addr, None, None))
                     .collect(),
-            };
-            Ok(hits
-                .into_iter()
-                .map(|(score, addr, key)| (score, i, addr, key))
-                .collect::<Vec<Found>>())
+            })
         })?;
         let mut found: Vec<Found> = per_split.into_iter().flatten().collect();
         if o.collapse.is_some() {
@@ -582,9 +833,9 @@ impl<'a> Request<'a> {
             let mut best: HashMap<Key, usize> = HashMap::new();
             let mut groups: Vec<Found> = Vec::new();
             for hit in found {
-                let key = hit.3.clone().unwrap_or(Key::Missing);
+                let key = hit.key.clone().unwrap_or(Key::Missing);
                 match best.get(&key) {
-                    Some(&at) if groups[at].0 >= hit.0 => {}
+                    Some(&at) if groups[at].score >= hit.score => {}
                     Some(&at) => groups[at] = hit,
                     None => {
                         best.insert(key, groups.len());
@@ -594,7 +845,14 @@ impl<'a> Request<'a> {
             }
             found = groups;
         }
-        found.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // Equal hits stay in split order, then the order a split gave them.
+        match &o.sort {
+            Some(sort) => found.sort_by(|a, b| match (&a.sort, &b.sort) {
+                (Some(a), Some(b)) => a.compare(b, sort.order()),
+                _ => Cmp::Equal,
+            }),
+            None => found.sort_by(|a, b| b.score.total_cmp(&a.score)),
+        }
         let found: Vec<Found> = found
             .into_iter()
             .skip(o.offset)
@@ -603,17 +861,28 @@ impl<'a> Request<'a> {
         // Documents, only for the hits kept, a split at a time.
         let mut positions: Vec<Vec<usize>> = vec![Vec::new(); self.splits.len()];
         for (at, hit) in found.iter().enumerate() {
-            positions[hit.1].push(at);
+            positions[hit.split].push(at);
         }
         let docs = par_map(self.splits.len(), self.threads, |i| {
             let searcher = &self.searchers[i];
+            let schema = self.splits[i].index.schema();
+            let snippets = match &o.highlight {
+                Some(spec) => Some(self.snippet_generators(i, spec)?),
+                None => None,
+            };
             let mut columns: HashMap<SegmentOrdinal, FastColumns> = HashMap::new();
             positions[i]
                 .iter()
                 .map(|&at| {
-                    let addr = found[at].2;
-                    Ok(match &o.fast {
-                        Some(names) => {
+                    let addr = found[at].addr;
+                    // Stored fields are read for a document that needs them.
+                    let stored = if o.fast.is_none() || snippets.is_some() {
+                        Some(searcher.doc::<TantivyDocument>(addr)?)
+                    } else {
+                        None
+                    };
+                    let doc = match (&o.fast, &stored) {
+                        (Some(names), _) => {
                             let cols = match columns.entry(addr.segment_ord) {
                                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                                 std::collections::hash_map::Entry::Vacant(e) => e.insert(
@@ -622,21 +891,57 @@ impl<'a> Request<'a> {
                             };
                             fast_json(cols, addr.doc_id)?
                         }
-                        None => stored_json(&searcher.doc(addr)?, &self.splits[i].index.schema())?,
-                    })
+                        (None, Some(stored)) => stored_json(stored, &schema)?,
+                        (None, None) => unreachable!("stored fields are read without `fast`"),
+                    };
+                    let highlight = match (&snippets, &stored) {
+                        (Some(generators), Some(stored)) => {
+                            Some(highlight_json(generators, stored)?)
+                        }
+                        _ => None,
+                    };
+                    Ok((doc, highlight))
                 })
-                .collect::<Result<Vec<String>>>()
+                .collect::<Result<Vec<(String, Option<String>)>>>()
         })?;
-        let mut out: Vec<(usize, Score, String)> = found
+        let mut out: Vec<Hit> = found
             .iter()
-            .map(|hit| (hit.1, hit.0, String::new()))
+            .map(|hit| Hit {
+                split: hit.split,
+                score: hit.score,
+                doc: String::new(),
+                highlight: None,
+            })
             .collect();
         for (split_positions, split_docs) in positions.iter().zip(docs) {
-            for (&at, doc) in split_positions.iter().zip(split_docs) {
-                out[at].2 = doc;
+            for (&at, (doc, highlight)) in split_positions.iter().zip(split_docs) {
+                out[at].doc = doc;
+                out[at].highlight = highlight;
             }
         }
         Ok(out)
+    }
+
+    /// What marks the query's terms in a stored text field, for a split.
+    fn snippet_generators(
+        &self,
+        i: usize,
+        spec: &HighlightSpec,
+    ) -> Result<Vec<(String, SnippetGenerator)>> {
+        let split = self.splits[i];
+        let q = query(split, self.text, &self.options)?;
+        let schema = split.index.schema();
+        spec.fields
+            .iter()
+            .map(|name| {
+                let mut generator =
+                    SnippetGenerator::create(&self.searchers[i], &*q, schema.get_field(name)?)?;
+                if let Some(chars) = spec.max_chars {
+                    generator.set_max_num_chars(chars);
+                }
+                Ok((name.clone(), generator))
+            })
+            .collect()
     }
 
     /// The number of matches: exact, or capped by `limit`, or the distinct
@@ -644,8 +949,8 @@ impl<'a> Request<'a> {
     pub fn count(&self) -> Result<u64> {
         let o = &self.options;
         ensure!(
-            o.offset == 0 && o.collapse.is_none(),
-            "offset and collapse are options of tantivy_search"
+            o.offset == 0 && o.collapse.is_none() && o.sort.is_none() && o.highlight.is_none(),
+            "offset, collapse, sort and highlight are options of tantivy_search"
         );
         ensure!(
             o.limit.is_none() || o.distinct.is_none(),
@@ -676,8 +981,13 @@ impl<'a> Request<'a> {
     pub fn aggregate(&self, aggs_json: &str) -> Result<String> {
         let o = &self.options;
         ensure!(
-            o.offset == 0 && o.collapse.is_none() && o.limit.is_none() && o.distinct.is_none(),
-            "offset, limit, collapse and distinct are not options of tantivy_aggregate"
+            o.offset == 0
+                && o.collapse.is_none()
+                && o.limit.is_none()
+                && o.distinct.is_none()
+                && o.sort.is_none()
+                && o.highlight.is_none(),
+            "offset, limit, collapse, distinct, sort and highlight are not options of tantivy_aggregate"
         );
         let aggs: Aggregations = serde_json::from_str(aggs_json).context("tantivy aggregations")?;
         let limits = AggregationLimitsGuard::default();
@@ -717,6 +1027,22 @@ fn stored_json(doc: &TantivyDocument, schema: &Schema) -> Result<String> {
         })
         .collect::<Result<Map<_, _>, _>>()?;
     Ok(serde_json::to_string(&fields)?)
+}
+
+/// The snippets of a stored document, as a JSON object of HTML by field; a
+/// field the query does not match is left out.
+fn highlight_json(
+    generators: &[(String, SnippetGenerator)],
+    stored: &TantivyDocument,
+) -> Result<String> {
+    let mut out = Map::new();
+    for (name, generator) in generators {
+        let snippet = generator.snippet_from_doc(stored);
+        if !snippet.is_empty() {
+            out.insert(name.clone(), Value::from(snippet.to_html()));
+        }
+    }
+    Ok(serde_json::to_string(&out)?)
 }
 
 /// A segment's open fast fields, by name.
@@ -1158,6 +1484,9 @@ mod tests {
             .unwrap()
             .hits()
             .unwrap()
+            .into_iter()
+            .map(|h| (h.split, h.score, h.doc))
+            .collect()
     }
 
     fn docs(hits: Vec<(usize, f32, String)>) -> Vec<String> {
@@ -1489,8 +1818,8 @@ mod feature_tests {
             .hits()
             .unwrap()
             .into_iter()
-            .map(|(_, _, doc)| {
-                let doc: Value = serde_json::from_str(&doc).unwrap();
+            .map(|h| {
+                let doc: Value = serde_json::from_str(&h.doc).unwrap();
                 (
                     doc["id"].as_i64().unwrap(),
                     doc.get("group").map(|g| g.as_str().unwrap().to_owned()),
@@ -1743,5 +2072,258 @@ mod feature_tests {
             .serialize_into(&mut bytes)
             .unwrap();
         assert_eq!(best(&Exclude::from_roaring(&bytes).unwrap()), 1);
+    }
+}
+
+#[cfg(test)]
+mod sort_and_highlight_tests {
+    use super::*;
+    use crate::split::testing::{build_with, open};
+    use tantivy::schema::{FAST, INDEXED, STORED, STRING, TEXT};
+
+    fn schema(date: bool) -> String {
+        let mut b = Schema::builder();
+        b.add_i64_field("id", FAST | STORED | INDEXED);
+        b.add_f64_field("rank", FAST | STORED);
+        b.add_u64_field("n", FAST | STORED);
+        if date {
+            b.add_date_field("seen", FAST | STORED);
+        } else {
+            b.add_text_field("seen", STRING | STORED); // not a fast field, nor a date
+        }
+        b.add_text_field("name", STRING | FAST | STORED);
+        b.add_text_field("body", TEXT | STORED);
+        serde_json::to_string(&b.build()).unwrap()
+    }
+
+    const DOCS: &[&str] = &[
+        r#"{"id": 1, "rank": 2.5, "n": 30, "seen": "2026-01-03T00:00:00Z", "name": "carol", "body": "roof tile"}"#,
+        r#"{"id": 2, "rank": -1.0, "n": 10, "seen": "2026-01-01T00:00:00Z", "name": "alice", "body": "a <b> & roof"}"#,
+        r#"{"id": 3, "rank": 9.0, "n": 20, "seen": "2026-01-02T00:00:00Z", "name": "bob", "body": "roof slate roof"}"#,
+        r#"{"id": 4, "body": "roof"}"#,
+        r#"{"id": 5, "rank": 2.5, "n": 30, "seen": "2026-01-03T00:00:00Z", "name": "carol", "body": "roof"}"#,
+        r#"{"id": 6, "rank": 0.0, "n": 5, "seen": "2025-12-31T00:00:00Z", "name": "dave", "body": "cat"}"#,
+    ];
+
+    fn splits(parts: &[&[&str]]) -> Vec<Split> {
+        parts
+            .iter()
+            .map(|docs| open(build_with(&schema(true), "", docs)))
+            .collect()
+    }
+
+    fn search(splits: &[Split], options: &str) -> Result<Vec<Hit>> {
+        let refs: Vec<&Split> = splits.iter().collect();
+        Request::new(&refs, "roof", options, None)?.hits()
+    }
+
+    fn ids(hits: &[Hit]) -> Vec<i64> {
+        hits.iter()
+            .map(|h| {
+                serde_json::from_str::<Value>(&h.doc).unwrap()["id"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// `ids` are in this order, the ids of a group in any order among themselves.
+    fn assert_order(ids: &[i64], groups: &[&[i64]]) {
+        let mut at = 0;
+        for group in groups {
+            let mut got = ids[at..at + group.len()].to_vec();
+            let mut want = group.to_vec();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "in {ids:?}, expected {groups:?}");
+            at += group.len();
+        }
+        assert_eq!(at, ids.len(), "in {ids:?}, expected {groups:?}");
+    }
+
+    #[test]
+    fn sorts_by_a_fast_field_with_missing_values_last() {
+        for parts in [&[DOCS][..], &[&DOCS[..3], &DOCS[3..]][..]] {
+            let s = splits(parts);
+            let sorted = |field: &str, order: &str| {
+                let options = format!(
+                    r#"{{"sort": {{"field": "{field}", "order": "{order}"}}, "fast": ["id"]}}"#
+                );
+                let hits = search(&s, &options).unwrap();
+                assert!(
+                    hits.iter().all(|h| h.score.is_nan()),
+                    "a sorted hit has no score"
+                );
+                ids(&hits)
+            };
+            assert_order(&sorted("rank", "asc"), &[&[2], &[1, 5], &[3], &[4]]);
+            assert_order(&sorted("rank", "desc"), &[&[3], &[1, 5], &[2], &[4]]);
+            assert_order(&sorted("n", "asc"), &[&[2], &[3], &[1, 5], &[4]]);
+            assert_order(&sorted("seen", "desc"), &[&[1, 5], &[3], &[2], &[4]]);
+            assert_order(&sorted("name", "asc"), &[&[2], &[3], &[1, 5], &[4]]);
+            assert_order(&sorted("name", "desc"), &[&[1, 5], &[3], &[2], &[4]]);
+            assert_order(&sorted("id", "desc"), &[&[5], &[4], &[3], &[2], &[1]]);
+            // The field alone is ascending; unsorted hits have scores.
+            let shorthand = search(&s, r#"{"sort": "id", "fast": ["id"]}"#).unwrap();
+            assert_eq!(ids(&shorthand), [1, 2, 3, 4, 5]);
+            assert!(search(&s, r#"{"fast": ["id"]}"#)
+                .unwrap()
+                .iter()
+                .all(|h| !h.score.is_nan()));
+            // Pages cut the one ordering, wherever the splits are.
+            let all = sorted("n", "desc");
+            for (offset, size) in [(0, 2), (1, 3), (3, 5), (9, 2)] {
+                let options = format!(
+                    r#"{{"sort": {{"field": "n", "order": "desc"}}, "fast": ["id"], "top_k": {size}, "offset": {offset}}}"#
+                );
+                let page = ids(&search(&s, &options).unwrap());
+                assert_eq!(
+                    page,
+                    all.iter()
+                        .copied()
+                        .skip(offset)
+                        .take(size)
+                        .collect::<Vec<_>>()
+                );
+            }
+            // The same call, the same hits.
+            assert_eq!(sorted("n", "desc"), all);
+        }
+    }
+
+    #[test]
+    fn sorts_what_is_not_excluded() {
+        let s = splits(&[DOCS]);
+        let refs: Vec<&Split> = s.iter().collect();
+        let ex = Exclude::from_ids([3, 4]);
+        let options = r#"{"sort": {"field": "rank", "order": "desc"}, "fast": ["id"], "exclude_field": "id", "top_k": 2}"#;
+        let hits = Request::new(&refs, "roof", options, Some(&ex))
+            .unwrap()
+            .hits()
+            .unwrap();
+        assert_order(&ids(&hits), &[&[1, 5]]); // 3 and 4 are gone; 2 is next but cut
+    }
+
+    #[test]
+    fn rejects_sorts_it_cannot_do() {
+        let s = splits(&[DOCS]);
+        let err = |options: &str| format!("{:#}", search(&s, options).expect_err("should fail"));
+        assert!(err(r#"{"sort": "body"}"#).contains("not a fast field"));
+        assert!(err(r#"{"sort": "nosuch"}"#).contains("no field"));
+        assert!(err(r#"{"sort": {"field": "id", "order": "up"}}"#).contains("did not match"));
+        assert!(err(r#"{"sort": {"field": "id", "extra": 1}}"#).contains("did not match"));
+        assert!(err(r#"{"sort": "id", "collapse": "name"}"#).contains("cannot be combined"));
+        // Splits must agree on the field's type.
+        let other = open(build_with(
+            &schema(false),
+            "",
+            &[r#"{"id": 9, "body": "roof", "seen": "x"}"#],
+        ));
+        let mixed = [&s[0], &other];
+        let refs: Vec<&Split> = mixed.to_vec();
+        let e = Request::new(&refs, "roof", r#"{"sort": "seen"}"#, None)
+            .err()
+            .expect("should fail");
+        assert!(format!("{e:#}").contains("not a fast field"), "{e:#}");
+        let i64s = open(build_with(
+            &schema(true),
+            "",
+            &[r#"{"id": 9, "body": "roof"}"#],
+        ));
+        let mut strings = Schema::builder();
+        strings.add_i64_field("id", FAST | STORED | INDEXED);
+        strings.add_text_field("n", STRING | FAST | STORED);
+        strings.add_text_field("body", TEXT | STORED);
+        let strings = open(build_with(
+            &serde_json::to_string(&strings.build()).unwrap(),
+            "",
+            &[r#"{"id": 8, "n": "x", "body": "roof"}"#],
+        ));
+        let refs = [&i64s, &strings];
+        let e = Request::new(&refs, "roof", r#"{"sort": "n"}"#, None)
+            .err()
+            .expect("should fail");
+        assert!(format!("{e:#}").contains("different types"), "{e:#}");
+        // A count or an aggregation has no order.
+        let one: Vec<&Split> = s.iter().collect();
+        let sorted = Request::new(&one, "roof", r#"{"sort": "id"}"#, None).unwrap();
+        assert!(sorted.count().is_err() && sorted.aggregate("{}").is_err());
+    }
+
+    #[test]
+    fn highlights_stored_text_where_the_query_matches() {
+        let s = splits(&[&DOCS[..3], &DOCS[3..]]);
+        let hits = search(
+            &s,
+            r#"{"fast": ["id"], "highlight": {"fields": ["body", "name"]}}"#,
+        )
+        .unwrap();
+        assert!(hits.iter().all(|h| h.highlight.is_some()));
+        let by_id: HashMap<i64, Value> = ids(&hits)
+            .into_iter()
+            .zip(&hits)
+            .map(|(id, h)| {
+                (
+                    id,
+                    serde_json::from_str(h.highlight.as_ref().unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by_id[&1]["body"], "<b>roof</b> tile");
+        assert_eq!(by_id[&3]["body"], "<b>roof</b> slate <b>roof</b>");
+        // The text is escaped; only the match is marked; `name` has no match.
+        assert_eq!(by_id[&2]["body"], "a &lt;b&gt; &amp; <b>roof</b>");
+        assert!(by_id.values().all(|h| h.get("name").is_none()));
+        // The document still comes from the fast fields, not the highlight's read.
+        assert_eq!(hits[0].doc.matches("body").count(), 0);
+        // A snippet is no longer than asked.
+        let long = format!(r#"{{"id": 7, "body": "roof {}"}}"#, "filler ".repeat(100));
+        let s = splits(&[&[long.as_str()]]);
+        let hits = search(
+            &s,
+            r#"{"fast": ["id"], "highlight": {"fields": ["body"], "max_chars": 40}}"#,
+        )
+        .unwrap();
+        let snippet: Value = serde_json::from_str(hits[0].highlight.as_ref().unwrap()).unwrap();
+        assert!(snippet["body"].as_str().unwrap().len() < 80, "{snippet}");
+        // Without it, no snippets.
+        assert!(search(&s, "{}")
+            .unwrap()
+            .iter()
+            .all(|h| h.highlight.is_none()));
+    }
+
+    #[test]
+    fn rejects_highlights_it_cannot_do() {
+        let s = splits(&[DOCS]);
+        let err = |options: &str| format!("{:#}", search(&s, options).expect_err("should fail"));
+        assert!(err(r#"{"highlight": {"fields": []}}"#).contains("needs fields"));
+        assert!(err(r#"{"highlight": {"fields": ["nosuch"]}}"#).contains("no field"));
+        assert!(err(r#"{"highlight": {"fields": ["id"]}}"#).contains("not a stored text field"));
+        assert!(
+            err(r#"{"highlight": {"fields": ["body"], "pre": "<em>"}}"#).contains("unknown field")
+        );
+        let one: Vec<&Split> = s.iter().collect();
+        let request =
+            Request::new(&one, "roof", r#"{"highlight": {"fields": ["body"]}}"#, None).unwrap();
+        assert!(request.count().is_err() && request.aggregate("{}").is_err());
+        // An unstored text field cannot be shown.
+        let mut b = Schema::builder();
+        b.add_text_field("body", TEXT);
+        let unstored = open(build_with(
+            &serde_json::to_string(&b.build()).unwrap(),
+            "",
+            &[r#"{"body": "roof"}"#],
+        ));
+        let refs = [&unstored];
+        let e = Request::new(
+            &refs,
+            "roof",
+            r#"{"highlight": {"fields": ["body"]}}"#,
+            None,
+        )
+        .err()
+        .expect("should fail");
+        assert!(format!("{e:#}").contains("not a stored text field"));
     }
 }

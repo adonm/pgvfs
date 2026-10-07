@@ -7,7 +7,7 @@
 //! (operator, minimum_should_match, fuzziness), match_phrase (slop),
 //! match_phrase_prefix, multi_match (best_fields, most_fields, phrase,
 //! phrase_prefix), prefix, wildcard, regexp, fuzzy, exists, range,
-//! query_string and simple_query_string; `boost` where Elasticsearch takes it,
+//! more_like_this (text), query_string and simple_query_string; `boost` where Elasticsearch takes it,
 //! `case_insensitive` on term, prefix, wildcard and regexp. Filters
 //! (`bool.filter`, `constant_score`) do not score.
 
@@ -17,10 +17,10 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use serde_json::Value;
 use tantivy::query::{
     AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery,
-    ExistsQuery, FuzzyTermQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, QueryParser,
-    RangeQuery, TermQuery, TermSetQuery,
+    EnableScoring, ExistsQuery, FuzzyTermQuery, MoreLikeThisQuery, Occur, PhrasePrefixQuery,
+    PhraseQuery, Query, QueryParser, RangeQuery, TermQuery, TermSetQuery, Weight,
 };
-use tantivy::schema::{Facet, Field, FieldType, IndexRecordOption, Schema};
+use tantivy::schema::{Facet, Field, FieldType, IndexRecordOption, OwnedValue, Schema};
 use tantivy::{DateTime, Index, Term};
 
 use crate::pattern::PatternQuery;
@@ -197,6 +197,35 @@ fn wildcard_regex(pattern: &str) -> Result<String> {
     Ok(out)
 }
 
+/// A query that scores even where the collector does not ask for scores:
+/// tantivy's more-like-this picks its terms by their statistics.
+#[derive(Debug)]
+struct NeedsScoring(Box<dyn Query>);
+
+impl Clone for NeedsScoring {
+    fn clone(&self) -> Self {
+        NeedsScoring(self.0.box_clone())
+    }
+}
+
+impl Query for NeedsScoring {
+    fn weight(&self, enable: EnableScoring<'_>) -> tantivy::Result<Box<dyn Weight>> {
+        match enable {
+            EnableScoring::Disabled {
+                searcher_opt: Some(searcher),
+                ..
+            } => self
+                .0
+                .weight(EnableScoring::enabled_from_searcher(searcher)),
+            other => self.0.weight(other),
+        }
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        self.0.query_terms(visitor)
+    }
+}
+
 impl Compiler<'_> {
     fn query(&self, q: &Value) -> Result<Box<dyn Query>> {
         let obj = q
@@ -253,6 +282,7 @@ impl Compiler<'_> {
                 ))
             }
             "multi_match" => self.multi_match(body),
+            "more_like_this" => self.more_like_this(body),
             "exists" => Ok(boosted(self.exists(body)?, body)),
             "query_string" | "simple_query_string" => {
                 self.query_string(body, kind == "query_string")
@@ -819,6 +849,119 @@ impl Compiler<'_> {
         Ok(boosted(q, body))
     }
 
+    /// `{"more_like_this": {"like": "text", "fields": [...]}}`: documents like
+    /// a text, by the terms that mark it out from the others. (Not a document
+    /// of the index: fetch its text, and pass that.)
+    fn more_like_this(&self, body: &Value) -> Result<Box<dyn Query>> {
+        parameters(
+            body,
+            "more_like_this",
+            &[
+                "like",
+                "fields",
+                "min_term_freq",
+                "max_query_terms",
+                "min_doc_freq",
+                "max_doc_freq",
+                "min_word_length",
+                "max_word_length",
+                "boost_terms",
+                "stop_words",
+            ],
+        )?;
+        let like: Vec<OwnedValue> = match body.get("like") {
+            Some(Value::String(text)) => vec![OwnedValue::Str(text.clone())],
+            Some(Value::Array(texts)) if !texts.is_empty() => texts
+                .iter()
+                .map(|t| {
+                    t.as_str()
+                        .map(|t| OwnedValue::Str(t.to_owned()))
+                        .context("more_like_this: like takes text")
+                })
+                .collect::<Result<_>>()?,
+            _ => bail!("more_like_this needs `like`: a text, or a list of texts"),
+        };
+        let is_text = |field: Field| {
+            matches!(
+                self.schema.get_field_entry(field).field_type(),
+                FieldType::Str(_)
+            )
+        };
+        let fields: Vec<Field> = match body.get("fields") {
+            Some(Value::Array(names)) => {
+                let mut found = Vec::new();
+                for name in names {
+                    let name = name.as_str().context("more_like_this: fields are names")?;
+                    if let Some(target) = self.resolve(name)? {
+                        anyhow::ensure!(
+                            target.path.is_none() && is_text(target.field),
+                            "more_like_this: {name:?} is not a text field"
+                        );
+                        found.push(target.field);
+                    }
+                }
+                found
+            }
+            _ => crate::search::text_fields(&self.schema)
+                .into_iter()
+                .filter(|f| is_text(*f))
+                .collect(),
+        };
+        if fields.is_empty() {
+            return Ok(Box::new(EmptyQuery));
+        }
+        let number = |key: &str| -> Result<Option<u64>> {
+            body.get(key)
+                .map(|v| {
+                    v.as_u64()
+                        .with_context(|| format!("more_like_this: {key} is a count"))
+                })
+                .transpose()
+        };
+        let mut builder = MoreLikeThisQuery::builder();
+        if let Some(n) = number("min_term_freq")? {
+            builder = builder.with_min_term_frequency(n as usize);
+        }
+        if let Some(n) = number("max_query_terms")? {
+            builder = builder.with_max_query_terms(n as usize);
+        }
+        if let Some(n) = number("min_doc_freq")? {
+            builder = builder.with_min_doc_frequency(n);
+        }
+        if let Some(n) = number("max_doc_freq")? {
+            builder = builder.with_max_doc_frequency(n);
+        }
+        if let Some(n) = number("min_word_length")? {
+            builder = builder.with_min_word_length(n as usize);
+        }
+        if let Some(n) = number("max_word_length")? {
+            builder = builder.with_max_word_length(n as usize);
+        }
+        if let Some(boost) = body.get("boost_terms") {
+            let boost = boost
+                .as_f64()
+                .filter(|b| *b >= 0.0 && *b <= f32::MAX as f64);
+            builder =
+                builder.with_boost_factor(boost.context("more_like_this: boost_terms")? as f32);
+        }
+        if let Some(words) = body.get("stop_words") {
+            let words = words
+                .as_array()
+                .context("more_like_this: stop_words is a list of words")?
+                .iter()
+                .map(|w| {
+                    w.as_str()
+                        .map(str::to_owned)
+                        .context("more_like_this: stop_words")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            builder = builder.with_stop_words(words);
+        }
+        let document = fields.into_iter().map(|f| (f, like.clone())).collect();
+        let query = builder.with_document_fields(document);
+        Ok(boosted(Box::new(NeedsScoring(Box::new(query))), body))
+    }
+
     /// `{"exists": {"field": "<name>"}}`: a fast field's column says which
     /// documents have a value. For an indexed text field without one, any term
     /// in the field's dictionary does, which is slower. A JSON field matches
@@ -912,8 +1055,8 @@ mod tests {
                 .hits()
                 .unwrap()
                 .into_iter()
-                .map(|(_, _, d)| {
-                    serde_json::from_str::<serde_json::Value>(&d).unwrap()["id"]
+                .map(|h| {
+                    serde_json::from_str::<serde_json::Value>(&h.doc).unwrap()["id"]
                         .as_i64()
                         .unwrap()
                 })
@@ -1077,7 +1220,7 @@ mod tests {
                 .hits()
                 .unwrap()
                 .into_iter()
-                .map(|h| h.1)
+                .map(|h| h.score)
                 .collect()
         };
         assert_eq!(
@@ -1091,6 +1234,61 @@ mod tests {
         assert_eq!(
             scores(json!({"constant_score": {"filter": {"term": {"tag": "alpha"}}, "boost": 2}})),
             [2.0, 2.0]
+        );
+    }
+
+    #[test]
+    fn finds_documents_like_a_text() {
+        let like = |extra: serde_json::Value| {
+            let mut body = json!({"like": "cats fox", "fields": ["body"], "min_term_freq": 1, "min_doc_freq": 1});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            json!({"more_like_this": body})
+        };
+        // Cats are in 2 and 3, foxes in 1 and 3.
+        assert_eq!(ids(like(json!({}))), [1, 2, 3]);
+        // Stop words are compared with the analyzed terms: "cat", as the index stems.
+        assert_eq!(ids(like(json!({"stop_words": ["cat"]}))), [1, 3]);
+        assert_eq!(ids(like(json!({"stop_words": ["cats"]}))), [1, 2, 3]);
+        assert_eq!(ids(like(json!({"like": ["lazy dog", "fox"]}))), [1, 3, 4]); // dog is in 4
+        assert_eq!(ids(like(json!({"min_doc_freq": 3}))), Vec::<i64>::new()); // no term is common enough
+        assert!(ids(like(json!({"max_query_terms": 1, "boost_terms": 2.0}))).len() >= 2);
+        assert_eq!(ids(like(json!({"fields": ["tag"]}))), Vec::<i64>::new()); // no such terms in tag
+                                                                              // A count asks for no scores, which this query needs.
+        let s = split(DOCS);
+        let count = |q: serde_json::Value| {
+            Request::new(&[&s], &q.to_string(), "", None)
+                .unwrap()
+                .count()
+        };
+        assert_eq!(count(like(json!({}))).unwrap(), 3);
+        assert_eq!(
+            count(json!({"bool": {"must": like(json!({})), "filter": {"term": {"tag": "alpha"}}}}))
+                .unwrap(),
+            2
+        );
+        assert!(fails(json!({"more_like_this": {"fields": ["body"]}})).contains("needs `like`"));
+        assert!(fails(json!({"more_like_this": {"like": 5}})).contains("needs `like`"));
+        assert!(
+            fails(json!({"more_like_this": {"like": "fox", "fields": ["id"]}}))
+                .contains("not a text field")
+        );
+        assert!(
+            fails(json!({"more_like_this": {"like": "fox", "fields": ["nosuch"]}}))
+                .contains("no field")
+        );
+        assert!(
+            fails(json!({"more_like_this": {"like": "fox", "min_term_freq": -1}}))
+                .contains("is a count")
+        );
+        assert!(
+            fails(json!({"more_like_this": {"like": "fox", "minimum_should_match": 1}}))
+                .contains("unsupported")
+        );
+        assert!(
+            fails(json!({"more_like_this": {"like": "fox", "boost_terms": "x"}}))
+                .contains("boost_terms")
         );
     }
 
@@ -1175,8 +1373,8 @@ mod json_tests {
         let hits = Request::new(&[&s], &query.to_string(), &options, None)?.hits()?;
         let mut ids: Vec<i64> = hits
             .into_iter()
-            .map(|(_, _, d)| {
-                serde_json::from_str::<serde_json::Value>(&d).unwrap()["id"]
+            .map(|h| {
+                serde_json::from_str::<serde_json::Value>(&h.doc).unwrap()["id"]
                     .as_i64()
                     .unwrap()
             })

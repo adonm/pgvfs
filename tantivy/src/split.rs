@@ -641,8 +641,8 @@ mod tests {
             .hits()
             .unwrap()
             .into_iter()
-            .map(|(_, _, doc)| {
-                serde_json::from_str::<serde_json::Value>(&doc).unwrap()["id"]
+            .map(|h| {
+                serde_json::from_str::<serde_json::Value>(&h.doc).unwrap()["id"]
                     .as_i64()
                     .unwrap()
             })
