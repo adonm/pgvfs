@@ -23,6 +23,11 @@ check:
 ext:
     #!/usr/bin/env bash
     set -euo pipefail
+    # CI checks submodules out shallowly, without tags, and DuckDB's build reads its version from the
+    # tag (without one it falls back to a dummy version). Fetch this release's tag if it is missing.
+    if ! git -C duckdb rev-parse -q --verify "refs/tags/{{duckdb}}" >/dev/null; then
+      git -C duckdb fetch -q --depth=1 origin "refs/tags/{{duckdb}}:refs/tags/{{duckdb}}"
+    fi
     tag=$(git -C duckdb describe --tags --exact-match 2>/dev/null || echo none)
     [ "$tag" = "{{duckdb}}" ] || {
       echo "duckdb/ is at $tag, not {{duckdb}}: git submodule update --init --recursive" >&2
