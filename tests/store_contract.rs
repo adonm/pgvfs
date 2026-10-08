@@ -1,5 +1,5 @@
 //! pgvfs storage contract against a real PostgreSQL. Run by `just contract`,
-//! serially (`--test-threads=1`): there is one writer lease per database.
+//! serially (`--test-threads=1`): the tests share one database and its layout.
 //!
 //! PGVFS_TEST_DB_URL       the database under test
 //! PGVFS_TEST_EMPTY_DB_URL a database with no pgvfs layout (optional)
@@ -11,20 +11,19 @@
 
 use anyhow::Result;
 use pgvfs::pg::Pool;
-use pgvfs::store::WriterLease;
 use pgvfs::store::{self, WriteMsg, ROW_BYTES, WRITE_BATCH};
 use tokio_postgres::types::Type;
 
-/// A pool plus this test's writer lease (which installs the layout).
-async fn writer() -> Result<(Pool, WriterLease)> {
+/// A pool for the database under test, made writable (which installs the layout).
+async fn writer() -> Result<Pool> {
     let pool = store::connect(
         &std::env::var("PGVFS_TEST_DB_URL")?,
         store::default_threads(),
     )
     .await?;
     store::verify(&pool).await?;
-    let lease = store::acquire_writer(&pool).await?;
-    Ok((pool, lease))
+    store::ensure_writable(&pool).await?;
+    Ok(pool)
 }
 
 fn volume(tag: &str) -> String {
@@ -70,7 +69,7 @@ async fn count(pool: &Pool, sql: &str, id: i64) -> Result<i64> {
 #[tokio::test]
 #[ignore]
 async fn round_trips_exact_ranges() -> Result<()> {
-    let (pool, _lease) = writer().await?;
+    let pool = writer().await?;
     let vol = volume("rt");
     let row = ROW_BYTES as usize;
     for (i, n) in [
@@ -115,7 +114,7 @@ async fn round_trips_exact_ranges() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn abandoned_write_leaves_nothing() -> Result<()> {
-    let (pool, _lease) = writer().await?;
+    let pool = writer().await?;
     let vol = volume("ab");
     let (tx, task) = store::spawn_writer(
         &tokio::runtime::Handle::current(),
@@ -145,7 +144,7 @@ async fn abandoned_write_leaves_nothing() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn overwrite_queues_old_file_and_reap_honours_grace() -> Result<()> {
-    let (pool, _lease) = writer().await?;
+    let pool = writer().await?;
     let vol = volume("ow");
     write(&pool, &vol, "a", &bytes(3 * ROW_BYTES as usize, 1)).await?;
     let old = store::open(&pool, &vol, "a").await?.unwrap();
@@ -172,21 +171,18 @@ async fn overwrite_queues_old_file_and_reap_honours_grace() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn list_remove_rename() -> Result<()> {
-    let (pool, _lease) = writer().await?;
+    let pool = writer().await?;
     let vol = volume("ls");
     for p in ["a/1", "a/2", "a/b/3", "ab", "c"] {
         write(&pool, &vol, p, p.as_bytes()).await?;
     }
     assert_eq!(
-        store::list(&pool, &vol, "a/", "", 100).await?,
+        listing(&pool, &vol, "a/", Some(100)).await?,
         ["a/1", "a/2", "a/b/3"]
     );
+    assert_eq!(listing(&pool, &vol, "a", Some(2)).await?, ["a/1", "a/2"]);
     assert_eq!(
-        store::list(&pool, &vol, "a", "a/1", 2).await?,
-        ["a/2", "a/b/3"]
-    );
-    assert_eq!(
-        store::list(&pool, &vol, "a_", "", 100).await?,
+        listing(&pool, &vol, "a_", Some(100)).await?,
         Vec::<String>::new()
     );
 
@@ -202,14 +198,14 @@ async fn list_remove_rename() -> Result<()> {
     for p in ["a/1", "a/2", "a/b/3"] {
         assert!(store::remove(&pool, &vol, p).await?);
     }
-    assert!(store::list(&pool, &vol, "", "", 100).await?.is_empty());
+    assert!(listing(&pool, &vol, "", Some(100)).await?.is_empty());
     Ok(())
 }
 
 #[tokio::test]
 #[ignore]
 async fn removes_prefixes_and_volumes() -> Result<()> {
-    let (pool, _lease) = writer().await?;
+    let pool = writer().await?;
     let vol = volume("rp");
     let other = volume("rq");
     for p in ["a/1", "a/2", "a/b/3", "ab", "b/4"] {
@@ -230,7 +226,7 @@ async fn removes_prefixes_and_volumes() -> Result<()> {
         1,
         "rows wait out the grace period"
     );
-    assert_eq!(store::list(&pool, &vol, "", "", 100).await?, ["ab", "b/4"]);
+    assert_eq!(listing(&pool, &vol, "", Some(100)).await?, ["ab", "b/4"]);
     assert_eq!(store::remove_prefix(&pool, &vol, "").await?, 2);
     assert_eq!(store::remove_prefix(&pool, &vol, "").await?, 0);
     assert!(
@@ -242,46 +238,22 @@ async fn removes_prefixes_and_volumes() -> Result<()> {
 
 #[tokio::test]
 #[ignore]
-async fn one_writer_at_a_time() -> Result<()> {
-    let (pool, lease) = writer().await?;
-    let err = store::acquire_writer(&pool)
-        .await
-        .err()
-        .expect("second writer refused");
-    assert!(
-        format!("{err:#}").contains("another pgvfs writer"),
-        "{err:#}"
-    );
-    lease.check()?;
-    drop(lease);
-    // The lock goes with the connection; the server notices it close.
-    for _ in 0..50 {
-        if store::acquire_writer(&pool).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    anyhow::bail!("lease not released after its connection closed")
-}
-
-#[tokio::test]
-#[ignore]
 async fn readers_need_no_layout_and_no_write_access() -> Result<()> {
     if let Ok(url) = std::env::var("PGVFS_TEST_EMPTY_DB_URL") {
         let pool = store::connect(&url, store::default_threads()).await?;
         store::verify(&pool).await?;
         assert!(store::open(&pool, "lake", "x").await?.is_none());
-        assert!(store::list(&pool, "lake", "", "", 10).await?.is_empty());
+        assert!(listing(&pool, "lake", "", Some(10)).await?.is_empty());
     }
     if let Ok(url) = std::env::var("PGVFS_TEST_READER_URL") {
         let vol = volume("ro");
         {
-            let (pool, _lease) = writer().await?;
+            let pool = writer().await?;
             write(&pool, &vol, "f", &bytes(3 * ROW_BYTES as usize, 7)).await?;
         }
         let pool = store::connect(&url, store::default_threads()).await?;
         store::verify(&pool).await?;
-        assert_eq!(store::list(&pool, &vol, "", "", 10).await?, ["f"]);
+        assert_eq!(listing(&pool, &vol, "", Some(10)).await?, ["f"]);
         let f = store::open(&pool, &vol, "f").await?.unwrap();
         assert_eq!(
             store::read_all(&pool, &f).await?,
@@ -311,7 +283,7 @@ async fn kill_backends(pool: &Pool, query_like: &str) -> Result<i64> {
 #[tokio::test]
 #[ignore]
 async fn reads_survive_lost_connections() -> Result<()> {
-    let (pool, _lease) = writer().await?;
+    let pool = writer().await?;
     let vol = volume("lost");
     let data = bytes(3 * ROW_BYTES as usize, 3);
     write(&pool, &vol, "f", &data).await?;
@@ -322,7 +294,7 @@ async fn reads_survive_lost_connections() -> Result<()> {
         // or a network blip); the next open, list and read must still work.
         kill_backends(&pool, "SELECT%").await?;
         assert!(store::open(&pool, &vol, "f").await?.is_some());
-        assert_eq!(store::list(&pool, &vol, "", "", 10).await?, ["f"]);
+        assert_eq!(listing(&pool, &vol, "", Some(10)).await?, ["f"]);
     }
     Ok(())
 }
@@ -330,7 +302,7 @@ async fn reads_survive_lost_connections() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn interrupted_write_publishes_nothing() -> Result<()> {
-    let (pool, _lease) = writer().await?;
+    let pool = writer().await?;
     let vol = volume("cut");
     let (tx, task) = store::spawn_writer(
         &tokio::runtime::Handle::current(),
@@ -365,32 +337,8 @@ async fn interrupted_write_publishes_nothing() -> Result<()> {
 
 #[tokio::test]
 #[ignore]
-async fn lost_writer_lock_stops_writes() -> Result<()> {
-    let (pool, lease) = writer().await?;
-    lease.check()?;
-    let conn = pool.get().await?;
-    let killed: i64 = conn
-        .query_typed_one(
-            "SELECT count(pg_terminate_backend(pid)) FROM pg_locks \
-             WHERE locktype = 'advisory' AND granted AND pid <> pg_backend_pid()",
-            &[],
-        )
-        .await?
-        .try_get(0)?;
-    assert_eq!(killed, 1, "the writer holds exactly one advisory lock");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(lease.check().is_err(), "a lost lock must be noticed");
-    drop(lease);
-    // Once lost, another writer can take over.
-    let again = store::acquire_writer(&pool).await?;
-    again.check()?;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore]
 async fn readers_see_consistent_files_while_writing() -> Result<()> {
-    let (pool, _lease) = writer().await?;
+    let pool = writer().await?;
     let vol = volume("mix");
     let len = |i: usize| (i * 7919) % (5 * ROW_BYTES as usize) + 1;
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -400,7 +348,7 @@ async fn readers_see_consistent_files_while_writing() -> Result<()> {
         readers.push(tokio::spawn(async move {
             let mut checked = 0;
             while !done.load(std::sync::atomic::Ordering::Relaxed) || checked == 0 {
-                for path in store::list(&pool, &vol, "", "", 1000).await? {
+                for path in listing(&pool, &vol, "", Some(1000)).await? {
                     let i: usize = path[1..].parse()?;
                     // Removed between list and open: fine, as long as what
                     // is there is exactly what was written.
@@ -433,7 +381,7 @@ async fn readers_see_consistent_files_while_writing() -> Result<()> {
 async fn offsets_beyond_4_gib() -> Result<()> {
     // Rows around byte 4.5 GiB of a 5 GiB file, without writing 5 GiB: the
     // offset arithmetic must not wrap anywhere in 32 bits.
-    let (pool, _lease) = writer().await?;
+    let pool = writer().await?;
     let vol = volume("big");
     let row = ROW_BYTES as usize;
     let first = (4_500_000_000i64 / ROW_BYTES) as i32;
@@ -476,7 +424,7 @@ async fn readers_work_on_a_standby() -> Result<()> {
     let vol = volume("sb");
     let data = bytes(4 * ROW_BYTES as usize + 9, 5);
     {
-        let (pool, _lease) = writer().await?;
+        let pool = writer().await?;
         write(&pool, &vol, "f", &data).await?;
     }
     let standby = store::connect(&url, 2).await?;
@@ -491,11 +439,10 @@ async fn readers_work_on_a_standby() -> Result<()> {
     }
     let f = found.expect("the file replicated to the standby");
     assert_eq!(store::read_all(&standby, &f).await?, data);
-    assert_eq!(store::list(&standby, &vol, "", "", 10).await?, ["f"]);
-    let err = store::acquire_writer(&standby)
+    assert_eq!(listing(&standby, &vol, "", Some(10)).await?, ["f"]);
+    let err = store::ensure_writable(&standby)
         .await
-        .err()
-        .expect("no writer on a standby");
+        .expect_err("no writer on a standby");
     assert!(format!("{err:#}").contains("standby"), "{err:#}");
     Ok(())
 }
@@ -543,6 +490,157 @@ async fn refuses_an_s3_gateway_database() -> Result<()> {
     let pool = store::connect(&url, store::default_threads()).await?;
     let err = store::verify(&pool).await.unwrap_err();
     assert!(format!("{err:#}").contains("S3 gateway"), "{err:#}");
+    Ok(())
+}
+
+/// The paths under `prefix` (at most `limit`), collected from the streamed listing.
+async fn listing(
+    pool: &Pool,
+    volume: &str,
+    prefix: &str,
+    limit: Option<i64>,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    store::list(pool, volume, prefix, limit, &mut |p: &str| {
+        out.push(p.to_owned())
+    })
+    .await?;
+    Ok(out)
+}
+
+#[tokio::test]
+#[ignore]
+async fn listing_ranges_and_limits() -> Result<()> {
+    let pool = writer().await?;
+    let vol = volume("lr");
+    for p in ["data/0001", "data/0002", "data0", "dat", "é/1", "ê/1"] {
+        write(&pool, &vol, p, b"x").await?;
+    }
+    assert_eq!(
+        listing(&pool, &vol, "data/", None).await?,
+        ["data/0001", "data/0002"]
+    );
+    assert_eq!(
+        listing(&pool, &vol, "data", None).await?,
+        ["data/0001", "data/0002", "data0"]
+    );
+    assert_eq!(
+        listing(&pool, &vol, "dat", None).await?,
+        ["dat", "data/0001", "data/0002", "data0"]
+    );
+    assert_eq!(listing(&pool, &vol, "é", None).await?, ["é/1"]);
+    assert_eq!(
+        listing(&pool, &vol, "", Some(2)).await?,
+        ["dat", "data/0001"]
+    );
+    // remove_prefix uses the same key range as the listing.
+    assert_eq!(store::remove_prefix(&pool, &vol, "data/").await?, 2);
+    assert_eq!(
+        listing(&pool, &vol, "", None).await?,
+        ["dat", "data0", "é/1", "ê/1"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn concurrent_writers_publish_independently() -> Result<()> {
+    let (a, b) = (writer().await?, writer().await?);
+    let vol = volume("cw");
+    let (x, y) = (bytes(3 * WRITE_BATCH, 1), bytes(2 * WRITE_BATCH + 17, 2));
+    let (ra, rb) = tokio::join!(write(&a, &vol, "x", &x), write(&b, &vol, "y", &y));
+    ra?;
+    rb?;
+    let fx = store::open(&a, &vol, "x").await?.unwrap();
+    let fy = store::open(&b, &vol, "y").await?.unwrap();
+    assert_eq!(store::read_all(&b, &fx).await?, x);
+    assert_eq!(store::read_all(&a, &fy).await?, y);
+    assert_eq!(listing(&a, &vol, "", None).await?, ["x", "y"]);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn concurrent_publish_of_one_path_keeps_one_whole_file() -> Result<()> {
+    let (a, b) = (writer().await?, writer().await?);
+    let vol = volume("cp");
+    let (x, y) = (bytes(WRITE_BATCH + 5, 3), bytes(WRITE_BATCH + 9, 4));
+    let (ra, rb) = tokio::join!(write(&a, &vol, "same", &x), write(&b, &vol, "same", &y));
+    assert!(ra.is_ok() || rb.is_ok(), "one of two publishers wins");
+    for r in [&ra, &rb] {
+        if let Err(e) = r {
+            assert!(
+                format!("{e:#}").contains("published by another writer"),
+                "{e:#}"
+            );
+        }
+    }
+    let f = store::open(&a, &vol, "same").await?.unwrap();
+    let got = store::read_all(&a, &f).await?;
+    assert!(got == x || got == y, "the file is one whole payload");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn concurrent_reaps_remove_each_row_once() -> Result<()> {
+    let pool = writer().await?;
+    let vol = volume("rc");
+    write(&pool, &vol, "gone", &bytes(WRITE_BATCH + 100, 5)).await?;
+    let f = store::open(&pool, &vol, "gone").await?.unwrap();
+    let rows = count(
+        &pool,
+        "SELECT count(*) FROM pgvfs.chunks WHERE file_id = $1",
+        f.file_id,
+    )
+    .await?;
+    assert!(store::remove(&pool, &vol, "gone").await?);
+    // Grace 0: this reap may remove other test files' garbage too, which is fine.
+    let reap = || {
+        let pool = pool.clone();
+        async move {
+            let conn = pool.get().await?;
+            let n: i32 = conn
+                .query_one("SELECT pgvfs.reap(interval '0 seconds')", &[])
+                .await?
+                .try_get(0)?;
+            anyhow::Ok(n)
+        }
+    };
+    let (a, b) = tokio::join!(reap(), reap());
+    assert!(
+        a? + b? >= rows as i32,
+        "the two reaps removed every row of the file"
+    );
+    let left = count(
+        &pool,
+        "SELECT count(*) FROM pgvfs.chunks WHERE file_id = $1",
+        f.file_id,
+    )
+    .await?;
+    assert_eq!(left, 0);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn stale_functions_are_refreshed_by_a_writer() -> Result<()> {
+    let pool = writer().await?;
+    pool.get()
+        .await?
+        .batch_execute("COMMENT ON FUNCTION pgvfs.reap(interval, int) IS 'stale'")
+        .await?;
+    store::ensure_writable(&pool).await?;
+    let marker: Option<String> = pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT obj_description('pgvfs.reap(interval,integer)'::regprocedure, 'pg_proc')",
+            &[],
+        )
+        .await?
+        .try_get(0)?;
+    assert_eq!(marker.as_deref(), Some(store::FUNCTIONS_MARKER));
     Ok(())
 }
 

@@ -22,6 +22,7 @@
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 #include <algorithm>
@@ -324,12 +325,29 @@ struct IndexJob {
 	}
 	shared_ptr<Build> Get(const string &url, const string &schema, const string &options) {
 		std::lock_guard<std::mutex> guard(lock);
+		// The builds of this query still alive (entries of freed builds are dropped), counted before
+		// this url's entry is inserted.
+		idx_t live = 0;
+		for (auto it = builds.begin(); it != builds.end();) {
+			if (it->second.expired()) {
+				it = builds.erase(it);
+			} else {
+				++live;
+				++it;
+			}
+		}
 		auto build = builds[url].lock();
 		if (!build || !build->build) {
+			// DuckDB's threads are shared out over the builds open so far (at most 8 each), and
+			// the builds' memory is checked against memory_limit: tantivy's memory is not DuckDB's.
+			auto threads = TaskScheduler::GetScheduler(context).NumberOfThreads() / (live + 1);
+			threads = std::min<idx_t>(std::max<idx_t>(threads, 1), 8);
+			auto max_memory = BufferManager::GetBufferManager(context).GetMaxMemory();
 			build = make_shared_ptr<Build>();
 			build->url = url;
 			char *err = nullptr;
-			build->build = tantivy_build_open(schema.c_str(), options.empty() ? nullptr : options.c_str(), &err);
+			build->build = tantivy_build_open(schema.c_str(), options.empty() ? nullptr : options.c_str(), threads,
+			                                  live, max_memory, &err);
 			if (!build->build) {
 				Fail("index", url, err);
 			}

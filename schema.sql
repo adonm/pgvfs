@@ -1,5 +1,6 @@
--- pgvfs layout v2 (store::LAYOUT_VERSION). Installed by the writer under its
--- advisory lock; any layout change requires a fresh database.
+-- pgvfs layout v2 (store::LAYOUT_VERSION). Installed by the first writer, under
+-- a transaction-scoped advisory lock (store::ensure_writable); any layout change
+-- requires a fresh database. The functions are in functions.sql.
 -- PostgreSQL 11+ (toast_tuple_target); no extensions.
 --
 -- Files are immutable: a write streams rows under a fresh file_id and
@@ -48,32 +49,9 @@ ALTER TABLE pgvfs.chunks SET (autovacuum_vacuum_scale_factor = 0.01,
   autovacuum_analyze_scale_factor = 0.02, autovacuum_vacuum_threshold = 1000);
 
 -- Unpublished files. Readers take no snapshot across statements, so rows
--- outlive the unpublish by a grace period for queries that already opened
--- the file. Only the writer reaps.
+-- outlive the unpublish by a grace period (PGVFS_REAP_GRACE_S) for reads that
+-- are running. Any writer reaps (pgvfs.reap takes a try-lock).
 CREATE TABLE pgvfs.garbage (
   file_id   int8 PRIMARY KEY,
   queued_at timestamptz NOT NULL DEFAULT now()
 );
-
--- Delete up to p_max_rows chunk rows of files queued before the grace period.
-CREATE FUNCTION pgvfs.reap(
-  p_grace interval DEFAULT interval '10 minutes',
-  p_max_rows int DEFAULT 65536
-) RETURNS int LANGUAGE plpgsql AS $$
-DECLARE
-  victim bigint;
-  removed int := 0;
-  n int;
-BEGIN
-  FOR victim IN SELECT file_id FROM pgvfs.garbage
-      WHERE queued_at < now() - p_grace ORDER BY queued_at, file_id LOOP
-    DELETE FROM pgvfs.chunks WHERE file_id = victim
-      AND no IN (SELECT no FROM pgvfs.chunks WHERE file_id = victim
-                 ORDER BY no LIMIT p_max_rows - removed);
-    GET DIAGNOSTICS n = ROW_COUNT;
-    removed := removed + n;
-    EXIT WHEN removed >= p_max_rows;
-    DELETE FROM pgvfs.garbage WHERE file_id = victim;
-  END LOOP;
-  RETURN removed;
-END $$;

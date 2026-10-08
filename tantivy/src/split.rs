@@ -25,6 +25,7 @@ use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWrite
 use tantivy::directory::{
     DirectoryLock, FileHandle, Lock, OwnedBytes, WatchCallback, WatchHandle, WritePtr,
 };
+use tantivy::indexer::IndexWriterOptions;
 use tantivy::merge_policy::NoMergePolicy;
 use tantivy::schema::Schema;
 use tantivy::tokenizer::{
@@ -186,10 +187,33 @@ pub struct Build {
     dir: tempfile::TempDir,
 }
 
+/// Memory a build holds beyond its `memory_budget`: segment and document-store buffers.
+const BUILD_OVERHEAD: u64 = 10 << 20;
+/// tantivy's smallest arena per indexing thread (its MEMORY_BUDGET_NUM_BYTES_MIN).
+const MIN_ARENA_PER_THREAD: usize = 15_000_000;
+
 impl Build {
-    pub fn new(schema: &str, options_json: &str) -> Result<Build> {
+    /// Opens a build: `threads` indexing threads share its `memory_budget`, with one merge
+    /// thread and no automatic merging. `live` builds of the same query are already open, and
+    /// `max_memory` is DuckDB's memory limit (0: none). tantivy's memory is not DuckDB's, so a
+    /// build that would take the total past the limit is refused.
+    pub fn new(
+        schema: &str,
+        options_json: &str,
+        threads: usize,
+        live: usize,
+        max_memory: u64,
+    ) -> Result<Build> {
         let schema: Schema = serde_json::from_str(schema).context("tantivy schema")?;
         let options: BuildOptions = options(options_json, "index")?;
+        let needed = (live as u64 + 1) * (options.memory_budget as u64 + BUILD_OVERHEAD);
+        anyhow::ensure!(
+            max_memory == 0 || needed <= max_memory,
+            "tantivy_index: {} open builds need about {needed} bytes, over memory_limit \
+             ({max_memory} bytes): lower memory_budget, build fewer groups per query, or raise \
+             memory_limit",
+            live + 1
+        );
         let dir = tempfile::Builder::new()
             .prefix("duckdb-tantivy-")
             .tempdir()?;
@@ -198,7 +222,14 @@ impl Build {
             .settings(options.settings.clone())
             .create_in_dir(dir.path())?;
         register(&index, &options)?;
-        let writer: IndexWriter = index.writer(options.memory_budget)?;
+        let threads = threads.clamp(1, (options.memory_budget / MIN_ARENA_PER_THREAD).max(1));
+        let writer: IndexWriter = index.writer_with_options(
+            IndexWriterOptions::builder()
+                .num_worker_threads(threads)
+                .memory_budget_per_thread(options.memory_budget / threads)
+                .num_merge_threads(1)
+                .build(),
+        )?;
         if options.merge {
             writer.set_merge_policy(Box::new(NoMergePolicy));
         }
@@ -599,7 +630,7 @@ pub(crate) mod testing {
     }
 
     pub fn build_with(schema: &str, options: &str, docs: &[&str]) -> Vec<u8> {
-        let build = Build::new(schema, options).unwrap();
+        let build = Build::new(schema, options, 1, 0, 0).unwrap();
         for doc in docs {
             build.add(doc).unwrap();
         }
@@ -753,9 +784,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_input() {
-        assert!(Build::new("not json", "").is_err());
-        assert!(Build::new(SCHEMA, r#"{"nope": 1}"#).is_err());
-        let b = Build::new(SCHEMA, OPTIONS).unwrap();
+        assert!(Build::new("not json", "", 1, 0, 0).is_err());
+        assert!(Build::new(SCHEMA, r#"{"nope": 1}"#, 1, 0, 0).is_err());
+        let b = Build::new(SCHEMA, OPTIONS, 1, 0, 0).unwrap();
         assert!(b.add("[1]").is_err());
         assert!(b.add(r#"{"id": "x"}"#).is_err());
         let bad = options::<BuildOptions>(

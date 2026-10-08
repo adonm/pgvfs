@@ -41,9 +41,17 @@ void tantivy_free_str(char *s);
 
 /*
  Start a split: `schema` is a tantivy schema as JSON, `options` (may be
- NULL) build options as JSON. NULL + `*err` on failure.
+ NULL) build options as JSON. `threads` indexing threads (at least 1) share
+ the build's memory budget; `live` builds of the same query are already open,
+ and `max_memory` is DuckDB's memory limit in bytes (0: none). NULL + `*err`
+ on failure.
  */
-TantivyBuild *tantivy_build_open(const char *schema, const char *options, char **err);
+TantivyBuild *tantivy_build_open(const char *schema,
+                                 const char *options,
+                                 size_t threads,
+                                 size_t live,
+                                 uint64_t max_memory,
+                                 char **err);
 
 /*
  Add one document (a JSON object), from any thread. 0 ok, -1 error.

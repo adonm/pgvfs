@@ -1,12 +1,13 @@
 //! pgvfs storage: a file is numbered 8120-byte rows in `pgvfs.chunks` under
 //! an immutable `file_id`, published as `(volume, path)` in `pgvfs.files`
-//! (layout: schema.sql).
+//! (layout: schema.sql; functions: functions.sql).
 //!
 //! A file_id never changes bytes, so readers need no locks, snapshots or
 //! metadata cache: a read is one primary-key range query per 8 MiB piece, and
-//! a large read fetches its pieces in parallel. One writer per database holds
-//! a session advisory lock (`WriterLease`); it alone installs the layout,
-//! publishes, removes and reaps.
+//! a large read fetches its pieces in parallel. Writers need no lease: a
+//! publish is one transaction, file ids come from a sequence, and the steps
+//! that change shared state (installing the layout, refreshing functions,
+//! reaping) take transaction-scoped advisory locks.
 
 use std::time::{Duration, SystemTime};
 
@@ -20,6 +21,9 @@ use tokio::sync::mpsc;
 use tokio_postgres::types::{ToSql, Type};
 
 pub const SCHEMA: &str = include_str!("../schema.sql");
+pub const FUNCTIONS: &str = include_str!("../functions.sql");
+/// The comment on `pgvfs.reap` (functions.sql). A writer refreshes the functions when it differs.
+pub const FUNCTIONS_MARKER: &str = "pgvfs functions 3";
 pub const LAYOUT_VERSION: i32 = 2;
 
 pub const ROW_BYTES: i64 = 8120;
@@ -47,6 +51,7 @@ pub static STATS: Stats = Stats {
     read_ns: std::sync::atomic::AtomicU64::new(0),
     pieces: std::sync::atomic::AtomicU64::new(0),
 };
+
 /// Rows per parallel read piece (8 MiB). Measured on full ClickBench heavy
 /// scans, 2 MiB pieces were 3-4% slower (4x the range queries) and 32 MiB no
 /// faster.
@@ -56,6 +61,8 @@ pub const WRITE_BATCH: usize = 516 * ROW_BYTES as usize;
 
 const RANGE_SQL: &str =
     "SELECT no, data FROM pgvfs.chunks WHERE file_id = $1 AND no >= $2 AND no <= $3";
+const LIST_SQL: &str = "SELECT path FROM pgvfs.files WHERE volume = $1 AND path >= $2 \
+     AND ($3::text IS NULL OR path < $3) ORDER BY path LIMIT $4";
 const COPY_SQL: &str = "COPY pgvfs.chunks (file_id, no, data) FROM STDIN WITH (FORMAT binary)";
 const COPY_HEADER: &[u8] = b"PGCOPY\n\xff\r\n\0\x00\x00\x00\x00\x00\x00\x00\x00";
 const COPY_TRAILER: &[u8] = &[0xFF, 0xFF];
@@ -96,7 +103,7 @@ pub async fn connect(url: &str, threads: usize) -> Result<Pool> {
 }
 
 /// Readers need no DDL: accept a database with no layout yet (reads find
-/// nothing until the writer installs it) or the current one; refuse others.
+/// nothing until a writer installs it) or the current one; refuse others.
 pub async fn verify(pool: &Pool) -> Result<()> {
     let conn = pool.get().await?;
     check_layout(&conn).await.map(|_| ())
@@ -128,71 +135,82 @@ async fn check_layout(client: &tokio_postgres::Client) -> Result<bool> {
     Ok(installed)
 }
 
-/// The right to write: a session advisory lock on a dedicated connection.
-/// A second writer fails at once; a crashed writer's lock goes with its
-/// connection.
-pub struct WriterLease(tokio_postgres::Client);
-
-const WRITER_LOCK: i64 = 0x7067_7666; // "pgvf"
-
-pub async fn acquire_writer(pool: &Pool) -> Result<WriterLease> {
-    let mut client = pool.dedicated().await?;
-    // A standby would grant its own, separate advisory lock, then refuse
-    // every write: say so up front.
-    let standby: bool = client
-        .query_typed_one("SELECT pg_is_in_recovery()", &[])
+/// Makes the database writable by this process, in one transaction under a
+/// transaction-scoped advisory lock: refuses a standby, installs the layout
+/// when it is missing, and refreshes the functions when their marker differs
+/// and this role may replace them (the owner, or a superuser; others keep the
+/// installed body). Concurrent writers serialise here, once each.
+pub async fn ensure_writable(pool: &Pool) -> Result<()> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.batch_execute("SELECT pg_advisory_xact_lock(hashtext('pgvfs.install')::bigint)")
+        .await?;
+    let standby: bool = tx
+        .query_one("SELECT pg_is_in_recovery()", &[])
         .await?
         .try_get(0)?;
     anyhow::ensure!(
         !standby,
-        "this PostgreSQL is a read-only standby: the pgvfs writer must connect to the primary"
+        "this PostgreSQL is a read-only standby: pgvfs writes must go to the primary"
     );
-    let got: bool = client
-        .query_typed_one(
-            "SELECT pg_try_advisory_lock($1)",
-            &[(&WRITER_LOCK, Type::INT8)],
-        )
-        .await?
-        .try_get(0)?;
-    anyhow::ensure!(
-        got,
-        "another pgvfs writer is active on this database (only one writer at a time)"
-    );
-    if !check_layout(&client).await? {
-        let tx = client.transaction().await?;
+    if !check_layout(tx.client()).await? {
         tx.batch_execute(SCHEMA).await?;
         tx.execute_typed(
             "INSERT INTO pgvfs.layout (version) VALUES ($1)",
             &[(&LAYOUT_VERSION, Type::INT4)],
         )
         .await?;
-        tx.commit().await?;
     }
-    Ok(WriterLease(client))
+    refresh_functions(&tx).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
-impl WriterLease {
-    /// A lost lease (its connection closed) may already belong to another
-    /// writer: stop rather than write concurrently.
-    pub fn check(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.0.is_closed(),
-            "pgvfs writer lock lost (its connection closed); reconnect to write"
-        );
-        Ok(())
+async fn refresh_functions(tx: &tokio_postgres::Transaction<'_>) -> Result<()> {
+    const REAP: &str = "to_regprocedure('pgvfs.reap(interval,integer)')";
+    let row = tx
+        .query_one(
+            &format!(
+                "SELECT {REAP} IS NULL, obj_description({REAP}, 'pg_proc'), \
+                 coalesce(pg_has_role((SELECT proowner FROM pg_proc WHERE oid = {REAP}), 'MEMBER'), false) \
+                 OR coalesce((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false)"
+            ),
+            &[],
+        )
+        .await?;
+    let (missing, marker, may_replace): (bool, Option<String>, bool) =
+        (row.try_get(0)?, row.try_get(1)?, row.try_get(2)?);
+    if missing || (may_replace && marker.as_deref() != Some(FUNCTIONS_MARKER)) {
+        tx.batch_execute(FUNCTIONS).await?;
     }
+    Ok(())
 }
 
-/// Reap unpublished files older than the grace period (bounded work).
+/// Reap past-grace garbage (bounded work; one reap runs at a time database-wide).
+/// Returns the chunk rows removed.
 pub async fn reap(pool: &Pool) -> Result<i32> {
     let conn = pool.get().await?;
+    let grace = reap_grace_seconds();
     Ok(conn
-        .query_typed_one("SELECT pgvfs.reap()", &[])
+        .query_typed_one(
+            "SELECT pgvfs.reap(make_interval(secs => $1))",
+            &[(&grace, Type::FLOAT8)],
+        )
         .await?
         .try_get(0)?)
 }
 
-/// Before the writer installs the layout, reads see an empty store.
+/// How long an unpublished file stays readable: PGVFS_REAP_GRACE_S seconds,
+/// default 600. Reads must finish within it after the file is replaced or removed.
+pub fn reap_grace_seconds() -> f64 {
+    std::env::var("PGVFS_REAP_GRACE_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|s| *s >= 0.0)
+        .unwrap_or(600.0)
+}
+
+/// Before the layout is installed, reads see an empty store.
 fn no_layout(e: &tokio_postgres::Error) -> bool {
     e.code() == Some(&SqlState::UNDEFINED_TABLE)
 }
@@ -348,50 +366,85 @@ async fn read_piece_once(
     }
     anyhow::ensure!(
         filled == out.len(),
-        "file {file_id}: rows {lo}..={hi} are missing (removed while reading?)"
+        "pgvfs file {file_id}: rows {lo}..={hi} are missing: the file was replaced or removed, \
+         and its rows were reaped while this read was running (a read must finish within the \
+         reap grace, PGVFS_REAP_GRACE_S: {} seconds here)",
+        reap_grace_seconds()
     );
     Ok(())
 }
 
-/// Keys under `prefix`, in byte order, after `after`, at most `limit`.
-pub async fn list(
+/// Paths under `prefix` in `volume`, in byte order, passed to `emit` as they
+/// arrive (at most `limit`, if given). A read that loses its connection before
+/// any path was emitted retries once.
+pub async fn list<F: FnMut(&str)>(
     pool: &Pool,
     volume: &str,
     prefix: &str,
-    after: &str,
-    limit: i64,
-) -> Result<Vec<String>> {
-    match list_once(pool, volume, prefix, after, limit).await {
-        Err(e) if lost_connection(&e) => list_once(pool, volume, prefix, after, limit).await,
+    limit: Option<i64>,
+    emit: &mut F,
+) -> Result<()> {
+    let mut emitted = 0usize;
+    match list_once(pool, volume, prefix, limit, emit, &mut emitted).await {
+        Err(e) if emitted == 0 && lost_connection(&e) => {
+            list_once(pool, volume, prefix, limit, emit, &mut emitted).await
+        }
         r => r,
     }
 }
 
-async fn list_once(
+async fn list_once<F: FnMut(&str)>(
     pool: &Pool,
     volume: &str,
     prefix: &str,
-    after: &str,
-    limit: i64,
-) -> Result<Vec<String>> {
-    let conn = pool.get().await?;
-    let rows = match conn
-        .query_typed(
-            "SELECT path FROM pgvfs.files WHERE volume = $1 AND path > $2 \
-             AND left(path, length($3)) = $3 ORDER BY path LIMIT $4",
-            &[
-                (&volume, Type::TEXT),
-                (&after, Type::TEXT),
-                (&prefix, Type::TEXT),
-                (&limit, Type::INT8),
-            ],
-        )
+    limit: Option<i64>,
+    emit: &mut F,
+    emitted: &mut usize,
+) -> Result<()> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    // The pooled session turns index scans off for chunk reads; a listing needs them.
+    tx.batch_execute("SET LOCAL enable_indexscan = on").await?;
+    let stmt = match tx
+        .prepare_typed(LIST_SQL, &[Type::TEXT, Type::TEXT, Type::TEXT, Type::INT8])
         .await
     {
-        Err(e) if no_layout(&e) => Vec::new(),
-        rows => rows?,
+        Err(e) if no_layout(&e) => return Ok(()),
+        r => r?,
     };
-    rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    let upper = prefix_end(prefix);
+    let params: [&(dyn ToSql + Sync); 4] = [&volume, &prefix, &upper.as_deref(), &limit];
+    let rows = match tx.query_raw(&stmt, params).await {
+        Err(e) if no_layout(&e) => return Ok(()),
+        r => r?,
+    };
+    futures::pin_mut!(rows);
+    while let Some(row) = rows.try_next().await? {
+        let path: &str = row.try_get(0)?;
+        *emitted += 1;
+        emit(path);
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The smallest string after every string that starts with `prefix` (paths
+/// collate as bytes, and UTF-8 bytes sort like code points): `prefix` with its
+/// last character incremented, skipping surrogates. None when nothing bounds the
+/// prefix: the empty prefix, or one made only of the largest character.
+pub fn prefix_end(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut next = last as u32 + 1;
+        if next == 0xD800 {
+            next = 0xE000; // surrogates are not characters
+        }
+        if let Some(c) = char::from_u32(next) {
+            chars.push(c);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 /// Unpublish one file. Returns false if nothing was there.
@@ -411,11 +464,17 @@ pub async fn remove(pool: &Pool, volume: &str, path: &str) -> Result<bool> {
 /// Returns how many there were.
 pub async fn remove_prefix(pool: &Pool, volume: &str, prefix: &str) -> Result<i64> {
     let conn = pool.get().await?;
+    let upper = prefix_end(prefix);
     let n = conn
         .execute_typed(
-            "WITH gone AS (DELETE FROM pgvfs.files WHERE volume = $1 AND left(path, length($2)) = $2 \
-             RETURNING file_id) INSERT INTO pgvfs.garbage (file_id) SELECT file_id FROM gone",
-            &[(&volume, Type::TEXT), (&prefix, Type::TEXT)],
+            "WITH gone AS (DELETE FROM pgvfs.files WHERE volume = $1 AND path >= $2 \
+             AND ($3::text IS NULL OR path < $3) RETURNING file_id) \
+             INSERT INTO pgvfs.garbage (file_id) SELECT file_id FROM gone",
+            &[
+                (&volume, Type::TEXT),
+                (&prefix, Type::TEXT),
+                (&upper.as_deref(), Type::TEXT),
+            ],
         )
         .await?;
     Ok(n as i64)
@@ -534,16 +593,27 @@ async fn write_file(
     sink.send(Bytes::from_static(COPY_TRAILER)).await?;
     sink.as_mut().finish().await.context("pgvfs COPY")?;
     replace_garbage(&tx, &volume, &path).await?;
-    tx.execute_typed(
-        "INSERT INTO pgvfs.files (volume, path, file_id, size) VALUES ($1, $2, $3, $4)",
-        &[
-            (&volume, Type::TEXT),
-            (&path, Type::TEXT),
-            (&file_id, Type::INT8),
-            (&size, Type::INT8),
-        ],
-    )
-    .await?;
+    if let Err(e) = tx
+        .execute_typed(
+            "INSERT INTO pgvfs.files (volume, path, file_id, size) VALUES ($1, $2, $3, $4)",
+            &[
+                (&volume, Type::TEXT),
+                (&path, Type::TEXT),
+                (&file_id, Type::INT8),
+                (&size, Type::INT8),
+            ],
+        )
+        .await
+    {
+        return Err(if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+            anyhow!(
+                "pgvfs://{volume}/{path} was published by another writer at the same time; \
+                 this write was rolled back"
+            )
+        } else {
+            e.into()
+        });
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -560,4 +630,22 @@ pub fn micros(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_micros() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_end;
+
+    #[test]
+    fn prefix_end_bounds_every_key_with_the_prefix() {
+        assert_eq!(prefix_end("data/").as_deref(), Some("data0"));
+        assert_eq!(prefix_end("a\u{10ffff}").as_deref(), Some("b"));
+        assert_eq!(prefix_end("\u{d7ff}").as_deref(), Some("\u{e000}"));
+        assert_eq!(prefix_end("\u{10ffff}"), None);
+        assert_eq!(prefix_end(""), None);
+        for key in ["data/", "data/x", "data/\u{10ffff}z"] {
+            assert!(key < "data0", "{key:?} sorts below the bound");
+            assert!(key >= "data/", "{key:?} starts with the prefix");
+        }
+    }
 }

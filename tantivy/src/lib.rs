@@ -160,17 +160,26 @@ pub unsafe extern "C" fn tantivy_free_str(s: *mut c_char) {
 }
 
 /// Start a split: `schema` is a tantivy schema as JSON, `options` (may be
-/// NULL) build options as JSON. NULL + `*err` on failure.
+/// NULL) build options as JSON. `threads` indexing threads (at least 1) share
+/// the build's memory budget; `live` builds of the same query are already open,
+/// and `max_memory` is DuckDB's memory limit in bytes (0: none). NULL + `*err`
+/// on failure.
 #[no_mangle]
 pub unsafe extern "C" fn tantivy_build_open(
     schema: *const c_char,
     options: *const c_char,
+    threads: usize,
+    live: usize,
+    max_memory: u64,
     err: *mut *mut c_char,
 ) -> *mut Build {
     guard(err, std::ptr::null_mut(), || {
         Ok(Box::into_raw(Box::new(Build::new(
             text(schema)?,
             text(options)?,
+            threads,
+            live,
+            max_memory,
         )?)))
     })
 }

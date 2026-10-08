@@ -1,12 +1,14 @@
 //! C ABI over the pgvfs storage layer, for the DuckDB `pgvfs://` filesystem
 //! (extension/). The C++ side only registers the scheme with DuckDB, whose
-//! FileSystem registration is not in the stable C API; storage is all here.
+//! FileSystem registration is not in the stable C API: storage is all here.
 //!
-//! Connecting needs only read access. The first write operation takes the
-//! database's writer lease (see `store::WriterLease`) and keeps it for the
-//! life of the connection.
+//! Connecting needs only read access. The first write operation makes the
+//! database writable for this process (`store::ensure_writable` installs or
+//! refreshes the layout and functions under a transaction lock); writes then
+//! need only the privileges PostgreSQL grants.
 //!
 //! Calls block the calling DuckDB thread on this connection's tokio runtime.
+//!
 //! Strings in are UTF-8 (rejected otherwise); errors come back as `*err`,
 //! freed with `pgvfs_free_str`.
 //!
@@ -31,12 +33,13 @@ use bytes::BytesMut;
 use pg::Pool;
 use tokio::sync::mpsc;
 
-use store::{FileInfo, WriteMsg, WriterLease, WRITE_BATCH};
+use store::{FileInfo, WriteMsg, WRITE_BATCH};
 
 pub struct PgvfsConn {
     rt: tokio::runtime::Runtime,
     pool: Pool,
-    writer: Mutex<Option<WriterLease>>,
+    /// Whether this process has made the database writable (see `writable`).
+    writable: Mutex<bool>,
     last_reap: AtomicU64,
     files: FileCache,
 }
@@ -83,15 +86,16 @@ impl FileCache {
 }
 
 impl PgvfsConn {
-    /// Take (once) and check the writer lease before any write.
-    fn writer(&self) -> Result<()> {
-        let mut lease = self.writer.lock().unwrap();
-        if lease.is_none() {
-            *lease = Some(self.rt.block_on(store::acquire_writer(&self.pool))?);
-            // A new writer catches up on garbage left while none was writing.
+    /// Makes the database writable, once per connection, before any write.
+    fn writable(&self) -> Result<()> {
+        let mut done = self.writable.lock().unwrap();
+        if !*done {
+            self.rt.block_on(store::ensure_writable(&self.pool))?;
+            *done = true;
+            // A writer catches up on garbage left while none was writing.
             self.maybe_reap();
         }
-        lease.as_ref().unwrap().check()
+        Ok(())
     }
 
     /// Reap past-grace garbage in the background, at most once a minute.
@@ -202,7 +206,7 @@ pub unsafe extern "C" fn pgvfs_connect(
         Ok(PgvfsConn {
             rt,
             pool,
-            writer: Mutex::new(None),
+            writable: Mutex::new(false),
             last_reap: AtomicU64::new(0),
             files: FileCache {
                 ttl: std::time::Duration::from_secs(env_num("PGVFS_OPEN_CACHE_S", 10) as u64),
@@ -342,8 +346,8 @@ pub extern "C" fn pgvfs_stats() -> *mut c_char {
 
 pub type ListCb = extern "C" fn(ctx: *mut c_void, path: *const c_char, len: usize);
 
-/// Call `cb` for up to `limit` paths under `prefix` (limit < 0: all), in byte
-/// order. 0 ok, -1 error.
+/// Call `cb` for each path under `prefix`, in byte order, as the rows stream
+/// in (`limit` paths at most; a negative limit means all). 0 ok, -1 error.
 #[no_mangle]
 pub unsafe extern "C" fn pgvfs_list(
     c: *const PgvfsConn,
@@ -358,22 +362,9 @@ pub unsafe extern "C" fn pgvfs_list(
     let run = || -> Result<()> {
         let (volume, prefix) = (text(volume)?, text(prefix)?);
         store::check_volume(volume)?;
-        let mut left = if limit < 0 { i64::MAX } else { limit };
-        let mut after = String::new();
-        while left > 0 {
-            let page = left.min(1000);
-            let batch =
-                c.rt.block_on(store::list(&c.pool, volume, prefix, &after, page))?;
-            for p in &batch {
-                cb(ctx, p.as_ptr().cast(), p.len());
-            }
-            left -= batch.len() as i64;
-            if (batch.len() as i64) < page {
-                break;
-            }
-            after = batch.last().cloned().unwrap_or_default();
-        }
-        Ok(())
+        let limit = (limit >= 0).then_some(limit);
+        let mut emit = |path: &str| cb(ctx, path.as_ptr().cast(), path.len());
+        c.rt.block_on(store::list(&c.pool, volume, prefix, limit, &mut emit))
     };
     match run() {
         Ok(()) => 0,
@@ -396,7 +387,7 @@ pub unsafe extern "C" fn pgvfs_remove(
     let run = || -> Result<bool> {
         let (volume, path) = (text(volume)?, text(path)?);
         store::check_volume(volume)?;
-        c.writer()?;
+        c.writable()?;
         c.files.forget(volume, path);
         c.rt.block_on(store::remove(&c.pool, volume, path))
     };
@@ -429,7 +420,7 @@ pub unsafe extern "C" fn pgvfs_remove_prefix(
     let run = || -> Result<i64> {
         let (volume, prefix) = (text(volume)?, text(prefix)?);
         store::check_volume(volume)?;
-        c.writer()?;
+        c.writable()?;
         c.files
             .map
             .lock()
@@ -462,7 +453,7 @@ pub unsafe extern "C" fn pgvfs_rename(
     let run = || -> Result<()> {
         let (volume, from, to) = (text(volume)?, text(from)?, text(to)?);
         store::check_volume(volume)?;
-        c.writer()?;
+        c.writable()?;
         c.files.forget(volume, from);
         c.files.forget(volume, to);
         c.rt.block_on(store::rename(&c.pool, volume, from, to))
@@ -488,7 +479,7 @@ pub unsafe extern "C" fn pgvfs_writer_open(
     let cr = conn(c);
     let run = || -> Result<PgvfsWriter> {
         let (volume, path) = (text(volume)?, text(path)?);
-        cr.writer()?;
+        cr.writable()?;
         let (tx, task) =
             store::spawn_writer(cr.rt.handle(), cr.pool.clone(), volume.into(), path.into())?;
         Ok(PgvfsWriter {
@@ -564,7 +555,7 @@ pub unsafe extern "C" fn pgvfs_writer_write(
 pub unsafe extern "C" fn pgvfs_writer_publish(w: *mut PgvfsWriter, err: *mut *mut c_char) -> c_int {
     let mut w = unsafe { Box::from_raw(w) };
     let run = |w: &mut PgvfsWriter| -> Result<()> {
-        conn(w.conn).writer()?;
+        conn(w.conn).writable()?;
         if !w.buf.is_empty() {
             let rest = w.buf.split().freeze();
             w.send(WriteMsg::Data(rest))?;

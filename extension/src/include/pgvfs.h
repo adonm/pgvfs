@@ -62,8 +62,8 @@ int pgvfs_read(const PgvfsConn *c,
 char *pgvfs_stats(void);
 
 /*
- Call `cb` for up to `limit` paths under `prefix` (limit < 0: all), in byte
- order. 0 ok, -1 error.
+ Call `cb` for each path under `prefix`, in byte order, as the rows stream
+ in (`limit` paths at most; a negative limit means all). 0 ok, -1 error.
  */
 int pgvfs_list(const PgvfsConn *c,
                const char *volume,

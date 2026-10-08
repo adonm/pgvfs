@@ -17,7 +17,6 @@ use deadpool_postgres::{
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
 use tokio_postgres::config::SslMode;
-use tokio_postgres::Client;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type Pooled = Object;
@@ -34,9 +33,6 @@ pub struct Options {
 #[derive(Clone)]
 pub struct Pool {
     pool: deadpool_postgres::Pool,
-    config: tokio_postgres::Config,
-    tls: MakeRustlsConnect,
-    session: Arc<str>,
 }
 
 impl Pool {
@@ -57,8 +53,8 @@ impl Pool {
         let tls = MakeRustlsConnect::new(tls_config()?);
         let session: Arc<str> = opts.session.into();
         let manager = Manager::from_config(
-            config.clone(),
-            tls.clone(),
+            config,
+            tls,
             ManagerConfig {
                 recycling_method: RecyclingMethod::Fast,
             },
@@ -82,30 +78,12 @@ impl Pool {
         // Open the warm set now rather than on the first queries.
         let warm = futures::future::try_join_all((0..opts.min).map(|_| pool.get())).await?;
         drop(warm);
-        Ok(Pool {
-            pool,
-            config,
-            tls,
-            session,
-        })
+        Ok(Pool { pool })
     }
 
     /// The most recently used idle connection, else a new one.
     pub async fn get(&self) -> Result<Pooled> {
         Ok(self.pool.get().await?)
-    }
-
-    /// A connection outside the pool, for state that lives as long as the
-    /// connection (the writer's advisory lock).
-    pub async fn dedicated(&self) -> Result<Client> {
-        let (client, connection) = self.config.connect(self.tls.clone()).await?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("pgvfs: postgres connection closed: {e}");
-            }
-        });
-        client.batch_execute(&self.session).await?;
-        Ok(client)
     }
 }
 

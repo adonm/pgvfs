@@ -5,8 +5,9 @@
 // This file only adapts DuckDB's C++ FileSystem interface, which the stable C
 // API cannot register, to the Rust storage layer's C ABI (pgvfs.h). Paths are
 // pgvfs://<volume>/<path>. Files are immutable once written: a write streams
-// into a new file_id and publishes on Close(); the file_id is the cache
-// version tag, so DuckDB's external file cache never serves stale bytes.
+// into a new file_id and publishes on Close(). DuckDB's external file cache is
+// keyed by a version tag that names the database (its connection) and the
+// file_id, so it never serves stale bytes, even across databases.
 #include "pgvfs_extension.hpp"
 #include "pgvfs.h"
 
@@ -26,6 +27,7 @@
 #include "duckdb/storage/object_cache.hpp"
 
 #include <cstdlib>
+#include <map>
 #include <mutex>
 
 namespace duckdb {
@@ -94,12 +96,22 @@ bool MatchSegments(const vector<string> &key, idx_t k, const vector<string> &pat
 	       MatchSegments(key, k + 1, pat, p + 1);
 }
 
+// One PostgreSQL database as pgvfs sees it: the connection behind it and an id
+// that names it in DuckDB's cache version tags.
+struct PgvfsTarget {
+	PgvfsTarget() = default;
+	PgvfsTarget(PgvfsConn *conn_, idx_t id_) : conn(conn_), id(id_) {
+	}
+	PgvfsConn *conn = nullptr;
+	idx_t id = 0;
+};
+
 class PgvfsFileSystem;
 
 class PgvfsFileHandle : public FileHandle {
 public:
-	PgvfsFileHandle(FileSystem &fs, const string &path, FileOpenFlags flags, PgvfsConn *conn)
-	    : FileHandle(fs, path, flags), conn(conn) {
+	PgvfsFileHandle(FileSystem &fs, const string &path, FileOpenFlags flags, PgvfsTarget where)
+	    : FileHandle(fs, path, flags), conn(where.conn), target(where.id) {
 	}
 	~PgvfsFileHandle() override {
 		if (writer) {
@@ -120,6 +132,7 @@ public:
 	}
 
 	PgvfsConn *conn;
+	idx_t target;
 	PgvfsFile file {};
 	PgvfsWriter *writer = nullptr;
 	idx_t written = 0;
@@ -129,8 +142,8 @@ public:
 class PgvfsFileSystem : public FileSystem {
 public:
 	~PgvfsFileSystem() override {
-		if (conn) {
-			pgvfs_disconnect(conn);
+		for (auto &entry : targets) {
+			pgvfs_disconnect(entry.second.conn);
 		}
 	}
 
@@ -149,11 +162,11 @@ public:
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener) override {
 		auto p = ParseFile(path);
-		auto *c = Conn(opener);
+		auto target = Conn(opener, path);
 		if (flags.OpenForAppending() || (flags.OpenForReading() && flags.OpenForWriting())) {
 			throw NotImplementedException("pgvfs files are written once, sequentially: %s", path);
 		}
-		auto handle = make_uniq<PgvfsFileHandle>(*this, path, flags, c);
+		auto handle = make_uniq<PgvfsFileHandle>(*this, path, flags, target);
 		if (flags.OpenForWriting()) {
 			// Every write makes a new file, replacing any at this path on Close().
 			if (!flags.CreateFileIfNotExists() && !flags.OverwriteExistingFile()) {
@@ -162,7 +175,7 @@ public:
 			if (flags.ExclusiveCreate() || flags.ReturnNullIfExists()) {
 				PgvfsFile existing;
 				char *err = nullptr;
-				auto rc = pgvfs_open(c, p.volume.c_str(), p.path.c_str(), &existing, &err);
+				auto rc = pgvfs_open(target.conn, p.volume.c_str(), p.path.c_str(), &existing, &err);
 				if (rc < 0) {
 					Fail("open", path, err);
 				}
@@ -174,14 +187,14 @@ public:
 				}
 			}
 			char *err = nullptr;
-			handle->writer = pgvfs_writer_open(c, p.volume.c_str(), p.path.c_str(), &err);
+			handle->writer = pgvfs_writer_open(target.conn, p.volume.c_str(), p.path.c_str(), &err);
 			if (!handle->writer) {
 				Fail("create", path, err);
 			}
 			return std::move(handle);
 		}
 		char *err = nullptr;
-		auto rc = pgvfs_open(c, p.volume.c_str(), p.path.c_str(), &handle->file, &err);
+		auto rc = pgvfs_open(target.conn, p.volume.c_str(), p.path.c_str(), &handle->file, &err);
 		if (rc < 0) {
 			Fail("open", path, err);
 		}
@@ -251,8 +264,11 @@ public:
 		return timestamp_t(handle.Cast<PgvfsFileHandle>().file.created_us);
 	}
 
+	// Names the database and the file: the same path can name different files in
+	// different databases, and file ids are only unique within one database.
 	string GetVersionTag(FileHandle &handle) override {
-		return std::to_string(handle.Cast<PgvfsFileHandle>().file.file_id);
+		auto &h = handle.Cast<PgvfsFileHandle>();
+		return std::to_string(h.target) + ":" + std::to_string(h.file.file_id);
 	}
 
 	FileType GetFileType(FileHandle &) override {
@@ -293,9 +309,10 @@ public:
 		if (p.path.empty() || p.path.back() == '/') {
 			return false;
 		}
+		auto target = Conn(opener, filename);
 		PgvfsFile f;
 		char *err = nullptr;
-		auto rc = pgvfs_open(Conn(opener), p.volume.c_str(), p.path.c_str(), &f, &err);
+		auto rc = pgvfs_open(target.conn, p.volume.c_str(), p.path.c_str(), &f, &err);
 		if (rc < 0) {
 			Fail("stat", filename, err);
 		}
@@ -310,8 +327,9 @@ public:
 
 	bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) override {
 		auto p = ParseFile(filename);
+		auto target = Conn(opener, filename);
 		char *err = nullptr;
-		auto rc = pgvfs_remove(Conn(opener), p.volume.c_str(), p.path.c_str(), &err);
+		auto rc = pgvfs_remove(target.conn, p.volume.c_str(), p.path.c_str(), &err);
 		if (rc < 0) {
 			Fail("remove", filename, err);
 		}
@@ -326,8 +344,9 @@ public:
 		if (from.volume != to.volume) {
 			throw NotImplementedException("pgvfs cannot move files between volumes: %s -> %s", source, target);
 		}
+		auto conn = Conn(opener, source);
 		char *err = nullptr;
-		if (pgvfs_rename(Conn(opener), from.volume.c_str(), from.path.c_str(), to.path.c_str(), &err) != 0) {
+		if (pgvfs_rename(conn.conn, from.volume.c_str(), from.path.c_str(), to.path.c_str(), &err) != 0) {
 			Fail("move", source, err);
 		}
 	}
@@ -336,12 +355,14 @@ public:
 	// removing one removes every file under it, in one statement.
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) override {
 		auto p = Parse(directory);
-		return !List(Conn(opener), p.volume, DirPrefix(p.path), 1).empty();
+		auto target = Conn(opener, directory);
+		return !List(target.conn, p.volume, DirPrefix(p.path), 1).empty();
 	}
 
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) override {
 		auto p = Parse(directory);
-		RemovePrefix(Conn(opener), p.volume, DirPrefix(p.path));
+		auto target = Conn(opener, directory);
+		RemovePrefix(target.conn, p.volume, DirPrefix(p.path));
 		auto context = FileOpener::TryGetClientContext(opener);
 		if (context) {
 			ForgetTantivyPrefix(*context, string(SCHEME) + p.volume + "/" + DirPrefix(p.path));
@@ -358,10 +379,10 @@ public:
 		return n;
 	}
 
-	// For SQL functions: this database's connection.
-	PgvfsConn *Connect(ClientContext &context) {
+	// For SQL functions: the database that `path` names.
+	PgvfsTarget Connect(ClientContext &context, const string &path) {
 		ClientContextFileOpener opener(context);
-		return Conn(&opener);
+		return Conn(&opener, path);
 	}
 
 	void CreateDirectory(const string &, optional_ptr<FileOpener>) override {
@@ -374,8 +395,9 @@ public:
 	               FileOpener *opener) override {
 		auto p = Parse(directory);
 		auto prefix = DirPrefix(p.path);
+		auto target = Conn(opener, directory);
 		string last_dir;
-		auto keys = List(Conn(opener), p.volume, prefix, -1);
+		auto keys = List(target.conn, p.volume, prefix, -1);
 		for (auto &key : keys) {
 			auto rest = key.substr(prefix.size());
 			auto slash = rest.find('/');
@@ -398,12 +420,13 @@ public:
 			}
 			return out;
 		}
-		auto first = p.path.find_first_of("*?[");
-		auto cut = p.path.rfind('/', first);
-		auto prefix = cut == string::npos ? "" : p.path.substr(0, cut + 1);
+		// Every match starts with the literal text before the first wildcard, so
+		// only that key range is listed.
+		auto prefix = p.path.substr(0, p.path.find_first_of("*?["));
 		auto pattern = StringUtil::Split(p.path, '/');
 		auto base = string(SCHEME) + p.volume + "/";
-		for (auto &key : List(Conn(opener), p.volume, prefix, -1)) {
+		auto target = Conn(opener, path);
+		for (auto &key : List(target.conn, p.volume, prefix, -1)) {
 			if (MatchSegments(StringUtil::Split(key, '/'), 0, pattern, 0)) {
 				out.emplace_back(base + key);
 			}
@@ -429,18 +452,14 @@ private:
 		return keys;
 	}
 
-	// One connection pool per database, opened on first use. Credentials
-	// resolve like the postgres extension's, so one secret can serve both
-	// DuckLake's catalog and pgvfs: the postgres secret named by pgvfs_secret,
-	// else $PGVFS_URL, else the unnamed default postgres secret.
-	PgvfsConn *Conn(optional_ptr<FileOpener> opener) {
-		auto target = ConnectionString(opener);
+	// The database for `path`, connected on first use. One pool per database,
+	// shared by every path that names it.
+	PgvfsTarget Conn(optional_ptr<FileOpener> opener, const string &path) {
+		auto target = ConnectionString(opener, path);
 		std::lock_guard<std::mutex> guard(lock);
-		if (conn) {
-			if (!target.empty() && target != conn_target) {
-				throw InvalidInputException("pgvfs is already connected to another database in this process");
-			}
-			return conn;
+		auto found = targets.find(target);
+		if (found != targets.end()) {
+			return found->second;
 		}
 		if (target.empty()) {
 			throw InvalidInputException(
@@ -454,15 +473,47 @@ private:
 			threads = int64_t(TaskScheduler::GetScheduler(*db).NumberOfThreads());
 		}
 		char *err = nullptr;
-		conn = pgvfs_connect(target.c_str(), threads, &err);
+		auto conn = pgvfs_connect(target.c_str(), threads, &err);
 		if (!conn) {
 			Fail("connect to", "PostgreSQL", err);
 		}
-		conn_target = target;
-		return conn;
+		PgvfsTarget made(conn, next_id++);
+		targets.emplace(target, made);
+		return made;
 	}
 
-	static string ConnectionString(optional_ptr<FileOpener> opener) {
+	// The postgres secret named by `name` (in the catalog, else on local storage), as a connection
+	// string. A secret of another type is refused.
+	static string NamedConnectionString(ClientContext &context, const string &name) {
+		auto &secrets = SecretManager::Get(context);
+		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+		auto entry = secrets.GetSecretByName(transaction, name);
+		if (!entry) {
+			entry = secrets.GetSecretByName(transaction, name, "local_file");
+		}
+		if (!entry) {
+			return "";
+		}
+		if (entry->secret->GetType() != "postgres") {
+			throw InvalidInputException("pgvfs secret \"%s\" is a %s secret, not postgres", name,
+			                            entry->secret->GetType());
+		}
+		return SecretToConnectionString(dynamic_cast<const KeyValueSecret &>(*entry->secret));
+	}
+
+	// The credentials for `path`, as a connection string ("" when none is configured). In order:
+	// the postgres secret named pgvfs_<volume>, which gives that volume its own database
+	// (CREATE SECRET pgvfs_lake (TYPE postgres, ...)); the pgvfs_secret setting; $PGVFS_URL; the
+	// unnamed default postgres secret that DuckLake's catalog uses. DuckDB's postgres secrets keep
+	// no SCOPE, so the name is what routes a path.
+	static string ConnectionString(optional_ptr<FileOpener> opener, const string &path) {
+		auto context = FileOpener::TryGetClientContext(opener);
+		if (context) {
+			auto per_volume = NamedConnectionString(*context, "pgvfs_" + Parse(path).volume);
+			if (!per_volume.empty()) {
+				return per_volume;
+			}
+		}
 		string name;
 		Value setting;
 		if (FileOpener::TryGetCurrentSetting(opener, "pgvfs_secret", setting) && !setting.IsNull()) {
@@ -476,27 +527,14 @@ private:
 			}
 			name = "__default_postgres";
 		}
-		auto context = FileOpener::TryGetClientContext(opener);
 		if (!context) {
 			return "";
 		}
-		auto &secrets = SecretManager::Get(*context);
-		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(*context);
-		auto entry = secrets.GetSecretByName(transaction, name);
-		if (!entry) {
-			entry = secrets.GetSecretByName(transaction, name, "local_file");
+		auto found = NamedConnectionString(*context, name);
+		if (found.empty() && explicit_secret) {
+			throw InvalidInputException("pgvfs_secret: no secret named \"%s\"", name);
 		}
-		if (!entry) {
-			if (explicit_secret) {
-				throw InvalidInputException("pgvfs_secret: no secret named \"%s\"", name);
-			}
-			return "";
-		}
-		if (entry->secret->GetType() != "postgres") {
-			throw InvalidInputException("pgvfs_secret \"%s\" is a %s secret, not postgres", name,
-			                            entry->secret->GetType());
-		}
-		return SecretToConnectionString(dynamic_cast<const KeyValueSecret &>(*entry->secret));
+		return found;
 	}
 
 	// A postgres secret as a key='value' connection string (tokio-postgres
@@ -527,8 +565,9 @@ private:
 	}
 
 	std::mutex lock;
-	PgvfsConn *conn = nullptr;
-	string conn_target;
+	// Connection string -> database. Entries live until the filesystem is destroyed.
+	std::map<string, PgvfsTarget> targets;
+	idx_t next_id = 1;
 };
 
 // pgvfs_stats(): JSON of process-wide counters (opens, reads, bytes, time
@@ -557,14 +596,13 @@ struct PgvfsEntry : public ObjectCacheEntry {
 };
 
 // pgvfs_drop_volume(volume): remove every file in a volume; how many there
-// were. Their rows are reaped after the usual grace. The writer only.
+// were. Their rows are reaped after the usual grace. Needs a role that can write.
 void DropVolumeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &context = state.GetContext();
 	auto entry = ObjectCache::GetObjectCache(context).Get<PgvfsEntry>(PgvfsEntry::ObjectType());
 	if (!entry) {
 		throw InternalException("pgvfs is not loaded in this database");
 	}
-	PgvfsConn *conn = nullptr;
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto volume = args.data[0].GetValue(i);
 		if (volume.IsNull()) {
@@ -580,10 +618,8 @@ void DropVolumeFunction(DataChunk &args, ExpressionState &state, Vector &result)
 		    FileSystem::GetFileSystem(context).IsDisabledForPath(path)) {
 			throw PermissionException("Cannot drop pgvfs volume %s - file system operations are disabled", name);
 		}
-		if (!conn) {
-			conn = entry->fs.Connect(context);
-		}
-		auto n = PgvfsFileSystem::RemovePrefix(conn, name, "");
+		auto target = entry->fs.Connect(context, path);
+		auto n = PgvfsFileSystem::RemovePrefix(target.conn, name, "");
 		ForgetTantivyPrefix(context, path);
 		result.SetValue(i, Value::BIGINT(n));
 	}
@@ -593,8 +629,9 @@ void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
 	config.AddExtensionOption("pgvfs_secret",
-	                          "Name of the postgres secret pgvfs:// connects with. Unset: $PGVFS_URL, else the "
-	                          "unnamed default postgres secret (the one DuckLake's catalog uses)",
+	                          "Name of the postgres secret pgvfs:// connects with, unless a secret named pgvfs_<volume> "
+	                          "exists for the volume. Unset: $PGVFS_URL, else the unnamed default postgres secret (the "
+	                          "one DuckLake's catalog uses)",
 	                          LogicalType::VARCHAR);
 	// Cache Parquet footers across queries (off by default in DuckDB). Safe:
 	// the cache is keyed by path and last-modified time, and a pgvfs path's
@@ -616,7 +653,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	CreateScalarFunctionInfo drop_volume_info(drop_volume);
 	FunctionDescription drop_volume_doc;
 	drop_volume_doc.description =
-	    "Removes every file in a pgvfs volume, through the writer. Returns the number of files.";
+	    "Removes every file in a pgvfs volume, unpublishing it for the reap grace. Returns the number of files.";
 	drop_volume_doc.examples = {"SELECT pgvfs_drop_volume('scratch')"};
 	drop_volume_info.descriptions.push_back(std::move(drop_volume_doc));
 	loader.RegisterFunction(std::move(drop_volume_info));

@@ -1,6 +1,6 @@
 # name: test/sql/pgvfs.test
 # description: pgvfs loads and fails cleanly without PostgreSQL (the storage
-#   itself is tested against real PostgreSQL by scripts/contract.sh)
+#   itself is tested against real PostgreSQL by `just contract`)
 # group: [pgvfs]
 
 require parquet

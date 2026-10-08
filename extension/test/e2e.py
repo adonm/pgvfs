@@ -1,11 +1,14 @@
 """End-to-end: DuckDB + the pgvfs extension against a real PostgreSQL.
 
-    PGVFS_TEST_URL=postgres://... python e2e.py path/to/pgvfs.duckdb_extension
+    PGVFS_TEST_URL=postgres://... PGVFS_TEST_READER_URL=postgres://...
+    PGVFS_TEST_SECOND_URL=postgres://... python e2e.py path/to/pgvfs.duckdb_extension
 
-PGVFS_TEST_URL names the database under test. It becomes
-one default postgres secret that serves both pgvfs and the DuckLake catalog
-(its own tables in the same database; no s3p schema). Each run uses a fresh
-volume, so reruns never collide.
+PGVFS_TEST_URL names the database under test. It becomes one default postgres
+secret that serves both pgvfs and the DuckLake catalog (its own tables in the
+same database; no s3p schema). PGVFS_TEST_READER_URL is that database as a
+SELECT-only role. PGVFS_TEST_SECOND_URL is an empty database, which one volume
+reaches through its pgvfs_<volume> secret. Each run uses a fresh volume, so
+reruns never collide.
 """
 
 import json
@@ -30,16 +33,20 @@ def sql_text(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def create_secret(con, url, name=""):
+    con.execute(
+        f"CREATE SECRET {name} (TYPE postgres, HOST {sql_text(url.hostname)}, PORT {url.port or 5432}, "
+        f"USER {sql_text(unquote(url.username))}, PASSWORD {sql_text(unquote(url.password))}, "
+        f"DATABASE {sql_text(url.path.lstrip('/'))})"
+    )
+
+
 def connect(url=url):
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute(f"LOAD '{ext}'")
     con.execute("INSTALL postgres")
     con.execute("LOAD postgres")
-    con.execute(
-        f"CREATE SECRET (TYPE postgres, HOST {sql_text(url.hostname)}, PORT {url.port or 5432}, "
-        f"USER {sql_text(unquote(url.username))}, PASSWORD {sql_text(unquote(url.password))}, "
-        f"DATABASE {sql_text(url.path.lstrip('/'))})"
-    )
+    create_secret(con, url)
     return con
 
 
@@ -357,14 +364,11 @@ for sql, msg in [
     except duckdb.Error as e:
         assert msg in str(e), (sql, e)
 assert one(con, f"SELECT count(*) FROM glob('{root}/fts/x*')") == (0,), "failed builds left files"
-try:  # only the pgvfs writer writes to pgvfs
-    con2.execute(
-        f"SELECT tantivy_index('{root}/fts/y.tantivy', {sql_text(fts_schema)}, to_json(t)) FROM lake.docs t"
-    ).fetchall()
-    raise AssertionError("a second process wrote a split")
-except duckdb.Error as e:
-    assert "writer" in str(e), e
-assert one(con, f"SELECT count(*) FROM glob('{root}/fts/y*')") == (0,)
+# Any process whose role can write may write: the second connection's split is visible to the first.
+assert con2.execute(f"FROM tantivy_create_index('{root}/fts/y.tantivy', 'lake.docs', 'id', ['body'])").fetchall() == [
+    (3,)
+]
+assert one(con, f"SELECT count(*) FROM tantivy_search('{root}/fts/y.tantivy', 'cats')") == (1,)
 
 stats = json.loads(one(con, "SELECT pgvfs_stats()")[0])
 assert stats["reads"] > stats0["reads"] and stats["read_bytes"] > 0, stats
@@ -386,8 +390,20 @@ if standby:
     assert one(con3, "SELECT count(*) FROM lake.t") == want, "standby never caught up"
     assert one(con3, "SELECT count(*) FROM lake.docs_splits s CROSS JOIN tantivy_search(s.path, 'fox')") == (1,)
 
-# Drop only one volume, through the writer. Cache entries are invalidated at
-# once in that database; open readers keep their file IDs for the usual grace.
+# Routing: a volume goes to the database its pgvfs_<volume> secret names. The same path holds
+# each database's own bytes, and dropping the secret routes it back to the default database.
+routed = vol + "-routed"
+routed_path = f"pgvfs://{routed}/x.parquet"
+routed_secret = f'"pgvfs_{routed}"'
+con.execute(f"COPY (SELECT 'default' AS v) TO '{routed_path}' (FORMAT parquet)")
+create_secret(con, urlsplit(os.environ["PGVFS_TEST_SECOND_URL"]), routed_secret)
+con.execute(f"COPY (SELECT 'second' AS v) TO '{routed_path}' (FORMAT parquet)")
+assert one(con, f"SELECT v FROM read_parquet('{routed_path}')") == ("second",)
+con.execute(f"DROP SECRET {routed_secret}")
+assert one(con, f"SELECT v FROM read_parquet('{routed_path}')") == ("default",)
+
+# Drop only one volume. Cache entries are invalidated at once in that database;
+# open readers keep their file IDs for the usual grace.
 drop_volume = vol + "-drop"
 drop_root = f"pgvfs://{drop_volume}"
 drop_index = f"{drop_root}/docs.tantivy"
@@ -397,11 +413,15 @@ assert one(
     con, f"SELECT tantivy_index('{drop_index}', {sql_text(fts_schema)}, " "json_object('rowid', 1, 'body', 'fox'))"
 ) == (1,)
 assert one(con, f"SELECT tantivy_count('{drop_index}', 'fox')") == (1,)
-try:
-    con2.execute(f"SELECT pgvfs_drop_volume('{drop_volume}')").fetchall()
-    raise AssertionError("a reader dropped a volume")
-except duckdb.Error as e:
-    assert "writer" in str(e), str(e)
+# A SELECT-only role reads the volume, but its writes and drops are refused by PostgreSQL.
+reader = connect(urlsplit(os.environ["PGVFS_TEST_READER_URL"]))
+assert one(reader, f"SELECT i FROM '{drop_root}/one.parquet'") == (1,)
+for sql in [f"COPY (SELECT 2 AS i) TO '{drop_root}/two.parquet'", f"SELECT pgvfs_drop_volume('{drop_volume}')"]:
+    try:
+        reader.execute(sql).fetchall()
+        raise AssertionError(f"a SELECT-only role succeeded: {sql}")
+    except duckdb.Error as e:
+        assert "permission denied" in str(e), (sql, e)
 assert one(con, "SELECT pgvfs_drop_volume(NULL)") == (None,)
 try:
     con.execute("SELECT pgvfs_drop_volume(?)", [drop_volume + "\0suffix"]).fetchall()
