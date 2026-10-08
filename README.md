@@ -3,9 +3,9 @@
 `pgvfs://` is a DuckDB filesystem that stores DuckLake's data files as rows in
 PostgreSQL. Put the DuckLake catalog in the same database and one PostgreSQL
 is the whole lake: one secret, one backup, one set of roles. Any number of
-DuckDB readers query it directly, with no object store, gateway or HTTP, so
-lookups take milliseconds. One process writes. Works on any PostgreSQL 11+,
-including Amazon Aurora.
+DuckDB processes read and write it directly, with no object store, gateway or
+HTTP. Any process whose PostgreSQL role can write may write. Works on PostgreSQL
+14 or later, including Amazon Aurora.
 
 Documentation: **<https://pgvfs.adonm.dev>**
 
@@ -61,7 +61,7 @@ WHERE site_id = 42 AND day = DATE '2026-09-01'; -- 2
 Run initialization once. In later sessions, load the extensions, recreate
 the secret, and attach the existing lake. Readers use `ATTACH
 'ducklake:postgres:' AS lake (READ_ONLY)` with a role that can read the catalog
-and pgvfs tables. Only one process writes. For remote PostgreSQL, add
+and pgvfs tables. For remote PostgreSQL, add
 `SSLMODE 'require'` to the secret; see [credentials](https://pgvfs.adonm.dev/how-it-works.html#credentials).
 
 ## Documentation
@@ -73,8 +73,8 @@ and pgvfs tables. Only one process writes. For remote PostgreSQL, add
   built and searched from SQL, on pgvfs or any DuckDB filesystem.
 - [Vector search](https://pgvfs.adonm.dev/vectors.html): nearest neighbours
   over a clustered lake, in plain SQL.
-- [How it works](https://pgvfs.adonm.dev/how-it-works.html): storage, one
-  writer and many readers, credentials, configuration.
+- [How it works](https://pgvfs.adonm.dev/how-it-works.html): storage, writers
+  and readers, credentials, configuration.
 - [Performance](https://pgvfs.adonm.dev/performance.html): benchmarks and
   sizing.
 - [Development](https://pgvfs.adonm.dev/development.html): build, test,
@@ -85,7 +85,7 @@ and pgvfs tables. Only one process writes. For remote PostgreSQL, add
 ```sh
 mise install          # toolchain: rust, just, uv, python, mdbook
 just check            # fmt, clippy, unit tests
-just e2e              # build the extension in a container, then contract + end-to-end tests
+just e2e              # build the extension, then the storage contract and end-to-end tests
 just bench city       # benchmark: Overture Houston, about a minute
 ```
 

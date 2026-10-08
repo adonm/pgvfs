@@ -4,6 +4,54 @@ pgvfs is in beta: the SQL interface and configuration are expected to stay,
 but storage layout changes are still possible (see "Storage layout" in the
 docs). Each release lists its layout version.
 
+## 0.2.0-beta.6
+
+Storage layout: **v2** (unchanged). The functions moved to `functions.sql`, which
+writers keep current; the tables did not change.
+
+- **Any process whose role can write may write.** The writer lease, its
+  dedicated connection and the "another writer holds the lock" error are gone.
+  Concurrent writers publish independently. Two writers publishing one path: the
+  second fails with a clear error and rolls back. A `SELECT`-only role's write,
+  drop or reap fails with PostgreSQL's permission error.
+- **Reaping runs in every writer,** under a try-lock, so concurrent reaps skip.
+  Each reap deletes a bounded range of rows per file. `PGVFS_REAP_GRACE_S` sets
+  the grace (600 seconds by default); a read that outlives it names the setting
+  in its error.
+- **Credentials per volume.** A `postgres` secret named `pgvfs_<volume>` gives
+  that volume its own database; each database has its own connection pool. DuckDB
+  keeps no `SCOPE` on postgres secrets, so the name is what routes a path.
+- **Build memory is bounded.** `tantivy_index` reserves each open build's
+  `memory_budget` (plus about 10 MB) against `memory_limit` and fails before any
+  build starts that would exceed it. Indexing threads are DuckDB's `threads`
+  shared among the open builds (at most 8 each), with one merge thread. Earlier
+  versions started tantivy's default of about 21 threads per build.
+- **Listing streams one primary-key range query,** and `glob` lists only the
+  literal prefix before its first `*`, `?` or `[`.
+- `pgvfs_drop_volume` works from any writer.
+- Build: `just ext` builds the stable extension locally from the DuckDB 1.5.6
+  submodule. The container build is for DuckDB 2.0 dev builds. Every script is a
+  justfile recipe; `scripts/` is gone, and `site.py` moved to `tools/`.
+- Benchmarks: cold passes evict PostgreSQL's files from the OS page cache;
+  `ROUNDS` repeats restart, eviction and passes; `PG_DEVICE` with
+  `PG_READ_IOPS` and `PG_READ_BPS` throttles PostgreSQL's disk reads.
+- PostgreSQL 11 to 13 are end-of-life upstream. The contract still passes on
+  them; use 14 or later.
+
+Upgrading from beta.5:
+
+- The first write by the database owner (or a superuser) replaces `pgvfs.reap`
+  with the new one. Until then, writers that do not own the functions keep the
+  beta.5 reap, which has no try-lock and deletes whole files at once.
+- Builds that would exceed `memory_limit` now fail. Each open build reserves
+  `memory_budget` plus about 10 MB, so at the default 256 MB budget a query
+  can have at most `memory_limit` / 266 MB groups. Lower `memory_budget` or
+  build fewer groups per query.
+- A `postgres` secret named `pgvfs_<volume>` now takes precedence over
+  `pgvfs_secret` for that volume. Rename any secret that already has that name.
+- A SELECT-only role's `pgvfs_drop_volume` fails with PostgreSQL's permission
+  error, not the old "writer" error.
+
 ## 0.2.0-beta.5
 
 Storage layout: **v2** (unchanged).

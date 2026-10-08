@@ -4,9 +4,11 @@
 
 {{#include ../generated/bench.md}}
 
-Passes: **cold** is the first pass after a PostgreSQL restart with new DuckDB
-processes; **warm** repeats the same queries; **new params** runs fresh
-random queries on warm processes.
+Passes: **cold** is the first pass after PostgreSQL restarts with its files
+evicted from the operating system's page cache, in new DuckDB processes;
+**warm** repeats the same queries; **new params** runs fresh random queries on
+warm processes. `ROUNDS` repeats the restart, eviction and passes; the lines of
+each round carry its `round`.
 
 ## Sizing
 
@@ -42,7 +44,10 @@ the group key helps too.
 ## Reference results
 
 All on one 16-core laptop, DuckDB 1.5.6, PostgreSQL 18 in a container.
-[Loading data](loading.md#measurements) has the layout measurements.
+[Loading data](loading.md#measurements) has the layout measurements. These
+results predate the page-cache eviction in the benchmark's cold passes, so their
+cold numbers had the operating system's cache warm; the weekly history is
+measured that way.
 Absolute numbers moved by up to 1.7× with the laptop's other load (warm
 Houston ran at 390–660 queries/s on the same day), so compare rows within a
 table: those runs alternated under the same conditions.
@@ -93,11 +98,18 @@ just bench city                         # Overture Houston, 1M rows: about a min
 just bench hits                         # ClickBench, 100M rows: about 4 minutes (14 GB download)
 MODE=profile just bench city            # where one warm query of each kind spends its time
 READERS=6 just bench city               # 6 readers with 2 threads each
+ROUNDS=3 just bench city                # three restarts, each with its files evicted
+PG_DEVICE=/dev/nvme0n1 PG_READ_IOPS=3000 PG_READ_BPS=125mb just bench city  # gp3's baseline disk
 LOAD_ARGS="--variant trickle" just bench city   # layout variants: see bench/city.py
 ```
 
-Each run loads the data into a fresh PostgreSQL container, pins PostgreSQL to
-about a fifth of the cores, restarts it, then runs lockstep readers: one cold
-pass, warm passes and a new-parameter pass. Every pass reports queries/s,
-latency, PostgreSQL's CPU and `pgvfs_stats()`. Memory stays bounded (see
-`scripts/bench.sh`).
+Each run loads the data into a fresh PostgreSQL container, on a data volume
+that the rounds keep. Each round then starts PostgreSQL in a new container
+pinned to about a fifth of the cores, evicts its files from the operating
+system's page cache, and runs lockstep readers: one cold pass, warm passes and a
+new-parameter pass. Every pass reports queries/s, latency, PostgreSQL's CPU and
+`pgvfs_stats()`. Memory stays bounded: `LOAD_MEMORY` (default 4 GiB, sorts spill
+to disk), `READER_MEMORY` (2 GiB per reader) and `PG_MEMORY` (6 GB for
+PostgreSQL). `PG_DEVICE` with `PG_READ_IOPS` and `PG_READ_BPS` throttles
+PostgreSQL's disk reads, a container setting that needs the device that holds
+Docker's volumes. The bench recipe is in the [justfile](https://github.com/adonm/pgvfs/blob/main/justfile).

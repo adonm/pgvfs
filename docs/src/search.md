@@ -27,8 +27,8 @@ indexes.
 
 ## Quick start
 
-On the writer, index the `title` and `body` columns of `lake.docs` under its
-key `id`:
+Index the `title` and `body` columns of `lake.docs` under its key `id`, from a
+process whose role can write to pgvfs:
 
 ```sql
 FROM tantivy_create_index('pgvfs://lake-fts/docs.tantivy', 'lake.docs', 'id', ['title', 'body']);
@@ -92,7 +92,7 @@ GROUP BY path;
 INSERT INTO lake.docs_fts_state VALUES (getvariable('s1'));
 COMMIT;
 
--- after each load, on the writer
+-- after each load
 BEGIN;
 SET VARIABLE s0 = (SELECT snapshot FROM lake.docs_fts_state);
 SET VARIABLE s1 = (SELECT id::BIGINT FROM lake.current_snapshot());
@@ -222,7 +222,7 @@ document per row, and returns the number of documents. The split is
 written as the aggregate finishes. The arguments are per row: with
 `GROUP BY`, each group builds its own split, and every row of a group must
 name the same `index`. No rows, no split. `index` must not exist yet (on
-pgvfs, only the writer can write). A failed split write cleans up its target;
+pgvfs, the process needs a role that can write). A failed split write cleans up its target;
 already completed splits are not rolled back with the SQL statement.
 
 - `schema` is a tantivy schema as JSON: an array of
@@ -254,8 +254,12 @@ already completed splits are not rolled back with the SQL statement.
 **Memory and disk of a build.** Every group of a query is built at the same
 time, and each takes about `memory_budget` of heap (256 MB by default, plus
 about 10 MB; less for a group with less data than that) on top of DuckDB's own
-memory. `memory_limit` does not bound it, and a materialised source table is
-DuckDB memory as well. So
+memory. Before a build starts, `tantivy_index` checks the reservations of the
+builds open (groups × (`memory_budget` + 10 MB)) against `memory_limit`, and
+fails with a message that says what to change: lower `memory_budget`, build
+fewer groups per query, or raise `memory_limit`. The check counts tantivy's
+reservations only, so leave room for DuckDB's own memory, including a
+materialised source table. So
 
 > peak ≈ DuckDB's memory + groups × (`memory_budget` + 10 MB)
 
@@ -277,6 +281,11 @@ lower `memory_budget` or build fewer groups per query.
 Each group also keeps its index in a local temporary directory (`TMPDIR`)
 until its split is written: about the size of the split, for all groups at
 once. On a tmpfs (often `/tmp`) that is memory too, so point `TMPDIR` at a disk.
+
+**Threads.** A build's indexing threads are DuckDB's `threads` divided among the
+builds open (at most 8 per build), and each build has one merge thread. Earlier
+versions gave every build tantivy's own default, about 21 threads: 256 groups
+started 5,392.
 
 ### `tantivy_search(index, query [, options [, exclude]])`
 
@@ -458,7 +467,7 @@ nothing instead, as in OpenSearch, for splits built with different schemas.
 ### `tantivy_drop(index)`
 
 Removes the split at `index`, and returns whether there was one (on pgvfs,
-on the writer). A scalar function, so `SELECT tantivy_drop(path) FROM ...`
+from a role that can write). A scalar function, so `SELECT tantivy_drop(path) FROM ...`
 drops many.
 
 ### The fts-style macros
@@ -490,8 +499,9 @@ with the lake.
 ## How it works
 
 - **Builds** use tantivy's own index directory in a local temporary one
-  (`TMPDIR`), with tantivy's indexing threads, so a build needs free local
-  disk about the size of the split. The finished index (merged to one
+  (`TMPDIR`), with indexing threads shared out from DuckDB's `threads` (see
+  memory and disk above), so a build needs free local disk about the size of
+  the split. The finished index (merged to one
   segment) is written to `index` as a single file: its files back to back
   and a small footer naming them.
 - **Searches** read a split through DuckDB's filesystem, opening it once per
@@ -507,8 +517,8 @@ with the lake.
   4 million documents in 4 splits, 60% of them excluded, a count of 2.8 million
   matches takes 9 ms (1.4 ms with nothing excluded), a top 10 takes 6 ms (5 ms),
   and a new set costs 25 ms the first time (`bench/search.py` measures these).
-- **Drops** remove the file. On pgvfs its rows stay for the usual 10-minute
-  grace, so searches already running finish; object stores delete at once,
+- **Drops** remove the file. On pgvfs its rows stay for the reap grace
+  (`PGVFS_REAP_GRACE_S`, 10 minutes by default), so searches already running finish; object stores delete at once,
   so there drop replaced splits a while after swapping them out.
 - **Storage.** On pgvfs a split is an ordinary file; the storage layout is
   unchanged.

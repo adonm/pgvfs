@@ -6,17 +6,18 @@ is the whole lake:
 
 - **One secret, one backup, one set of roles.** No object store, no S3
   credentials, no gateway.
-- **Many readers, one writer.** Readers need only `SELECT`, take no locks and
-  can run on read replicas. One process writes at a time.
-- **Millisecond reads.** Files are immutable, so DuckDB caches them without
+- **Many writers and readers.** Readers need only `SELECT`, take no locks and
+  can run on read replicas. Any process whose role can write may write, so
+  loaders run in parallel; PostgreSQL roles decide who may.
+- **Fast reads.** Files are immutable, so DuckDB caches them without
   revalidating. Reads are primary-key range queries straight into DuckDB's
-  buffers: a block read takes about 0.1–0.2 ms, and lookups on a well-laid-out
-  lake take single-digit milliseconds (see [Performance](performance.md)).
+  buffers: a block read takes about 0.1–0.2 ms, and with one reader a lookup on
+  a well-laid-out lake has a median under 10 ms (see [Performance](performance.md)).
 - **Search.** [Tantivy](search.md) full-text indexes, built and searched
   from SQL and stored in the lake (or on any DuckDB filesystem), and
   [vector search](vectors.md) as plain SQL over a clustered lake.
-- **Plain PostgreSQL 11+.** No extensions and no superuser needed, so managed
-  services work too; tested on Amazon Aurora PostgreSQL (with password
+- **Plain PostgreSQL.** No extensions and no superuser needed, so managed
+  services work too (14 or later; see [install](install.md)); tested on Amazon Aurora PostgreSQL (with password
   authentication; RDS IAM tokens aren't supported).
 
 It suits lakes that fit comfortably in one PostgreSQL (tested to 100M rows,
@@ -47,10 +48,12 @@ PostgreSQL clients, use one of these instead:
   data lake files in PostgreSQL, using DuckDB to execute queries.
 
 They suit scans and analytics over large lakes, but not millisecond lookups.
-In our testing, only pgvfs served lake queries in milliseconds: the others read
-from object storage, where each request takes tens of milliseconds. Aurora's
-announcement likewise recommends copying lake data into native tables when a
-query needs single-digit-millisecond latency.
+We did not test the projects above. Each reads object storage, where a request
+to S3 Standard takes tens of milliseconds; S3 Express One Zone, which is faster,
+was not tested. Aurora's announcement likewise recommends copying lake data into
+native tables when a query needs single-digit-millisecond latency. Against an S3
+gateway on the same PostgreSQL, pgvfs was faster on ClickBench
+([Performance](performance.md)).
 
 Source: <https://github.com/adonm/pgvfs> (Apache-2.0). Beta, storage layout v2;
 see the [changelog](https://github.com/adonm/pgvfs/blob/main/CHANGELOG.md) and

@@ -52,6 +52,15 @@ Recall depends on how clustered the data is. Real embeddings are clustered,
 nearer the first column than the second, but measure on your own, and pick
 the probes for the recall you need.
 
+Recall and bytes trade off directly: on overlapping blobs, 4 probes give 0.69
+recall for 10–14% of the bytes, and 16 give 0.88 for 39%. Clusters are the
+unit of I/O here. A graph index (HNSW, say) visits rows one at a time, and in
+pgvfs every read fetches at least one 8 KB chunk, so a search that visits
+hundreds of rows reads far more than a few probed clusters. That is an argument
+from the storage design, not a measurement: we have not benchmarked a graph
+index. Consider one only if the probes your recall needs read more bytes than a
+graph search would.
+
 ## At scale
 
 Pick the cluster count so a cluster spans a row group or two: for 10 billion

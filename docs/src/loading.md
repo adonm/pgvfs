@@ -150,10 +150,10 @@ rows each thread sees wants fewer threads instead (see
 
 ## 5. For big or continuous loads, write files elsewhere and register them
 
-When the writer itself is the bottleneck, move sorting and encoding out of
+When the loading process is the bottleneck, move sorting and encoding out of
 it. Any number of DuckDB processes, anywhere, write finished Parquet files in
-the lake's layout. The one writer only copies their bytes into pgvfs and
-registers them in the catalog, without decoding them:
+the lake's layout. One process with a role that can write to pgvfs only copies
+their bytes into pgvfs and registers them in the catalog, without decoding them:
 
 ```sql
 -- each producer: one sorted, contiguous key range per file
@@ -163,7 +163,7 @@ COPY (SELECT * EXCLUDE (bucket) FROM batch WHERE bucket = 0 ORDER BY site_id, da
 TO 'bucket-0000.parquet' (FORMAT parquet, COMPRESSION zstd, PARQUET_VERSION V2, ROW_GROUP_SIZE 8192);
 -- ... one COPY per bucket
 
--- the writer: copy the bytes, then register the files in one transaction
+-- the registering process: copy the bytes, then register the files in one transaction
 COPY (SELECT content FROM read_blob('bucket-0000.parquet'))
 TO 'pgvfs://lake/main/events/bucket-0000.parquet' (FORMAT blob);
 BEGIN;
@@ -176,17 +176,17 @@ COMMIT;
   Pick the bucket count so each file is about 64 MB. Don't rely on
   `FILE_SIZE_BYTES` rotation instead: it interleaves key ranges across
   files, so none of them prune.
-- **Copy from the writer process.** The writer lock belongs to the first
-  process that writes, so a separate copier would be refused. Several
-  connections of the writer's DuckDB share the lock and copy in parallel:
-  one streamed about 300 MiB/s, four 536 MiB/s; six and eight were slower
-  (PostgreSQL on 8 cores).
+- **Copy in parallel.** Each connection writes its own files, so several
+  connections of one DuckDB copy at once: one streamed about 300 MiB/s, four
+  536 MiB/s; six and eight were slower (PostgreSQL on 8 cores). Separate
+  processes may copy too, since there is no writer lock; their throughput was
+  not measured.
 - **Commit about 2 GB of files at a time.** Each commit has fixed catalog
   work and makes a snapshot. A 3.2 GiB load took 40.6 s in 256 MB commits,
   35.9 s in 2 GB commits and 36.5 s in 8 GB commits.
-- **Give the writer threads; cap its memory with `memory_limit`.** The same
-  load took 77 s on 1 thread and 33 s on 6, with the same 9.5 GiB peak, so
-  fewer threads only made it slower.
+- **Give the loading process threads; cap its memory with `memory_limit`.**
+  The same load took 77 s on 1 thread and 33 s on 6, with the same 9.5 GiB peak,
+  so fewer threads only made it slower.
 
 Registering new rows this way ran at 160–190 MiB/s of Parquet, copy and
 commit included. Updates and deletes still cost per changed row, because
@@ -301,7 +301,7 @@ memory; that took about 10% off this row's warm latency.
 
 From an API built on pgvfs: parcels, buildings and roof parts with every
 captured version, synthetic data seeded from Overture. DuckDB 1.5.6; for the
-pgvfs runs, one writer process with 6 threads and 8 GB and PostgreSQL 18 on
+pgvfs runs, one loading process with 6 threads and 8 GB and PostgreSQL 18 on
 8 cores and 8 GB. Single runs, so treat small differences as noise.
 
 **Compression and row groups** (local files, 3 batches of 100K parcels, 100

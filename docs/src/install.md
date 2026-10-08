@@ -16,8 +16,9 @@ DuckDB selects the build matching its version and platform:
 | macOS | Intel, Apple Silicon |
 | Windows | x86-64 |
 
-WebAssembly and MinGW/rtools are not supported. PostgreSQL **11+** is needed
-for storage; no PostgreSQL extensions are required. pgvfs is in beta, on
+WebAssembly and MinGW/rtools are not supported. Storage needs PostgreSQL
+**14 or later**; the contract also passes on 11 to 13, which are end-of-life
+upstream. No PostgreSQL extensions are required. pgvfs is in beta, on
 [storage layout v2](how-it-works.md#storage-layout-versions).
 
 ## Python
@@ -48,7 +49,7 @@ docker run --name pgvfs-demo --rm -d -p 127.0.0.1:54329:5432 \
   -e POSTGRES_DB=lake -e POSTGRES_USER=lake -e POSTGRES_PASSWORD=lake postgres:18
 ```
 
-Wait for PostgreSQL to be ready (`docker exec pgvfs-demo pg_isready -U lake -d lake`).
+Wait for PostgreSQL to be ready (`docker exec pgvfs-demo pg_isready -h 127.0.0.1 -U lake -d lake`; without `-h` it can report ready before TCP connections work).
 This demo uses local-only credentials and loses its data when stopped.
 For your own server, replace the host, port, database, user and password below.
 
@@ -106,8 +107,9 @@ SELECT count(*) FROM lake.events; -- 3
 
 The reader role needs `USAGE` on both the DuckLake catalog and pgvfs schemas,
 and `SELECT` on their tables. The same attach works on a streaming read
-replica. A writer can attach without `READ_ONLY`, but only one process may
-write at a time.
+replica. A process whose role can write attaches without `READ_ONLY`; several
+such processes may write at once, and [roles](how-it-works.md#roles) say which
+roles those are.
 
 ## Switch from an unsigned installation
 
@@ -162,5 +164,6 @@ signed community binaries. Prefer `FROM community` for stable DuckDB.
   the supported builds above. A 2.0 dev wheel needs its exact matching build.
 - **Missing PostgreSQL credentials:** load `postgres` and create its secret
   before attaching the lake. Secrets are temporary unless made persistent.
-- **Another writer holds the lock:** close the other writer, or use
-  `READ_ONLY` for this process. Readers do not need a writer lock.
+- **Permission denied on a write:** the role has no write privileges on
+  pgvfs's tables. Attach with `READ_ONLY` for a reader, or grant the writer
+  privileges as shown in [roles](how-it-works.md#roles).
