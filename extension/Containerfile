@@ -1,16 +1,16 @@
 # The pgvfs DuckDB extension, linked the way DuckDB's own loadable
 # extensions are: statically against duckdb_static of the exact DuckDB build
 # that will load it (DuckDB's Python module loads with RTLD_LOCAL, so an
-# extension cannot rely on the host's C++ symbols). DuckDB is never compiled:
-# the `duckdb` build context is prepared by scripts/duckdb.sh (source tree
-# for headers, prebuilt static libs, footer version).
+# extension cannot rely on the host's C++ symbols). DuckDB is never compiled
+# here: `just ext-nightly` prepares the `duckdb` build context (source tree for
+# headers, the static libs DuckDB's CI built for that commit, footer version).
+# The stable build is made locally by `just ext`, from the DuckDB submodule.
 #
-#   just ext            # stable release -> target/ext/release/
-#   just ext nightly    # newest 2.0 dev wheel -> target/ext/nightly/
+#   just ext-nightly    # newest 2.0 dev wheel -> target/ext/nightly/
 
 FROM rust:1-bookworm AS rust
 WORKDIR /src
-COPY Cargo.toml Cargo.lock schema.sql ./
+COPY Cargo.toml Cargo.lock schema.sql functions.sql ./
 COPY src/ src/
 COPY tantivy/ tantivy/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

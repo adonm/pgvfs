@@ -6,7 +6,7 @@ name: Pages
 on:
   push:
     branches: [main]
-    paths: [docs/**, scripts/site.py, .github/workflows/pages.yml]
+    paths: [docs/**, tools/site.py, .github/workflows/pages.yml]
   workflow_call:
   workflow_dispatch:
 
@@ -37,8 +37,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: jdx/mise-action@v3  # python, mdbook
-      - run: bash scripts/release.sh fetch releases
-      - run: python3 scripts/site.py site --releases releases
+      - run: just release-fetch releases
+      - run: python3 tools/site.py site --releases releases
       - uses: actions/upload-pages-artifact@v4
         with:
           path: site

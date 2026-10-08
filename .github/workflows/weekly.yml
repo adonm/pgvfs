@@ -48,8 +48,10 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0  # tags, for the extension version (git describe)
+          submodules: recursive  # the stable build compiles the duckdb submodule
       - uses: jdx/mise-action@v3
       - uses: docker/setup-buildx-action@v3
+        if: matrix.target == 'nightly'  # the nightly build runs in a container
       - run: just e2e ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
@@ -67,7 +69,7 @@ jobs:
           name: ext-release
           path: target/ext/release
       # Overture Houston (1M rows): cold, warm and new-area passes in minutes.
-      - run: bash scripts/bench.sh city --passes 4 | tee bench.jsonl
+      - run: just bench city --passes 4 | tee bench.jsonl
       - uses: actions/upload-artifact@v4
         with:
           name: bench
@@ -83,17 +85,18 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
       - run: |
           for target in release nightly; do
-            bash scripts/release.sh publish "artifacts/ext-$target"
+            just release-publish "artifacts/ext-$target"
           done
           if [ -f artifacts/bench/bench.jsonl ]; then
-            bash scripts/release.sh bench artifacts/bench/bench.jsonl
+            just release-bench artifacts/bench/bench.jsonl
           fi
-          bash scripts/release.sh prune
+          just release-prune
 
   pages:
     needs: publish

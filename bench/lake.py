@@ -9,9 +9,10 @@ batch(con, n, seed) -> [(kind, sql)].
     lake.py DATASET profile --ext EXT --url URL
 
 run: READERS processes each run their own fixed batch PASSES times in
-lockstep. Pass 1 is cold (new DuckDBs; scripts/bench.sh restarts PostgreSQL
-first), later passes warm, and a final pass uses new random parameters (warm
-caches, unseen queries). One JSON line per pass, then per-kind latencies.
+lockstep. Pass 1 is cold (new DuckDBs, after `just bench` restarted PostgreSQL
+and evicted its files from the OS page cache), later passes warm, and a final
+pass uses new random parameters (warm caches, unseen queries). One JSON line
+per pass (with the round, when --round is given), then per-kind latencies.
 profile: one warm query of each kind, split into planning (binding, DuckLake
 catalog, footers) and operator time.
 """
@@ -173,7 +174,8 @@ def run(ds, args) -> None:
             for kind, t in r[p][0]:
                 kinds.setdefault(kind, {}).setdefault(label, []).append(t)
         print(json.dumps({
-            "pass": p + 1, "kind": label, "readers": args.readers, "threads_each": threads,
+            "pass": p + 1, **({"round": args.round} if args.round else {}),
+            "kind": label, "readers": args.readers, "threads_each": threads,
             "queries": len(times), "wall_s": round(wall, 1), "qps": round(len(times) / wall, 1),
             "p50_ms": pct(times, .5), "p95_ms": pct(times, .95), "max_ms": pct(times, 1),
             "rows": sum(r[p][1] for r in results),
@@ -250,6 +252,7 @@ def main() -> None:
     ap.add_argument("--reader-cpus", help="pin readers, e.g. 3-15")
     ap.add_argument("--pg-cpus", help="Postgres's cores, for utilisation")
     ap.add_argument("--pg-container", help="Postgres container, for its CPU use")
+    ap.add_argument("--round", type=int, help="run: which round of the benchmark this is")
     args = ap.parse_args()
     ds = importlib.import_module(args.dataset)
     if args.command == "download":

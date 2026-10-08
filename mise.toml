@@ -5,3 +5,6 @@ rust = "stable"
 uv = "0.12"
 python = "3.12"
 mdbook = "0.5"
+# The local DuckDB build (`just ext`) needs CMake and Ninja.
+cmake = "4"
+ninja = "1"

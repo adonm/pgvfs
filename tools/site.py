@@ -4,7 +4,7 @@ mdbook docs (docs/) plus a DuckDB extension repository.
 
     site.py SITE_DIR [--releases DIR]
 
-DIR is `scripts/release.sh fetch DIR` output (or local builds laid out the
+DIR is `just release-fetch DIR` output (or local builds laid out the
 same way): DIR/<duckdb version>/{pgvfs.duckdb_extension, build.json} and
 DIR/bench/history.jsonl. The site gets
 <duckdb version>/linux_amd64/pgvfs.duckdb_extension.gz, which is what
@@ -54,7 +54,7 @@ def fragments(found: list[dict], history: list[dict]) -> None:
     warm = sorted((r for r in latest if r["kind"] == "warm"), key=lambda r: r["qps"])
     shown = [latest[0], warm[len(warm) // 2], latest[-1]] if warm else latest
     lines = [
-        f"Run {first['date']} at commit `{first['commit']}` (`scripts/bench.sh city`): Overture "
+        f"Run {first['date']} at commit `{first['commit']}` (`just bench city`): Overture "
         f"Houston, {first['readers']} readers each running {first['queries'] // first['readers']} "
         f"area and attribute queries per pass, on a {first['cores']}-core GitHub runner"
         f"{'; lake layout ' + first['layout'] if first.get('layout') else ''}. Shared "
