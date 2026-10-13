@@ -6,6 +6,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/*
+ `pgdb_open` flags.
+ */
+#define PGDB_WRITE 1
+
+#define PGDB_CREATE 2
+
+#define PGDB_OVERWRITE 4
+
+typedef struct PgdbFile PgdbFile;
+
 typedef struct PgvfsConn PgvfsConn;
 
 typedef struct PgvfsWriter PgvfsWriter;
@@ -20,6 +31,18 @@ typedef struct {
 } PgvfsFile;
 
 typedef void (*pgvfs_list_cb)(void *ctx, const char *path, size_t len);
+
+/*
+ What `pgdb_open` opened: `gen` is -1 (and `writer` 1) for the writer's files.
+ */
+typedef struct {
+    int32_t db_id;
+    int64_t file_id;
+    int64_t gen;
+    int writer;
+} PgdbInfo;
+
+typedef void (*pgdb_run_cb)(void *ctx, int64_t offset, int64_t len, int64_t gen);
 
 #ifdef __cplusplus
 extern "C" {
@@ -116,6 +139,109 @@ int pgvfs_writer_publish(PgvfsWriter *w, char **err);
  Discard and free the writer; nothing is published.
  */
 void pgvfs_writer_abort(PgvfsWriter *w);
+
+/*
+ The newest published gen of a database: 0 found (`*gen`), 1 no such database, -1 error.
+ */
+int pgdb_latest(const PgvfsConn *c, const char *volume, const char *name, int64_t *gen, char **err);
+
+/*
+ Open `path` of a database: for writing (PGDB_WRITE, taking the database's
+ write lock unless this process holds it; PGDB_CREATE makes the database
+ and file if missing, PGDB_OVERWRITE empties the file), else for reading
+ at `gen` (< 0: the newest). `token` (< 0: none) names the attach the path
+ came from: the writer's own attach (or a plain path) reads the writer's
+ files, any other a published version. 0 ok (`*out`, `*info`), 1 not
+ found, -1 error.
+ */
+int pgdb_open(const PgvfsConn *c,
+              const char *volume,
+              const char *name,
+              int64_t gen,
+              int64_t token,
+              const char *path,
+              int flags,
+              PgdbFile **out,
+              PgdbInfo *info,
+              char **err);
+
+/*
+ Close and free a file. Closing the last of a writer's files publishes what
+ is left and releases the database. 0 ok, -1 error (the file is freed anyway).
+ */
+int pgdb_close(PgdbFile *f, char **err);
+
+int64_t pgdb_size(const PgdbFile *f);
+
+/*
+ Fill exactly `len` bytes from `pos`, straight from PostgreSQL (and, for
+ the writer, its staged writes). 0 ok, -1 error.
+ */
+int pgdb_read(const PgdbFile *f, uint8_t *buf, int64_t len, int64_t pos, char **err);
+
+/*
+ For a reader: call `cb` with runs of [pos, pos + len) and the gen whose
+ bytes each run can be read (and cached) as (`pgdb_read_gen`). 0 ok, 1 not
+ cacheable (read with `pgdb_read`).
+ */
+int pgdb_runs(const PgdbFile *f, int64_t pos, int64_t len, pgdb_run_cb cb, void *ctx);
+
+/*
+ Fill `len` bytes from `pos` of a file as of `gen` (zeros past its end),
+ for DuckDB's external file cache. 0 ok, 2 that gen's versions may be
+ reaped (read with `pgdb_read` instead), -1 error.
+ */
+int pgdb_read_gen(const PgvfsConn *c,
+                  int32_t db_id,
+                  int64_t file_id,
+                  int64_t gen,
+                  uint8_t *buf,
+                  int64_t len,
+                  int64_t pos,
+                  char **err);
+
+/*
+ Write `len` bytes at `pos`. Staged: published by `pgdb_sync`. 0 ok, -1 error.
+ */
+int pgdb_write(PgdbFile *f, const uint8_t *buf, int64_t len, int64_t pos, char **err);
+
+int pgdb_truncate(PgdbFile *f, int64_t size, char **err);
+
+/*
+ Publish everything this database's writer has written as the next gen.
+ */
+int pgdb_sync(PgdbFile *f, char **err);
+
+/*
+ 0 exists, 1 not, -1 error. For the writer's own attach (`token`, see
+ `pgdb_open`) or a plain path its files; otherwise as of `gen` (< 0: the newest).
+ */
+int pgdb_exists(const PgvfsConn *c,
+                const char *volume,
+                const char *name,
+                int64_t gen,
+                int64_t token,
+                const char *path,
+                char **err);
+
+/*
+ Remove a file of a database this process writes. 0 removed, 1 not found, -1 error.
+ */
+int pgdb_remove(const PgvfsConn *c,
+                const char *volume,
+                const char *name,
+                const char *path,
+                char **err);
+
+/*
+ Rename a file of a database this process writes, replacing `to`. 0 ok, -1 error.
+ */
+int pgdb_rename(const PgvfsConn *c,
+                const char *volume,
+                const char *name,
+                const char *from,
+                const char *to,
+                char **err);
 
 #ifdef __cplusplus
 }  // extern "C"

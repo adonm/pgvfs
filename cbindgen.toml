@@ -13,7 +13,8 @@ tab_width = 4
 
 [export]
 # Internal constants of the crate, not part of the C ABI.
-exclude = ["LAYOUT_VERSION", "ROW_BYTES", "WRITE_BATCH"]
+exclude = ["LAYOUT_VERSION", "ROW_BYTES", "WRITE_BATCH", "CHUNK"]
 
 [export.rename]
 "ListCb" = "pgvfs_list_cb"
+"RunCb" = "pgdb_run_cb"
