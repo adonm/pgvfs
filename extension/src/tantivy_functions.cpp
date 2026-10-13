@@ -26,6 +26,7 @@
 #include "duckdb/storage/object_cache.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -91,26 +92,43 @@ void CheckText(const string &text) {
 	}
 }
 
-// A split open for search. Its file is read through one handle under a lock:
-// not every filesystem reads one handle from several threads.
+// A split open for search. Its file is read through a few handles, each under
+// its own lock (not every filesystem reads one handle from several threads),
+// so concurrent searches of one split read it in parallel.
 struct OpenSplit {
 	~OpenSplit() {
 		if (split) {
-			tantivy_split_close(split); // before the handle it reads
+			tantivy_split_close(split); // before the handles it reads
 		}
 	}
-	unique_ptr<FileHandle> handle;
-	std::mutex lock;
+	struct Slot {
+		unique_ptr<FileHandle> handle;
+		std::mutex lock;
+	};
+	vector<unique_ptr<Slot>> slots;
+	std::atomic<idx_t> next {0};
 	TantivySplit *split = nullptr;
 	string version;
 	std::chrono::steady_clock::time_point checked;
 };
 
+// The first free handle, else wait for one.
 int ReadSplit(void *ctx, uint8_t *buf, uint64_t len, uint64_t offset, char *msg, size_t cap) {
 	auto &open = *static_cast<OpenSplit *>(ctx);
 	try {
-		std::lock_guard<std::mutex> guard(open.lock);
-		open.handle->Read(buf, len, offset);
+		auto n = open.slots.size();
+		auto start = open.next.fetch_add(1, std::memory_order_relaxed);
+		for (idx_t i = 0; i < n; i++) {
+			auto &slot = *open.slots[(start + i) % n];
+			std::unique_lock<std::mutex> guard(slot.lock, std::try_to_lock);
+			if (guard.owns_lock()) {
+				slot.handle->Read(buf, len, offset);
+				return 0;
+			}
+		}
+		auto &slot = *open.slots[start % n];
+		std::lock_guard<std::mutex> guard(slot.lock);
+		slot.handle->Read(buf, len, offset);
 		return 0;
 	} catch (std::exception &e) {
 		SetMessage(msg, cap, e.what());
@@ -151,12 +169,18 @@ struct Splits : public ObjectCacheEntry {
 		}
 		// The client's filesystem: it brings the client's credentials.
 		auto &fs = FileSystem::GetFileSystem(context);
-		auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS);
+		auto open_handle = [&]() {
+			return fs.OpenFile(path, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS);
+		};
+		auto version_of = [&](FileHandle &h) {
+			return fs.GetVersionTag(h) + "/" + std::to_string(h.GetFileSize()) + "/" +
+			       std::to_string(fs.GetLastModifiedTime(h).value);
+		};
+		auto handle = open_handle();
 		if (!handle) {
 			throw IOException("no tantivy split at %s", path);
 		}
-		auto version = fs.GetVersionTag(*handle) + "/" + std::to_string(handle->GetFileSize()) + "/" +
-		               std::to_string(fs.GetLastModifiedTime(*handle).value);
+		auto version = version_of(*handle);
 		{
 			std::lock_guard<std::mutex> guard(lock);
 			auto it = open.find(path);
@@ -166,11 +190,26 @@ struct Splits : public ObjectCacheEntry {
 			}
 		}
 		auto split = make_shared_ptr<OpenSplit>();
-		split->handle = std::move(handle);
+		auto size = handle->GetFileSize();
+		auto add_slot = [&](unique_ptr<FileHandle> h) {
+			split->slots.push_back(make_uniq<OpenSplit::Slot>());
+			split->slots.back()->handle = std::move(h);
+		};
+		add_slot(std::move(handle));
+		// More handles now, while the client's filesystem (its credentials) is
+		// at hand; pgvfs answers these from its open cache.
+		auto handles = MinValue<idx_t>(4, idx_t(TaskScheduler::GetScheduler(context).NumberOfThreads()));
+		while (split->slots.size() < handles) {
+			auto more = open_handle();
+			if (!more || version_of(*more) != version) {
+				break; // replaced meanwhile: read the version opened first
+			}
+			add_slot(std::move(more));
+		}
 		split->version = version;
 		split->checked = now;
 		char *err = nullptr;
-		split->split = tantivy_split_open(split->handle->GetFileSize(), ReadSplit, split.get(), &err);
+		split->split = tantivy_split_open(size, ReadSplit, split.get(), &err);
 		if (!split->split) {
 			Fail("open", path, err);
 		}
