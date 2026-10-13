@@ -1,8 +1,9 @@
-name: SQL tests on pgdb
+name: pgdb
 
 # DuckDB's own SQL tests (test/sql, about 3,400 files), each on a pgdb://
-# database (test/configs/pgvfs.json, `just sqllogic`). Too long for every push:
-# weekly, by hand, and on pull requests that touch pgdb://.
+# database (test/configs/pgvfs.json, `just sqllogic`), and the storage contract
+# on the oldest PostgreSQL versions. Too long for every push: weekly, by hand,
+# and on pull requests that touch pgdb://.
 on:
   schedule:
     - cron: "0 7 * * 1"
@@ -23,6 +24,18 @@ defaults:
     shell: bash
 
 jobs:
+  # The contract (pgvfs:// and pgdb://) without an extension: no DuckDB build.
+  contract:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [11, 14]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v3
+      - run: PG_IMAGE=postgres:${{ matrix.pg }} just contract
+
   build:
     runs-on: ubuntu-latest
     steps:
