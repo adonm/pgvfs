@@ -78,5 +78,5 @@ jobs:
         if: ${{ !cancelled() }}
         with:
           name: sqllogic-logs-${{ matrix.shard }}
-          path: .tmp/sqllogic/*.txt
+          path: .tmp/sqllogic/
           retention-days: 14

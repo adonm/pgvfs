@@ -24,14 +24,21 @@
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/open_file_info.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database_file_opener.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
+// DuckDB 2.0 moved the external file cache's headers, and its reads return a
+// handle group instead of a pointer into one pinned buffer.
+#if __has_include("duckdb/storage/external_file_cache/caching_file_system.hpp")
+#include "duckdb/storage/external_file_cache/caching_file_system.hpp"
+#define PGDB_CACHE_V2 1
+#else
 #include "duckdb/storage/caching_file_system.hpp"
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -550,9 +557,13 @@ private:
 			info.extended_info->options["validate_external_file_cache"] = Value::BOOLEAN(false);
 			try {
 				auto file = cache.OpenFile(info, FileFlags::FILE_FLAGS_READ);
+#ifdef PGDB_CACHE_V2
+				file->Read(idx_t(n), idx_t(offset)).CopyTo(out + (offset - pos), idx_t(n));
+#else
 				data_ptr_t data = nullptr;
 				auto pin = file->Read(data, idx_t(n), idx_t(offset));
 				memcpy(out + (offset - pos), data, size_t(n));
+#endif
 			} catch (std::exception &e) {
 				if (string(e.what()).find(EXPIRED_MARK) == string::npos) {
 					throw;
@@ -631,7 +642,7 @@ void PgdbRefresher::Tick(DatabaseInstance &instance) {
 			following.insert(next);
 		}
 		auto result = con.Query("ATTACH OR REPLACE '" + StringUtil::Replace(next, "'", "''") + "' AS " +
-		                        KeywordHelper::WriteOptionallyQuoted(name) + " (READ_ONLY)");
+		                        SQLIdentifier::ToString(name) + " (READ_ONLY)");
 		std::lock_guard<std::mutex> guard(lock);
 		following.erase(path);
 		if (result->HasError()) {
