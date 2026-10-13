@@ -10,7 +10,9 @@ just ext-nightly [WHEEL]      # a DuckDB 2.0 dev wheel (default: newest), built 
 just contract [EXT]          # storage contract on disposable PostgreSQL (PG_IMAGE=postgres:11..18); with EXT, the end-to-end test too
 just compat                   # the contract on every supported PostgreSQL
 just e2e [release|nightly]    # build, then contract + DuckDB end-to-end
+just sqllogic [PATTERN] [JOBS] # DuckDB's own SQL tests, each on a pgdb:// database (after `just ext`)
 just bench [city|hits]       # benchmarks (see Performance)
+just bench-db                 # pgdb:// against a local DuckDB file (see Databases)
 just site                     # this site from local builds -> .tmp/site/
 ```
 
@@ -22,9 +24,23 @@ server with a throwaway CA, and tests against all three: exact reads, concurrent
 writers, same-path publish conflicts, cooperative reaps, function refresh, listing
 ranges, readers with `SELECT` only and on the standby, TLS verification, lost
 connections, interrupted writes, readers during writes, and offsets past 4 GiB.
-With an extension, it also runs the DuckDB end-to-end test through it: a second
-process's writes, a `SELECT`-only role's refused writes, and volumes routed to
-two databases by their secrets.
+For `pgdb://` (`tests/db_contract.rs`, run twice: with the default write
+batches and with tiny ones): a randomized writer checked against an in-memory
+model at every version, readers keeping their version, one writer and recovery
+from a dead one, and reaping. With an extension, it also runs the DuckDB
+end-to-end test through it: a second process's writes, a `SELECT`-only role's
+refused writes, volumes routed to two databases by their secrets, and for
+`pgdb://` (`extension/test/pgdb.py`) keys and constraints, WAL replay, refused
+second writers, refresh, the cache, pinned versions, a killed writer process,
+the standby and a `SELECT`-only role.
+
+**DuckDB's own SQL tests on `pgdb://`.** `just sqllogic` runs DuckDB's
+`test/sql` through `test/configs/pgvfs.json`, which attaches a `pgdb://`
+database per test on a disposable PostgreSQL and uses it, as DuckDB's
+encryption config does with an encrypted file (and with its skip list: tests
+that use the memory catalog by name). Tests that `load` a database file of
+their own are skipped by that mechanism. Skips need a reason, and the list
+churns with DuckDB upgrades.
 
 ## Layout
 
@@ -34,12 +50,14 @@ two databases by their secrets.
 | `src/store.rs` | reads, the `COPY` writer, the advisory-locked install, reaping |
 | `src/pg.rs` | connection pool and TLS |
 | `src/lib.rs` | the C interface used by the extension, the open cache, `pgvfs_stats()` |
+| `dbschema.sql`, `src/db.rs` | `pgdb://`: its tables, the versioned writer, reads, refresh, reaping |
 | `tantivy/` | tantivy splits (a workspace crate, linked into the same staticlib): build, bundle, search |
-| `extension/` | the C++ DuckDB `FileSystem` adapter, the tantivy SQL functions, the container build, the end-to-end test |
-| `tests/` | the storage contract, against real PostgreSQL; `headers.rs` checks `pgvfs.h` against the FFI |
+| `extension/` | the C++ DuckDB `FileSystem` adapters (`pgdb_filesystem.cpp`: `pgdb://`, its cache and refresher), the tantivy SQL functions, the container build, the end-to-end tests |
+| `tests/` | the storage contracts, against real PostgreSQL; `headers.rs` checks `pgvfs.h` against the FFI |
+| `test/` | SQL tests for `make test`, and `configs/pgvfs.json` for DuckDB's own tests on `pgdb://` |
 | `cbindgen.toml`, `tantivy/cbindgen.toml` | how the two C headers in `extension/src/include/` are generated from the Rust FFI |
 | `deny.toml` | supply-chain policy for `cargo deny`: permissive licences, crates.io only, advisories |
-| `bench/` | benchmark harness (`lake.py`), datasets (`city.py`, `hits.py`), the IVF check (`ivf.py`) |
+| `bench/` | benchmark harness (`lake.py`), datasets (`city.py`, `hits.py`), the IVF check (`ivf.py`), `pgdb.py` |
 | `tools/` | the Pages site generator (`site.py`) |
 | `justfile` | every build, test, benchmark and release command |
 | `docs/` | this site (mdbook) |

@@ -4,6 +4,7 @@
 
 - [Install](install.md)
 - [Loading data](loading.md)
+- [Databases (pgdb://)](databases.md)
 - [Full-text search](search.md)
 - [Vector search](vectors.md)
 - [How it works](how-it-works.md)
