@@ -30,6 +30,13 @@
       ]
     },
     {
+      "reason": "Concurrent loops that provoke write conflicts: the runner re-runs on_new_connection (USE) before every statement, which fails in the aborted transaction before the test's own COMMIT can end it.",
+      "paths": [
+        "test/sql/index/art/constraints/test_art_concurrent_loop.test_slow",
+        "test/sql/index/art/insert_update_delete/test_art_non_unique_delete_checkpoint.test_slow"
+      ]
+    },
+    {
       "reason": "Expects parquet not to be loaded; this config loads it statically.",
       "paths": [
         "test/sql/copy/csv/zstd_crash.test"
