@@ -40,6 +40,14 @@ pub struct Stats {
     pub read_ns: std::sync::atomic::AtomicU64,
     /// Range queries sent to PostgreSQL (a read is one or more pieces).
     pub pieces: std::sync::atomic::AtomicU64,
+    /// pgdb:// reads that went to PostgreSQL, their bytes and range queries.
+    pub db_reads: std::sync::atomic::AtomicU64,
+    pub db_read_bytes: std::sync::atomic::AtomicU64,
+    pub db_pieces: std::sync::atomic::AtomicU64,
+    /// pgdb:// bytes read through DuckDB's external file cache (hits and misses).
+    pub db_cache_bytes: std::sync::atomic::AtomicU64,
+    /// pgdb:// gens published by this process's writers.
+    pub db_publishes: std::sync::atomic::AtomicU64,
 }
 
 pub static STATS: Stats = Stats {
@@ -50,6 +58,11 @@ pub static STATS: Stats = Stats {
     read_bytes: std::sync::atomic::AtomicU64::new(0),
     read_ns: std::sync::atomic::AtomicU64::new(0),
     pieces: std::sync::atomic::AtomicU64::new(0),
+    db_reads: std::sync::atomic::AtomicU64::new(0),
+    db_read_bytes: std::sync::atomic::AtomicU64::new(0),
+    db_pieces: std::sync::atomic::AtomicU64::new(0),
+    db_cache_bytes: std::sync::atomic::AtomicU64::new(0),
+    db_publishes: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// Rows per parallel read piece (8 MiB). Measured on full ClickBench heavy
@@ -246,7 +259,7 @@ pub struct FileInfo {
 /// Whether an error came from a connection that died (PostgreSQL restarted,
 /// the network dropped). The pool may hand out such a connection once before
 /// noticing, so reads, which are safe to repeat, retry once.
-fn lost_connection(e: &anyhow::Error) -> bool {
+pub(crate) fn lost_connection(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         c.downcast_ref::<tokio_postgres::Error>()
             .is_some_and(|e| e.is_closed())

@@ -10,6 +10,7 @@
 // file_id, so it never serves stale bytes, even across databases.
 #include "pgvfs_extension.hpp"
 #include "pgvfs.h"
+#include "pgvfs_connector.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_opener.hpp"
@@ -96,16 +97,6 @@ bool MatchSegments(const vector<string> &key, idx_t k, const vector<string> &pat
 	       MatchSegments(key, k + 1, pat, p + 1);
 }
 
-// One PostgreSQL database as pgvfs sees it: the connection behind it and an id
-// that names it in DuckDB's cache version tags.
-struct PgvfsTarget {
-	PgvfsTarget() = default;
-	PgvfsTarget(PgvfsConn *conn_, idx_t id_) : conn(conn_), id(id_) {
-	}
-	PgvfsConn *conn = nullptr;
-	idx_t id = 0;
-};
-
 class PgvfsFileSystem;
 
 class PgvfsFileHandle : public FileHandle {
@@ -139,7 +130,7 @@ public:
 	idx_t position = 0;
 };
 
-class PgvfsFileSystem : public FileSystem {
+class PgvfsFileSystem : public FileSystem, public PgvfsConnector {
 public:
 	~PgvfsFileSystem() override {
 		for (auto &entry : targets) {
@@ -379,6 +370,20 @@ public:
 		return n;
 	}
 
+	PgvfsTarget ConnectVolume(optional_ptr<FileOpener> opener, const string &volume) override {
+		return Conn(opener, string(SCHEME) + volume + "/");
+	}
+
+	PgvfsConn *ConnById(idx_t id) override {
+		std::lock_guard<std::mutex> guard(lock);
+		for (auto &entry : targets) {
+			if (entry.second.id == id) {
+				return entry.second.conn;
+			}
+		}
+		throw InternalException("pgvfs: no connection %llu", (unsigned long long)id);
+	}
+
 	// For SQL functions: the database that `path` names.
 	PgvfsTarget Connect(ClientContext &context, const string &path) {
 		ClientContextFileOpener opener(context);
@@ -483,13 +488,17 @@ private:
 	}
 
 	// The postgres secret named by `name` (in the catalog, else on local storage), as a connection
-	// string. A secret of another type is refused.
-	static string NamedConnectionString(ClientContext &context, const string &name) {
-		auto &secrets = SecretManager::Get(context);
-		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-		auto entry = secrets.GetSecretByName(transaction, name);
+	// string. A secret of another type is refused. Through the opener, so database-level I/O (a
+	// pgdb:// database's WAL and checkpoints, which have no client) finds the secrets too.
+	static string NamedConnectionString(optional_ptr<FileOpener> opener, const string &name) {
+		auto secrets = FileOpener::TryGetSecretManager(opener);
+		auto transaction = FileOpener::TryGetCatalogTransaction(opener);
+		if (!secrets || !transaction) {
+			return "";
+		}
+		auto entry = secrets->GetSecretByName(*transaction, name);
 		if (!entry) {
-			entry = secrets.GetSecretByName(transaction, name, "local_file");
+			entry = secrets->GetSecretByName(*transaction, name, "local_file");
 		}
 		if (!entry) {
 			return "";
@@ -507,12 +516,9 @@ private:
 	// unnamed default postgres secret that DuckLake's catalog uses. DuckDB's postgres secrets keep
 	// no SCOPE, so the name is what routes a path.
 	static string ConnectionString(optional_ptr<FileOpener> opener, const string &path) {
-		auto context = FileOpener::TryGetClientContext(opener);
-		if (context) {
-			auto per_volume = NamedConnectionString(*context, "pgvfs_" + Parse(path).volume);
-			if (!per_volume.empty()) {
-				return per_volume;
-			}
+		auto per_volume = NamedConnectionString(opener, "pgvfs_" + Parse(path).volume);
+		if (!per_volume.empty()) {
+			return per_volume;
 		}
 		string name;
 		Value setting;
@@ -527,10 +533,7 @@ private:
 			}
 			name = "__default_postgres";
 		}
-		if (!context) {
-			return "";
-		}
-		auto found = NamedConnectionString(*context, name);
+		auto found = NamedConnectionString(opener, name);
 		if (found.empty() && explicit_secret) {
 			throw InvalidInputException("pgvfs_secret: no secret named \"%s\"", name);
 		}
@@ -641,8 +644,10 @@ void LoadInternal(ExtensionLoader &loader) {
 		config.SetOption("parquet_metadata_cache", Value::BOOLEAN(true));
 	}
 	auto fs = make_uniq<PgvfsFileSystem>();
+	auto &pgvfs = *fs;
 	db.GetObjectCache().Put(PgvfsEntry::ObjectType(), make_shared_ptr<PgvfsEntry>(*fs));
 	db.GetFileSystem().RegisterSubSystem(std::move(fs));
+	RegisterPgdb(loader, pgvfs);
 	RegisterTantivy(loader);
 
 	ScalarFunction drop_volume("pgvfs_drop_volume", {LogicalType::VARCHAR}, LogicalType::BIGINT, DropVolumeFunction);
@@ -670,6 +675,10 @@ void LoadInternal(ExtensionLoader &loader) {
 }
 
 } // namespace
+
+void PgvfsFail(const string &what, const string &path, char *err) {
+	Fail(what, path, err);
+}
 
 void PgvfsExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);

@@ -20,6 +20,7 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub type Pooled = Object;
+pub type Dedicated = deadpool_postgres::ClientWrapper;
 
 pub struct Options {
     /// Connections opened at start.
@@ -84,6 +85,12 @@ impl Pool {
     /// The most recently used idle connection, else a new one.
     pub async fn get(&self) -> Result<Pooled> {
         Ok(self.pool.get().await?)
+    }
+
+    /// A connection taken out of the pool: it is closed when dropped, so
+    /// session state (an advisory lock) never returns to the pool.
+    pub async fn dedicated(&self) -> Result<Dedicated> {
+        Ok(Object::take(self.pool.get().await?))
     }
 }
 

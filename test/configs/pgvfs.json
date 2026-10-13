@@ -1,0 +1,52 @@
+{
+  "description": "DuckDB's SQL tests on a pgdb:// database in PostgreSQL ($PGVFS_URL): `just sqllogic`.",
+  "on_init": "ATTACH 'pgdb://sqllogic/{BASE_TEST_NAME}.duckdb' AS __test__config__pgdb;",
+  "on_new_connection": "USE __test__config__pgdb;",
+  "on_load": "skip",
+  "skip_compiled": "true",
+  "statically_loaded_extensions": ["core_functions", "parquet", "pgvfs"],
+  "inherit_skip_tests": "test/configs/encryption.json",
+  "skip_tests": [
+    {
+      "reason": "The init ATTACH looks up pgvfs credentials, which starts the secret manager: its settings are then fixed, and its directory is touched before the test restricts file access.",
+      "paths": [
+        "test/sql/secrets/create_secret_filesystem_logging.test",
+        "test/sql/settings/test_disabled_local_filesystem_metadata.test",
+        "test/sql/settings/test_disabled_local_filesystem_secrets.test",
+        "test/sql/settings/test_external_access_metadata.test",
+        "test/sql/settings/test_external_access_secrets.test",
+        "test/sql/extensions/allowed_directories_install.test"
+      ]
+    },
+    {
+      "reason": "Measures memory usage (as in force_storage.json); fails the same with a local file attached instead.",
+      "paths": [
+        "test/sql/delete/in_memory_bulk_delete.test_slow",
+        "test/sql/pragma/profiling/test_custom_profiling_memory_and_temp_dir.test_slow"
+      ]
+    },
+    {
+      "reason": "Requires the latest storage version (as in force_storage.json); fails the same with a local file attached instead.",
+      "paths": [
+        "test/sql/function/variant/variant_typeof.test",
+        "test/sql/storage/types/variant/index_fetch.test",
+        "test/sql/storage/types/variant/update.test",
+        "test/sql/types/geo/geometry_stats.test",
+        "test/sql/types/geo/geometry_stats_prune_null.test",
+        "test/sql/types/variant/variant_map_to_variant_filter.test"
+      ]
+    },
+    {
+      "reason": "Expects only the default database (as in force_storage.json); fails the same with a local file attached instead.",
+      "paths": [
+        "test/sql/storage/read_duckdb/concurrent_duckdb_read.test_slow"
+      ]
+    },
+    {
+      "reason": "Overwrites a local Parquet file in place: loading pgvfs turns on parquet_metadata_cache, so the old footer is used.",
+      "paths": [
+        "test/sql/storage/external_file_cache/external_file_cache_validate.test"
+      ]
+    }
+  ]
+}

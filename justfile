@@ -173,6 +173,11 @@ contract EXT="":
       PGVFS_TEST_TLS_URL="postgres://postgres:postgres@localhost:$(docker port "$name-tls" 5432/tcp | cut -d: -f2)/postgres?sslmode=require" \
       PGVFS_TEST_TLS_CA="$certs/ca.crt" PGVFS_POOL_MIN=1 PGVFS_POOL_MAX=8 \
       cargo test --locked --test store_contract -- --include-ignored --test-threads=1
+    PGVFS_TEST_DB_URL="$base/pgvfs_t" PGVFS_POOL_MIN=1 \
+      cargo test --locked --test db_contract -- --include-ignored --test-threads=1
+    # Again with tiny writer batches: many COPYs and upserts per version.
+    PGVFS_TEST_DB_URL="$base/pgvfs_t" PGVFS_POOL_MIN=1 PGVFS_DB_FLUSH_KB=64 \
+      cargo test --locked --test db_contract -- --include-ignored --test-threads=1
 
     if [ -n "$ext" ]; then
       PGVFS_TEST_URL="$base/pgvfs_t" PGVFS_TEST_READER_URL="postgres://reader:reader@$addr/pgvfs_t" \
@@ -296,6 +301,79 @@ bench DATASET="city" *ARGS:
         --round "$round" $args
     done
     stop
+
+# DuckDB's own SQL tests, each on a pgdb:// database (test/configs/pgvfs.json), on a disposable
+# PostgreSQL: one unittest per directory of PATTERN, JOBS at a time; with SHARDS, only every
+# SHARDS-th directory from SHARD (CI runs four). Logs, and the failures' summary, in .tmp/sqllogic/.
+
+# DuckDB's SQL tests on pgdb:// databases (after `just ext`; CI: sqllogic.yml).
+sqllogic PATTERN="test/sql" JOBS="4":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # A local build is brought up to date; CI passes in a built unittest.
+    if [ -f build/release/build.ninja ]; then ninja -C build/release unittest >/dev/null; fi
+    container="pgvfs-sqllogic-$$"
+    port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+    docker run -d --name "$container" -e POSTGRES_PASSWORD=postgres --shm-size=1g \
+      -p "127.0.0.1:$port:5432" "${PG_IMAGE:-postgres:18}" -c max_connections=2000 -c fsync=off >/dev/null
+    for _ in $(seq 1 120); do
+      docker exec "$container" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break
+      sleep 0.5
+    done
+    sleep 1
+    docker exec "$container" psql -U postgres -qc 'CREATE DATABASE sqllogic'
+    logs="$PWD/.tmp/sqllogic"
+    rm -rf "$logs" && mkdir -p "$logs"
+    export PGVFS_URL="postgres://postgres:postgres@127.0.0.1:$port/sqllogic" LOGS="$logs"
+    cd duckdb
+    find "{{PATTERN}}" -mindepth 1 -maxdepth 1 -type d | sort |
+      awk -v shard="${SHARD:-0}" -v shards="${SHARDS:-1}" '(NR - 1) % shards == shard' |
+      xargs -P "{{JOBS}}" -I{} sh -c 'name=$(echo "{}" | tr / _); \
+        ../build/release/test/unittest --test-dir . \
+          --test-config ../test/configs/pgvfs.json "{}/*" >"$LOGS/$name.log" 2>&1 \
+          || echo "{}"' >"$logs/failed.txt" || true
+    for name in $(sed 's|/|_|g' "$logs/failed.txt"); do
+      echo "== $name" && grep -E "^[0-9]+\. test/|^(Query|Wrong|Expected|Actual)|Error:" "$logs/$name.log" | head -40
+    done | tee "$logs/summary.txt"
+    [ ! -s "$logs/failed.txt" ]
+
+# pgdb:// against a local DuckDB file (bench/pgdb.py): load, commits, refresh, cold and concurrent
+# readers, on a disposable PostgreSQL pinned to a fifth of the cores (readers on the rest).
+# READERS (default: the reader cores), ROWS (default 30M).
+
+# A pgdb:// database against the same database in a local file.
+bench-db *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cores=$(nproc)
+    pg=$(( cores / 5 > 0 ? cores / 5 : 1 ))
+    pg_cpus=${PG_CPUS:-0-$((pg - 1))}
+    reader_cpus=${READER_CPUS:-$pg-$((cores - 1))}
+    first=${reader_cpus%-*}
+    last=${reader_cpus#*-}
+    readers=${READERS:-$((last - first + 1))}
+    ext=${EXT:-target/ext/release/pgvfs.duckdb_extension}
+    if [ -z "${EXT:-}" ] && [ ! -f "$ext" ]; then just ext; fi
+    wheel=${DUCKDB_PY:-$(cat "$(dirname "$ext")/DUCKDB_PY")}
+    container="pgvfs-bench-db-$$"
+    # A fixed host port: the cold pass restarts the container, which would get a new random one.
+    port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+    docker run -d --name "$container" -e POSTGRES_PASSWORD=postgres --shm-size=2g \
+      --memory "${PG_MEMORY:-6g}" --cpuset-cpus "$pg_cpus" -p "127.0.0.1:$port:5432" \
+      "${PG_IMAGE:-postgres:18}" -c shared_buffers=2GB -c max_connections=500 >/dev/null
+    for _ in $(seq 1 120); do
+      docker exec "$container" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break
+      sleep 0.5
+    done
+    sleep 1
+    docker exec "$container" psql -U postgres -qc 'CREATE DATABASE bench'
+    echo "== pgdb: PostgreSQL on cores $pg_cpus, $readers readers on $reader_cpus ==" >&2
+    uv run --quiet --no-project --with "duckdb==$wheel" python bench/pgdb.py "$ext" \
+      "postgres://postgres:postgres@127.0.0.1:$port/bench" \
+      --readers "$readers" --reader-cpus "$reader_cpus" --pg-container "$container" \
+      --rows "${ROWS:-30000000}" --memory-limit "${READER_MEMORY:-2GiB}" {{ARGS}}
 
 # Replaces the pre-release duckdb-<version> with the build in EXT_DIR (needs gh with write access).
 release-publish EXT_DIR:

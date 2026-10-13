@@ -20,6 +20,7 @@ from urllib.parse import unquote, urlsplit
 
 import duckdb
 
+from pgdb import check_pgdb
 from search import check_search
 
 ext = sys.argv[1]
@@ -438,5 +439,14 @@ try:
     raise AssertionError("a dropped volume's split remained cached")
 except duckdb.Error as e:
     assert "no tantivy split" in str(e), str(e)
+
+# pgdb://: a native DuckDB database in the same PostgreSQL (pgdb.py).
+standby_url = os.environ.get("PGVFS_TEST_STANDBY_URL")
+check_pgdb(
+    ext,
+    url,
+    standby_url=urlsplit(standby_url) if standby_url else None,
+    reader_url=urlsplit(os.environ["PGVFS_TEST_READER_URL"]),
+)
 
 print(f"pgvfs e2e ok: volume {vol}, lake files {files} -> {after}")
