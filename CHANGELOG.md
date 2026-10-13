@@ -4,6 +4,39 @@ pgvfs is in beta: the SQL interface and configuration are expected to stay,
 but storage layout changes are still possible (see "Storage layout" in the
 docs). Each release lists its layout version.
 
+## 0.3.0
+
+Storage layout: **v2** (unchanged). `pgdb://` adds five tables
+(`dbschema.sql`), created by the first database writer; the `pgvfs://` tables
+do not change.
+
+- **`pgdb://`: native DuckDB databases in PostgreSQL (experimental).** `ATTACH
+  'pgdb://<volume>/<name>'` is a real DuckDB database (ART indexes, primary and
+  foreign keys, constraints, sequences, WAL) stored as versioned 8 KB chunks.
+  One writer, refused at attach if another holds it and fenced on every write;
+  any number of readers, on standbys too, each reading one published version
+  and re-attached at the newest every `pgdb_refresh_interval` seconds (running
+  transactions keep theirs). Readers cache through DuckDB's external file cache
+  under keys a new version leaves valid. Experimental: its tables may still
+  change, with a migration. See
+  [Databases](https://pgvfs.adonm.dev/databases.html) for the design, limits
+  and benchmarks: against a local file, warm readers run at 93% of the
+  throughput, loads at 1.24x the time, commits at about 2 ms; cold scattered
+  lookups are the slow case.
+- **Concurrent searches of one tantivy split read in parallel,** through up to
+  four handles instead of one under a lock.
+- **Secrets are found for database-level I/O** (no client context), through
+  the file opener.
+- `pgvfs_stats()` adds `db_reads`, `db_read_bytes`, `db_pieces`,
+  `db_cache_bytes` and `db_publishes`.
+- Tests and benchmarks: `just bench-db` (`pgdb://` against a local DuckDB
+  file), `just sqllogic` (DuckDB's own SQL tests on `pgdb://`), and a
+  `pgdb://` storage contract and end-to-end test in `just contract`.
+
+Upgrading from beta.6: nothing to do. Readers of `pgdb://` need `SELECT` on the
+new tables, writers `INSERT`, `UPDATE` and `DELETE` (see
+[Databases](https://pgvfs.adonm.dev/databases.html#storage)).
+
 ## 0.2.0-beta.6
 
 Storage layout: **v2** (unchanged). The functions moved to `functions.sql`, which
