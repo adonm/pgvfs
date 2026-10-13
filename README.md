@@ -64,11 +64,25 @@ the secret, and attach the existing lake. Readers use `ATTACH
 and pgvfs tables. For remote PostgreSQL, add
 `SSLMODE 'require'` to the secret; see [credentials](https://pgvfs.adonm.dev/how-it-works.html#credentials).
 
+## A DuckDB database in PostgreSQL
+
+`pgdb://` stores a native DuckDB database (indexes, keys, constraints, WAL) in
+the same PostgreSQL: one writer, any number of readers that follow its commits.
+
+```sql
+ATTACH 'pgdb://lake/sales.duckdb' AS sales;               -- the one writer
+ATTACH 'pgdb://lake/sales.duckdb' AS sales (READ_ONLY);   -- readers, anywhere
+```
+
+See [Databases](https://pgvfs.adonm.dev/databases.html).
+
 ## Documentation
 
 - [Install](https://pgvfs.adonm.dev/install.html): builds, versions, Python.
 - [Loading data](https://pgvfs.adonm.dev/loading.html): lay out a lake for
   fast reads, load at scale, and keep it fast.
+- [Databases](https://pgvfs.adonm.dev/databases.html): native DuckDB databases
+  on `pgdb://`, one writer and many readers.
 - [Full-text search](https://pgvfs.adonm.dev/search.html): tantivy indexes
   built and searched from SQL, on pgvfs or any DuckDB filesystem.
 - [Vector search](https://pgvfs.adonm.dev/vectors.html): nearest neighbours

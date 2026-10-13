@@ -91,6 +91,27 @@ Not measured here.
   0.01–0.03 ms.
 - **Pipelining a read's pieces:** every read measured was a single piece.
 
+**Considered, and not done:**
+
+- **Sharding one file's `COPY` across connections:** one stream already writes
+  about 300 MiB/s, and more than four streams were slower on an 8-core
+  PostgreSQL ([loading](loading.md)). Committing shards before the publish
+  would also leak rows from a crashed writer that nothing points at.
+- **Hedged retries:** tails come from CPU queueing, so a hedge adds load exactly
+  when PostgreSQL is saturated.
+- **`wal_compression`:** it compresses full-page images only, and the pages hold
+  already-compressed Parquet: CPU for nothing, on the scarce resource.
+- **Several ranges per query:** DuckDB's `FileSystem::Read` is one synchronous
+  call per range, so pgvfs never sees a batch to merge. Only the tantivy code
+  could issue one, at the cost of tying full-text search to pgvfs.
+- **A pgvfs block cache:** DuckDB's external file cache, keyed by the immutable
+  `file_id`, already serves warm reads, within `memory_limit`.
+- **`full_page_writes = off`:** risks corrupting the whole PostgreSQL cluster on
+  a crash.
+
+**`pgdb://` databases** have their own benchmark, `just bench-db`, against
+the same database in a local file: see [Databases](databases.md#performance).
+
 ## Running the benchmarks
 
 ```sh

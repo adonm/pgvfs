@@ -1,5 +1,9 @@
 # How it works
 
+This page covers `pgvfs://`, the files behind a DuckLake. Native DuckDB
+databases on `pgdb://` have their own tables and design: see
+[Databases](databases.md#design).
+
 ## Storage
 
 A file is a sequence of 8,120-byte rows in one table, `pgvfs.chunks`, keyed by
@@ -116,7 +120,9 @@ loop, with four live at a time:
   keeps file bytes in memory across queries and they can never be stale.
   Warm queries don't reach PostgreSQL for data at all.
 - **Parquet footers.** Loading pgvfs turns on DuckDB's `parquet_metadata_cache`
-  (off by default), so footers aren't re-parsed on every query.
+  (off by default), so footers aren't re-parsed on every query. It applies to
+  every Parquet file the process reads: a process that rewrites local Parquet
+  files in place while reading them should `SET parquet_metadata_cache = false`.
 - **File opens.** pgvfs remembers each path's file for 10 s per DuckDB
   database. DuckDB re-opens files to check them (DuckLake's delete files on
   every query), and this answers those checks without a round trip. This
@@ -174,7 +180,8 @@ database holding the other's schema.
 | `pgvfs_<volume>` postgres secret | none | credentials for one volume's paths |
 | `SET pgvfs_secret = 'name'` | the default `postgres` secret | credentials for all other paths |
 | `PGVFS_URL` | | credentials, if no secret is named |
-| `PGVFS_REAP_GRACE_S` | 600 | seconds a deleted file's rows stay readable |
+| `PGVFS_REAP_GRACE_S` | 600 | seconds a deleted file's rows (and a superseded `pgdb://` version) stay readable |
+| `SET pgdb_refresh_interval = s` | 10 | seconds between `pgdb://` readers' checks for a newer version (0 off) |
 | `PGVFS_POOL_MAX` | max(8, 2 × DuckDB `threads`) | PostgreSQL connections per DuckDB database |
 | `PGVFS_POOL_MIN` | 4 | connections kept open |
 | `PGVFS_IO_THREADS` | DuckDB `threads` | I/O threads per DuckDB database |
@@ -183,5 +190,8 @@ database holding the other's schema.
 | `PGVFS_DB_ALLOW_PLAINTEXT` | false | allow plaintext to a remote server |
 
 `SELECT pgvfs_stats()` returns this process's counters as JSON: opens and
-cache hits, reads, bytes, time spent in pgvfs, and range queries sent. They
-are cumulative, so diff two samples.
+cache hits, reads, bytes, time spent in pgvfs, and range queries sent; for
+[`pgdb://`](databases.md), reads and bytes sent to PostgreSQL (`db_reads`,
+`db_read_bytes`, `db_pieces`), bytes read through DuckDB's external file cache
+(`db_cache_bytes`) and versions published (`db_publishes`). They are
+cumulative, so diff two samples.
