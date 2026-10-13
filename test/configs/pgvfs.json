@@ -19,10 +19,20 @@
       ]
     },
     {
-      "reason": "Measures memory usage (as in force_storage.json); fails the same with a local file attached instead.",
+      "reason": "Measures memory usage (as in force_storage.json), some through pragma_database_size(), which has a row per attached database; fails the same with a local file attached instead.",
       "paths": [
         "test/sql/delete/in_memory_bulk_delete.test_slow",
-        "test/sql/pragma/profiling/test_custom_profiling_memory_and_temp_dir.test_slow"
+        "test/sql/pragma/profiling/test_custom_profiling_memory_and_temp_dir.test_slow",
+        "test/sql/index/art/memory/test_art_non_linear.test_slow",
+        "test/sql/index/art/memory/test_art_varchar.test_slow",
+        "test/sql/index/art/vacuum/test_art_vacuum_integers.test_slow",
+        "test/sql/index/art/vacuum/test_art_vacuum_strings.test_slow"
+      ]
+    },
+    {
+      "reason": "Expects parquet not to be loaded; this config loads it statically.",
+      "paths": [
+        "test/sql/copy/csv/zstd_crash.test"
       ]
     },
     {
