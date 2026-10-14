@@ -18,7 +18,11 @@ just site                     # this site from local builds -> .tmp/site/
 
 Every build, test, benchmark and release command is a recipe in the
 [justfile](https://github.com/adonm/pgvfs/blob/main/justfile); `just --list`
-shows them. Docker is needed for the contract, the nightly build and the
+shows them. [CONTRIBUTING.md](https://github.com/adonm/pgvfs/blob/main/CONTRIBUTING.md)
+has the house style: code carries the design, comments only where they state
+an invariant or DuckDB/PostgreSQL behaviour that is not derivable, plain
+structs and free functions over stateful objects, and no globals beyond
+`pgvfs_stats`' counters and the environment knobs. Docker is needed for the contract, the nightly build and the
 benchmark. `just contract` starts a primary, a streaming standby and a TLS-only
 server with a throwaway CA, and tests against all three: exact reads, concurrent
 writers, same-path publish conflicts, cooperative reaps, function refresh, listing

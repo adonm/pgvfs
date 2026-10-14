@@ -7,8 +7,7 @@ namespace duckdb {
 
 class ExtensionLoader;
 
-// One PostgreSQL database as pgvfs sees it: the connection behind it and an id
-// that names it in DuckDB's cache keys.
+// One PostgreSQL database: its connection, and its id in DuckDB cache keys.
 struct PgvfsTarget {
 	PgvfsTarget() = default;
 	PgvfsTarget(PgvfsConn *conn_, idx_t id_) : conn(conn_), id(id_) {
@@ -17,13 +16,12 @@ struct PgvfsTarget {
 	idx_t id = 0;
 };
 
-// The databases pgvfs:// is connected to, by volume (credentials as for
-// pgvfs://<volume>/), shared with pgdb://.
+// The databases pgvfs:// and pgdb:// are connected to, by volume.
 class PgvfsConnector {
 public:
 	virtual ~PgvfsConnector() = default;
 	virtual PgvfsTarget ConnectVolume(optional_ptr<FileOpener> opener, const string &volume) = 0;
-	// A database connected earlier, by its id.
+	// A database connected earlier.
 	virtual PgvfsConn *ConnById(idx_t id) = 0;
 };
 

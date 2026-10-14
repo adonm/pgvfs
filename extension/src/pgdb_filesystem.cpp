@@ -3,21 +3,16 @@
 //   ATTACH 'pgdb://<volume>/<name>' AS db;               -- the one writer
 //   ATTACH 'pgdb://<volume>/<name>' AS db (READ_ONLY);   -- any number of readers
 //
-// The database's files (it and its WAL files) are versioned chunks: the writer
-// publishes a version (gen) on every fsync, and a reader reads the gen it
-// attached. Attaching resolves the path to its newest gen (CanonicalizePath:
-// pgdb://v/name@<gen>~<token>, so DuckDB's WAL path names the same gen), and
-// a refresher re-attaches read-only databases when a newer gen is published
-// (ATTACH OR REPLACE): a running transaction keeps the gen it started with.
-// A path with an explicit @<gen> stays at that gen.
+// Attaching resolves the plain path to its newest gen, as pgdb://v/name@<gen>
+// with a process-unique token. A refresher re-attaches read-only databases
+// when a newer gen is published (ATTACH OR REPLACE), so a running transaction
+// keeps the gen it started with; an explicit @<gen> stays there.
 //
-// The token, unique in the process, tells attaches apart: DuckDB refuses a
-// read-write and a read-only attach of one path, and only the writer's own
-// attach may read its unpublished files (src/lib.rs, pgdb_open).
+// DuckDB refuses a read-write and a read-only attach of one path, and only
+// the writer's own attach may read its unpublished files (pgdb_open).
 //
-// Readers cache through DuckDB's external file cache, keyed by the gen that
-// last wrote each byte range (pgdb_runs), so a new gen leaves every unchanged
-// range cached.
+// Readers cache through DuckDB's external file cache, under the gen that last
+// wrote each range (pgdb_runs): a new gen leaves every unchanged range.
 #include "pgvfs_connector.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -56,11 +51,10 @@ namespace {
 
 constexpr const char *SCHEME = "pgdb://";
 constexpr const char *CACHE_SCHEME = "pgdbc://";
-// In an error from the cache's inner reads when their gen may be reaped.
 constexpr const char *EXPIRED_MARK = "[pgdb gen reaped]";
 // Attach tokens: process-wide, as DuckDB's attached paths are.
 std::atomic<int64_t> next_token {0};
-// DuckDB's WAL files of a database: the longest first, for parsing.
+// Longest first, for parsing.
 const char *const WAL_SUFFIXES[] = {".wal.checkpoint", ".wal.recovery", ".wal"};
 
 struct PgdbPath {
@@ -152,9 +146,8 @@ public:
 	idx_t position = 0;
 };
 
-// The files DuckDB's external file cache reads on a miss:
-// pgdbc://<target>/<db_id>/<file_id>@<gen> is that file's bytes as of gen,
-// which never change. Not registered with DuckDB: only CachingFileSystem uses it.
+// What the cache's inner reads see on a miss (bytes that never change):
+// pgdbc://<target>/<db_id>/<file_id>@<gen>. Not registered with DuckDB.
 class PgdbCacheFileSystem : public FileSystem {
 public:
 	explicit PgdbCacheFileSystem(PgvfsConnector &connector) : connector(connector) {
@@ -227,8 +220,8 @@ private:
 class PgdbFileSystem;
 
 // Re-attaches this DuckDB's read-only pgdb:// databases when a newer gen is
-// published. A detached thread holding only a weak reference to the database
-// (a held Connection would keep it open); it stops when the filesystem goes.
+// published. Holds only a weak reference: a Connection would keep the database
+// open, and the thread stops when the filesystem goes.
 struct PgdbRefresher : public enable_shared_from_this<PgdbRefresher> {
 	std::mutex lock;
 	std::condition_variable wake;
@@ -236,8 +229,7 @@ struct PgdbRefresher : public enable_shared_from_this<PgdbRefresher> {
 	bool stop = false;
 	weak_ptr<DatabaseInstance> db;
 	PgdbFileSystem *fs = nullptr;
-	// Paths this extension resolved to a gen (attaching the plain path, or a
-	// refresh): those follow new gens. A user's explicit @<gen> does not.
+	// Follows new gens: a plain attach, or a refresh. @<gen> does not.
 	std::set<string> following;
 
 	void Follow(const string &path, optional_ptr<FileOpener> opener) {
@@ -289,7 +281,6 @@ public:
 		return StringUtil::StartsWith(fpath, SCHEME);
 	}
 
-	// Attaching the plain path resolves it to the newest gen, under a new token.
 	string CanonicalizePath(const string &path, optional_ptr<FileOpener> opener) override {
 		auto p = Parse(path);
 		if (p.gen >= 0 || !p.suffix.empty()) {
@@ -539,8 +530,8 @@ private:
 		static_cast<vector<std::tuple<int64_t, int64_t, int64_t>> *>(ctx)->emplace_back(offset, len, gen);
 	}
 
-	// Through DuckDB's external file cache, a range per key gen. False if the
-	// read cannot be keyed (read it directly).
+	// A range per key gen through DuckDB's external file cache; false if the read
+	// cannot be keyed (read it directly).
 	bool ReadCached(PgdbFileHandle &h, data_ptr_t out, int64_t len, int64_t pos) {
 		vector<std::tuple<int64_t, int64_t, int64_t>> runs;
 		if (pgdb_runs(h.file, pos, len, CollectRun, &runs) != 0) {
@@ -553,7 +544,7 @@ private:
 			OpenFileInfo info(StringUtil::Format("%s%llu/%d/%lld@%lld", CACHE_SCHEME, (unsigned long long)h.target.id,
 			                                     h.info.db_id, (long long)h.info.file_id, (long long)gen));
 			info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-			// The bytes under a key never change: nothing to validate.
+			// The bytes under a key never change.
 			info.extended_info->options["validate_external_file_cache"] = Value::BOOLEAN(false);
 			try {
 				auto file = cache.OpenFile(info, FileFlags::FILE_FLAGS_READ);
@@ -621,7 +612,7 @@ void PgdbRefresher::Tick(DatabaseInstance &instance) {
 	if (attached->HasError()) {
 		return;
 	}
-	// Database-level, as for DuckDB's own WAL I/O: no transaction needed.
+	// Database-level, as DuckDB's own WAL I/O.
 	DatabaseFileOpener opener(instance);
 	for (auto &row : *attached) {
 		auto name = row.GetValue<string>(0);
