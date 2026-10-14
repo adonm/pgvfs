@@ -1,17 +1,16 @@
 -- pgdb:// databases (src/db.rs): native DuckDB database files, beside layout v2.
--- Additive: the first database writer creates these if they are missing, under
--- the install lock, so the pgvfs layout version does not change.
+-- Additive: the first database writer creates these, so the pgvfs layout
+-- version does not change.
 --
--- A database's files (the database and its WAL files) are chunks keyed by
--- version (gen). The one writer inserts new chunk versions and publishes a gen
--- per fsync in one statement; a reader opens a gen and reads the newest version
--- of each chunk at or below it. Versions are never updated in place: a version
--- is reaped once a newer one is older than the reap grace (dbs.reap_horizon,
--- which reads check in the same statement).
+-- A database's files are chunks keyed by version (gen). The one writer
+-- publishes a gen per fsync in one statement; a reader opens a gen and reads
+-- the newest version of each chunk at or below it. A version is reaped once a
+-- newer one is older than the reap grace (dbs.reap_horizon, checked by every
+-- read in its own statement).
 --
--- Chunk rows hold 8112-byte payloads INLINE: 8 + 8 + 4 + 4 + 8112 bytes plus
--- the 24-byte tuple header fit toast_tuple_target = 8160, one row per page.
--- An empty payload is a tombstone (a truncated chunk): it reads as zeros.
+-- Chunk rows hold 8112-byte payloads INLINE, one row per page (the 24-byte
+-- tuple header included in toast_tuple_target = 8160). An empty payload is a
+-- tombstone (a truncated chunk): it reads as zeros.
 CREATE SEQUENCE IF NOT EXISTS pgvfs.db_ids AS int4;
 
 CREATE TABLE IF NOT EXISTS pgvfs.dbs (
