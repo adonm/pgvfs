@@ -348,7 +348,7 @@ pub extern "C" fn pgvfs_stats() -> *mut c_char {
     let s = &store::STATS;
     let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
     let json = format!(
-        "{{\"opens\": {}, \"open_hits\": {}, \"open_ms\": {:.1}, \"reads\": {}, \"read_bytes\": {}, \"read_ms\": {:.1}, \"pieces\": {}, \"db_reads\": {}, \"db_read_bytes\": {}, \"db_pieces\": {}, \"db_cache_bytes\": {}, \"db_publishes\": {}}}",
+        "{{\"opens\": {}, \"open_hits\": {}, \"open_ms\": {:.1}, \"reads\": {}, \"read_bytes\": {}, \"read_ms\": {:.1}, \"pieces\": {}, \"db_reads\": {}, \"db_read_bytes\": {}, \"db_pieces\": {}, \"db_cache_bytes\": {}, \"db_publishes\": {}, \"db_readahead_hits\": {}, \"db_readahead_bytes\": {}}}",
         get(&s.opens),
         get(&s.open_hits),
         get(&s.open_ns) as f64 / 1e6,
@@ -360,7 +360,9 @@ pub extern "C" fn pgvfs_stats() -> *mut c_char {
         get(&s.db_read_bytes),
         get(&s.db_pieces),
         get(&s.db_cache_bytes),
-        get(&s.db_publishes)
+        get(&s.db_publishes),
+        get(&s.db_readahead_hits),
+        get(&s.db_readahead_bytes)
     );
     CString::new(json).unwrap_or_default().into_raw()
 }
@@ -866,8 +868,8 @@ pub unsafe extern "C" fn pgdb_read(
                 store::STATS
                     .db_read_bytes
                     .fetch_add(len as u64, Ordering::Relaxed);
-                c.rt.block_on(db::read_versions(
-                    &c.pool, v.db.db_id, v.file_id, v.gen, v.gen, pos, out,
+                c.rt.block_on(db::read_with_readahead(
+                    &v.db, &c.pool, v.file_id, v.gen, pos, out,
                 ))
             }
         }
@@ -936,9 +938,15 @@ pub unsafe extern "C" fn pgdb_read_gen(
     store::STATS
         .db_read_bytes
         .fetch_add(len as u64, Ordering::Relaxed);
-    match c.rt.block_on(db::read_versions(
-        &c.pool, db_id, file_id, gen, gen, pos, out,
-    )) {
+    let result = match c.dbs.by_id(db_id) {
+        Some(db) => c.rt.block_on(db::read_with_readahead(
+            &db, &c.pool, file_id, gen, pos, out,
+        )),
+        None => c.rt.block_on(db::read_versions(
+            &c.pool, db_id, file_id, gen, gen, pos, out,
+        )),
+    };
+    match result {
         Ok(()) => 0,
         Err(e) if format!("{e:#}").contains(db::EXPIRED) => 2,
         Err(e) => {

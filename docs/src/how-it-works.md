@@ -193,5 +193,6 @@ database holding the other's schema.
 cache hits, reads, bytes, time spent in pgvfs, and range queries sent; for
 [`pgdb://`](databases.md), reads and bytes sent to PostgreSQL (`db_reads`,
 `db_read_bytes`, `db_pieces`), bytes read through DuckDB's external file cache
-(`db_cache_bytes`) and versions published (`db_publishes`). They are
-cumulative, so diff two samples.
+(`db_cache_bytes`), versions published (`db_publishes`), and reads answered by
+readahead (`db_readahead_hits`) with the bytes it fetched ahead
+(`db_readahead_bytes`). They are cumulative, so diff two samples.

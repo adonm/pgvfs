@@ -4,6 +4,20 @@ pgvfs is in beta: the SQL interface and configuration are expected to stay,
 but storage layout changes are still possible (see "Storage layout" in the
 docs). Each release lists its layout version.
 
+## Unreleased
+
+- **`pgdb://` reads ahead.** A read that continues the previous one also
+  fetches the blocks after it, so scans stop costing a round trip per block
+  (2.6 s to 0.70 s for a cold 1.2 GB scan with 16 KiB blocks, 438 ms to 163 ms
+  with 8 threads) and range scans nearly halve. A read after a gap fetches
+  exactly its own bytes, so point lookups are unchanged. Knobs:
+  `PGVFS_DB_READAHEAD_KB` (1 MiB) and `PGVFS_DB_READAHEAD_SLOTS` (8). New
+  counters: `db_readahead_hits`, `db_readahead_bytes`.
+- Block size is documented as a knob (`BLOCK_SIZE` at creation):
+  [Databases](https://pgvfs.adonm.dev/databases.html#block-size).
+- Comments trimmed across the Rust and C++ sources; the house style is in
+  [CONTRIBUTING.md](https://github.com/adonm/pgvfs/blob/main/CONTRIBUTING.md).
+
 ## 0.3.0
 
 Storage layout: **v2** (unchanged). `pgdb://` adds five tables

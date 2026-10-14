@@ -48,6 +48,10 @@ pub struct Stats {
     pub db_cache_bytes: std::sync::atomic::AtomicU64,
     /// pgdb:// gens published by this process's writers.
     pub db_publishes: std::sync::atomic::AtomicU64,
+    /// pgdb:// reads answered by readahead, and the bytes it fetched ahead
+    /// of what it was asked for.
+    pub db_readahead_hits: std::sync::atomic::AtomicU64,
+    pub db_readahead_bytes: std::sync::atomic::AtomicU64,
 }
 
 pub static STATS: Stats = Stats {
@@ -63,6 +67,8 @@ pub static STATS: Stats = Stats {
     db_pieces: std::sync::atomic::AtomicU64::new(0),
     db_cache_bytes: std::sync::atomic::AtomicU64::new(0),
     db_publishes: std::sync::atomic::AtomicU64::new(0),
+    db_readahead_hits: std::sync::atomic::AtomicU64::new(0),
+    db_readahead_bytes: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// Rows per parallel read piece (8 MiB). Measured on full ClickBench heavy
