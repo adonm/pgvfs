@@ -4,7 +4,9 @@ pgvfs is in beta: the SQL interface and configuration are expected to stay,
 but storage layout changes are still possible (see "Storage layout" in the
 docs). Each release lists its layout version.
 
-## Unreleased
+## 0.3.1
+
+Storage layout: **v2** (unchanged). No FFI or table changes.
 
 - **`pgdb://` reads ahead.** A read that continues the previous one also
   fetches the blocks after it, so scans stop costing a round trip per block
