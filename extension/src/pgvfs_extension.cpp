@@ -643,6 +643,12 @@ void LoadInternal(ExtensionLoader &loader) {
 	if (config.HasExtensionOption("parquet_metadata_cache")) {
 		config.SetOption("parquet_metadata_cache", Value::BOOLEAN(true));
 	}
+	// DuckDB 2.0 caches only paths that look remote (http://, s3://, ...);
+	// pgdb:// reads the cache through pgdbc:// paths, which do not. 1.5.6 has
+	// no such setting (and no such rule): GetOptionByName returns null there.
+	if (auto option = DBConfig::GetOptionByName("cache_local_files")) {
+		config.SetOption(*option, Value::BOOLEAN(true));
+	}
 	auto fs = make_uniq<PgvfsFileSystem>();
 	auto &pgvfs = *fs;
 	db.GetObjectCache().Put(PgvfsEntry::ObjectType(), make_shared_ptr<PgvfsEntry>(*fs));

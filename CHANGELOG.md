@@ -4,6 +4,24 @@ pgvfs is in beta: the SQL interface and configuration are expected to stay,
 but storage layout changes are still possible (see "Storage layout" in the
 docs). Each release lists its layout version.
 
+## Unreleased
+
+Storage layout: **v2** (unchanged).
+
+- **DuckDB 2.0 caches `pgdb://` reads again.** 2.0 caches only paths that look
+  remote, and loading pgvfs now turns on `cache_local_files` where it exists, so
+  the external file cache serves `pgdb://` reads (1.5.6 is unaffected: it has no
+  such rule and no such setting).
+- **The nightly build works again:** the container had not copied
+  `dbschema.sql` (needed since 0.3.0), and `extension/build.sh` had not been
+  given `pgdb_filesystem.cpp`. A failed nightly build now prints the compiler's
+  error instead of only docker's.
+- `just ext-nightly` passes `--hostname github.com` to `gh`, so it works for a
+  developer whose `gh` defaults to another host.
+- The contract's PostgreSQL allows 500 connections (the pgdb end-to-end test
+  uses more than the default 100 under 2.0) and the Python end-to-end test runs
+  with `PGVFS_POOL_MIN=1 PGVFS_POOL_MAX=8`, as the Rust contract does.
+
 ## 0.3.1
 
 Storage layout: **v2** (unchanged). No FFI or table changes.

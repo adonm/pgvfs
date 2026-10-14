@@ -73,26 +73,32 @@ ext-nightly WHEEL="":
     dir=target/duckdb/$sid
     if [ ! -f "$dir/version" ]; then
       echo "ext-nightly: wheel $wheel is DuckDB $library ($sid)" >&2
-      sha=$(gh api "repos/duckdb/duckdb/commits/$sid" -q .sha)
-      run=$(gh api "repos/duckdb/duckdb/actions/workflows/Main.yml/runs?head_sha=$sha&status=success" \
+      sha=$(gh api --hostname github.com "repos/duckdb/duckdb/commits/$sid" -q .sha)
+      run=$(gh api --hostname github.com "repos/duckdb/duckdb/actions/workflows/Main.yml/runs?head_sha=$sha&status=success" \
         -q '[.workflow_runs[] | select(.head_repository.id == .repository.id)][0].id // empty')
       [ -n "$run" ] || { echo "ext-nightly: no successful DuckDB Main run on $sha for static libs" >&2; exit 1; }
-      read -r artifact digest < <(gh api \
+      read -r artifact digest < <(gh api --hostname github.com \
         "repos/duckdb/duckdb/actions/runs/$run/artifacts?name=duckdb-static-libs-linux-amd64.tar.gz" \
         -q '.artifacts[0] | "\(.id) \(.digest)"')
       [ -n "$artifact" ] || { echo "ext-nightly: run $run kept no linux-amd64 static libs (expired?)" >&2; exit 1; }
       rm -rf "$dir" && mkdir -p "$dir/libs" "$dir/src"
       echo "ext-nightly: static libs from run $run, artifact $artifact" >&2
-      gh api "repos/duckdb/duckdb/actions/artifacts/$artifact/zip" >"$dir/libs.tar.gz"
+      gh api --hostname github.com "repos/duckdb/duckdb/actions/artifacts/$artifact/zip" >"$dir/libs.tar.gz"
       echo "${digest#sha256:}  $dir/libs.tar.gz" | sha256sum -c --quiet -
       tar xzf "$dir/libs.tar.gz" -C "$dir/libs" && rm "$dir/libs.tar.gz"
       curl -fsSL "https://github.com/duckdb/duckdb/archive/$sha.tar.gz" | tar xz -C "$dir/src" --strip-components 1
       echo "$wheel" >"$dir/wheel"
       echo "$version" >"$dir/version"
     fi
-    docker buildx build -q -f extension/Containerfile --build-context duckdb="$dir" \
+    # Quiet on success; a failed link prints the compiler's error (log kept).
+    log=${TMPDIR:-/tmp}/pgvfs-ext-nightly.log
+    if ! docker buildx build -f extension/Containerfile --build-context duckdb="$dir" \
       --build-arg PGVFS_VERSION="$(git describe --tags --always --dirty)" \
-      --output type=local,dest=target/ext/nightly . >/dev/null
+      --output type=local,dest=target/ext/nightly . >"$log" 2>&1; then
+      tail -60 "$log" >&2
+      echo "ext-nightly: build failed; full log in $log" >&2
+      exit 1
+    fi
     cp "$dir/wheel" target/ext/nightly/DUCKDB_PY
     cp "$dir/version" target/ext/nightly/DUCKDB_VERSION
     echo "target/ext/nightly/pgvfs.duckdb_extension for duckdb==$(cat "$dir/wheel") ($(cat "$dir/version"))"
@@ -127,7 +133,8 @@ contract EXT="":
 
     docker network create "$name" >/dev/null
     docker run -d --name "$name" --network "$name" --network-alias primary \
-      -e POSTGRES_PASSWORD=postgres -p 127.0.0.1::5432 "$image" >/dev/null
+      -e POSTGRES_PASSWORD=postgres -p 127.0.0.1::5432 "$image" \
+      -c max_connections=500 >/dev/null
     ready "$name"
     psql -c 'CREATE DATABASE pgvfs_t' -c 'CREATE DATABASE empty_t' -c 'CREATE DATABASE s3_t' \
       -c 'CREATE DATABASE second_t' -c "CREATE ROLE reader LOGIN PASSWORD 'reader'"
@@ -144,7 +151,7 @@ contract EXT="":
         set -e; d=/var/lib/postgresql/standby
         pg_basebackup -h primary -U postgres -D "$d" -R -X stream --checkpoint=fast
         chown -R postgres:postgres "$d"; chmod 700 "$d"
-        exec gosu postgres postgres -D "$d"' >/dev/null
+        exec gosu postgres postgres -D "$d" -c max_connections=500' >/dev/null
     ready "$name-standby"
 
     # A TLS-only server, its certificate signed by a throwaway CA.
@@ -183,6 +190,7 @@ contract EXT="":
       PGVFS_TEST_URL="$base/pgvfs_t" PGVFS_TEST_READER_URL="postgres://reader:reader@$addr/pgvfs_t" \
         PGVFS_TEST_SECOND_URL="$base/second_t" \
         PGVFS_TEST_STANDBY_URL="postgres://postgres:postgres@$(docker port "$name-standby" 5432/tcp)/pgvfs_t" \
+        PGVFS_POOL_MIN=1 PGVFS_POOL_MAX=8 \
         uv run --quiet --no-project --with "duckdb==$wheel" python extension/test/e2e.py "$ext"
     fi
 

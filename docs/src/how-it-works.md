@@ -123,6 +123,10 @@ loop, with four live at a time:
   (off by default), so footers aren't re-parsed on every query. It applies to
   every Parquet file the process reads: a process that rewrites local Parquet
   files in place while reading them should `SET parquet_metadata_cache = false`.
+- **External file cache.** DuckDB 2.0 caches only files that look remote
+  (`http://`, `s3://`, ...); loading pgvfs also turns on `cache_local_files`
+  there, so `pgdb://` reads are cached (they go through `pgdbc://` paths) and
+  local files are cached too. 1.5.6 has no such setting.
 - **File opens.** pgvfs remembers each path's file for 10 s per DuckDB
   database. DuckDB re-opens files to check them (DuckLake's delete files on
   every query), and this answers those checks without a round trip. This
