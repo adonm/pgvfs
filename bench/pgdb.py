@@ -175,10 +175,11 @@ def cold_pass(args, path, n, queue):
 
 
 def run(args, label, path):
-    out = {"target": label, "rows": args.rows}
+    out = {"target": label, "rows": args.rows, "block_size": args.block_size}
     n = args.rows
     w = connect(args)
-    w.execute(f"ATTACH '{path}' AS db")
+    opts = f" (BLOCK_SIZE {args.block_size})" if args.block_size else ""
+    w.execute(f"ATTACH '{path}' AS db{opts}")
     w.execute("USE db")
     out["load_s"] = round(timed(lambda: w.execute(
         f"CREATE TABLE orders AS SELECT i AS id, i % 100000 AS customer_id, "
@@ -242,6 +243,7 @@ def main():
     ap.add_argument("--memory-limit", default="2GiB", help="per DuckDB (each reader is one)")
     ap.add_argument("--pg-container", help="restart and evict it before the cold pass")
     ap.add_argument("--targets", default="local,pgdb")
+    ap.add_argument("--block-size", type=int, help="create the pgdb:// database with this block size")
     args = ap.parse_args()
     tmp = tempfile.mkdtemp()
     for target in args.targets.split(","):

@@ -112,6 +112,51 @@ local readers share the OS page cache. Scans and aggregates are close to local.
 Writes go to PostgreSQL by binary `COPY` (blocks new to a version) and upserts
 (blocks rewritten in one version), on one connection.
 
+### Readahead
+
+DuckDB's block manager asks for one block at a time, so a scan used to pay a
+round trip per block. A read that continues the previous one now also fetches
+the blocks after it (`PGVFS_DB_READAHEAD_KB`, 1 MiB by default; 0 turns it off,
+`PGVFS_DB_READAHEAD_SLOTS` caps the buffers per process at 8). A read after a
+gap fetches exactly its own bytes, so point lookups pay nothing.
+
+Cold, one reader thread, on a 20M-row (1.2 GB) database, PostgreSQL restarted
+and its files evicted before each run, two runs (medians):
+
+| | before | with readahead |
+| --- | ---: | ---: |
+| Full scan, 16 KiB blocks | 2,603 ms | 703 ms |
+| Full scan, 16 KiB blocks, 8 threads | 438 ms | 163 ms |
+| Full scan, 256 KiB blocks | 738 ms | 645 ms |
+| Full scan, 256 KiB blocks, 8 threads | 116 ms | 126 ms |
+| 200 point lookups, 16 KiB blocks | 812 ms | 458 ms |
+| 200 point lookups, 256 KiB blocks | 745 ms | 695 ms |
+| Scan of 1% of the table, 16 KiB blocks | 79 ms | 43 ms |
+
+It fetches ahead about 171 MB for a 160 MB scan (the reads would have happened
+anyway) and about 3 MB for the 200 lookups. A scan that stops costs at most the
+window that was already fetched.
+
+### Block size
+
+`ATTACH 'pgdb://lake/sales.duckdb' (BLOCK_SIZE 16384)` creates a database with
+16 KiB blocks; readers and later writers use whatever the file was created
+with. The trade is bytes against round trips:
+
+| Same 20M-row table | 16 KiB | 256 KiB (default) |
+| --- | ---: | ---: |
+| Bytes a cold point lookup moves | ~60 KB | ~630 KB |
+| Read calls (200 point lookups) | 745 | 443 |
+| Full scan, one thread (with readahead) | 703 ms | 645 ms |
+| Full scan, 8 threads (with readahead) | 163 ms | 116 ms |
+| Database size on disk | 1.03 GB | 754 MB |
+
+Lookup latency was equal within noise in these runs; the difference is the
+bytes, which matter for many concurrent readers and for PostgreSQL. Use the
+default for scan-heavy lakes, and 16 KiB blocks for lookup-heavy databases —
+cold point lookups are 10x cheaper in bytes there, and readahead brings their
+scans close to the default's.
+
 Readers hold a block twice while it is hot: in DuckDB's buffer pool and in the
 external file cache, which share one eviction queue. Set `memory_limit` per
 reader process (several readers on one host each default to 80% of its memory).

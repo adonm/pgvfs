@@ -1,22 +1,13 @@
-//! pgdb:// databases: DuckDB's own database files (a database and its WAL
-//! files) as versioned 8112-byte chunks (dbschema.sql).
-//!
-//! One writer per database, any number of readers. The writer inserts chunk
-//! versions under its working gen and publishes the gen on every fsync, in one
-//! statement, so a published gen is a set of fsyncs: a state DuckDB's crash
-//! recovery handles. A reader opens a gen and reads the newest version of each
-//! chunk at or below it, so it never sees a later write. Versions are reaped
-//! once superseded for longer than the reap grace; every read checks the reap
-//! horizon in the same statement, so an expired gen fails rather than reading
-//! wrong bytes.
-//!
-//! Readers cache through DuckDB's external file cache under keys whose bytes
-//! never change (`ChangeMap::runs`): a chunk's key is the last gen that wrote
-//! it, so a new gen leaves every unchanged chunk cached.
+//! pgdb:// databases: DuckDB's database and WAL files as versioned 8112-byte
+//! chunks (dbschema.sql). One writer publishes a gen per fsync in one
+//! statement; readers open a gen and read the newest version of each chunk at
+//! or below it. A read checks the reap horizon in its own statement, so an
+//! expired gen fails rather than reading wrong bytes. DuckDB's external file
+//! cache keys on the last gen that wrote a chunk (`ChangeMap::runs`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
@@ -126,18 +117,132 @@ pub async fn latest(pool: &Pool, volume: &str, name: &str) -> Result<Option<i64>
 #[derive(Default)]
 pub struct Dbs {
     map: Mutex<HashMap<(String, String), Arc<Db>>>,
+    by_id: Mutex<HashMap<i32, Weak<Db>>>,
+}
+
+impl Dbs {
+    pub fn by_id(&self, db_id: i32) -> Option<Arc<Db>> {
+        self.by_id.lock().unwrap().get(&db_id)?.upgrade()
+    }
 }
 
 pub struct Db {
     pub db_id: i32,
     pub label: String,
-    /// The writer and how many handles use it.
     writer: Mutex<Option<(Arc<Writer>, usize)>>,
     changes: Mutex<ChangeMap>,
+    readahead: Mutex<Readahead>,
+}
+
+/// A read continuing the previous one also fetches the blocks after it, so a
+/// scan's round trips drop from one per block to one per window. A read after
+/// a gap fetches exactly its own bytes.
+#[derive(Default)]
+struct Readahead {
+    last: HashMap<(i64, i64), (i64, u64)>,
+    extents: HashMap<(i64, i64), Vec<Extent>>,
+    held: usize,
+    next: u64,
+}
+
+struct Extent {
+    start: i64,
+    stamp: u64,
+    data: Box<[u8]>,
+}
+
+enum Plan {
+    Hit { skip: usize, index: usize },
+    Fetch { len: i64, widen: bool },
+}
+
+impl Readahead {
+    fn bytes(&self) -> i64 {
+        static BYTES: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *BYTES.get_or_init(|| {
+            std::env::var("PGVFS_DB_READAHEAD_KB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map_or(1 << 20, |kb| (kb << 10) as i64)
+        })
+    }
+
+    fn slots(&self) -> usize {
+        static SLOTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *SLOTS.get_or_init(|| {
+            std::env::var("PGVFS_DB_READAHEAD_SLOTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8)
+        })
+    }
+
+    fn stamp(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    fn plan(&mut self, key: (i64, i64), pos: i64, len: i64) -> Plan {
+        let stamp = self.stamp();
+        if let Some(extents) = self.extents.get_mut(&key) {
+            for (index, e) in extents.iter_mut().enumerate() {
+                if pos >= e.start && pos + len <= e.start + e.data.len() as i64 {
+                    e.stamp = stamp;
+                    return Plan::Hit {
+                        skip: (pos - e.start) as usize,
+                        index,
+                    };
+                }
+            }
+        }
+        let ra = self.bytes();
+        let widen = ra > 0 && len <= ra && self.last.get(&key).map(|&(end, _)| end) == Some(pos);
+        Plan::Fetch {
+            len: if widen { len + ra } else { len },
+            widen,
+        }
+    }
+
+    fn put(&mut self, key: (i64, i64), start: i64, data: Box<[u8]>) {
+        let stamp = self.stamp();
+        while self.held >= self.slots() {
+            let oldest = self
+                .extents
+                .iter()
+                .flat_map(|(k, e)| e.iter().enumerate().map(move |(i, x)| (*k, i, x.stamp)))
+                .min_by_key(|&(_, _, stamp)| stamp);
+            let Some((key, index, _)) = oldest else { break };
+            let extents = self.extents.get_mut(&key).unwrap();
+            extents.swap_remove(index);
+            self.held -= 1;
+            if extents.is_empty() {
+                self.extents.remove(&key);
+            }
+        }
+        self.extents
+            .entry(key)
+            .or_default()
+            .push(Extent { start, stamp, data });
+        self.held += 1;
+    }
+
+    fn done(&mut self, key: (i64, i64), pos: i64, len: i64) {
+        let stamp = self.stamp();
+        self.last.insert(key, (pos + len, stamp));
+        if self.last.len() > self.slots() * 8 {
+            if let Some(old) = self
+                .last
+                .iter()
+                .min_by_key(|(_, &(_, stamp))| stamp)
+                .map(|(k, _)| *k)
+            {
+                self.last.remove(&old);
+            }
+        }
+    }
 }
 
 impl Dbs {
-    /// The database, created when `create` (a writer attaching a new one).
     pub async fn find(
         &self,
         pool: &Pool,
@@ -175,9 +280,15 @@ impl Dbs {
             label: format!("pgdb://{volume}/{name}"),
             writer: Mutex::new(None),
             changes: Mutex::new(ChangeMap::new()),
+            readahead: Mutex::new(Readahead::default()),
         });
         let mut map = self.map.lock().unwrap();
-        Ok(Some(map.entry(key).or_insert(db).clone()))
+        let db = map.entry(key).or_insert(db).clone();
+        self.by_id
+            .lock()
+            .unwrap()
+            .insert(db.db_id, Arc::downgrade(&db));
+        Ok(Some(db))
     }
 }
 
@@ -187,8 +298,7 @@ impl Db {
         self.writer.lock().unwrap().as_ref().map(|(w, _)| w.clone())
     }
 
-    /// A handle on the writer, opening it (taking the database's write lock)
-    /// if this process has none.
+    /// A handle on the writer, opening it if this process has none.
     pub fn acquire_writer(
         self: &Arc<Self>,
         rt: &tokio::runtime::Handle,
@@ -205,7 +315,6 @@ impl Db {
         Ok(w)
     }
 
-    /// Joins the writer's handles if it is open (reads see its writes).
     pub fn join_writer(&self) -> Option<Arc<Writer>> {
         let mut slot = self.writer.lock().unwrap();
         slot.as_mut().map(|(w, n)| {
@@ -214,8 +323,7 @@ impl Db {
         })
     }
 
-    /// One handle on the writer closed; the last publishes what is left and
-    /// releases the database.
+    /// The last handle closes: publish and release the database.
     pub fn release_writer(&self) -> Result<()> {
         let mut slot = self.writer.lock().unwrap();
         let Some((w, n)) = slot.as_mut() else {
@@ -230,13 +338,12 @@ impl Db {
         w.finish() // under the slot lock: the next writer waits for this one
     }
 
-    /// Bring the change map up to `gen` (a reader opening it).
+    /// Bring the change map up to `gen`.
     async fn advance(&self, pool: &Pool, gen: i64, horizon: i64) -> Result<()> {
         let from = {
             let mut m = self.changes.lock().unwrap();
             if m.base < 0 || horizon > m.base {
-                // The first gen, or the base's versions may be reaped: start
-                // over (gen >= horizon: open_version checked).
+                // First gen, or the base was reaped: start over.
                 let at = gen.max(m.upto);
                 m.reset(at);
             }
@@ -287,8 +394,7 @@ impl Db {
         Ok(())
     }
 
-    /// Cache runs for a read of chunks [k0, k1] of `file_id` at `gen`:
-    /// (first chunk, end chunk, key gen). None if the map cannot key that gen.
+    /// (first chunk, end chunk, key gen) runs for a read, None if unkeyable.
     pub fn runs(&self, file_id: i64, k0: i64, k1: i64, gen: i64) -> Option<Vec<(i64, i64, i64)>> {
         self.changes.lock().unwrap().runs(file_id, k0, k1, gen)
     }
@@ -327,7 +433,7 @@ impl ChangeMap {
         self.segments = 0;
     }
 
-    /// Chunks [lo, hi) of `file` were written at `gen` (gens arrive in order).
+    /// Chunks [lo, hi) of `file` were written at `gen`.
     pub fn insert(&mut self, file: i64, lo: i64, hi: i64, gen: i64) {
         if lo >= hi {
             return;
@@ -379,7 +485,7 @@ impl ChangeMap {
         }
     }
 
-    /// Runs of chunks [k0, k1] with one key gen each, merged where equal.
+    /// The map's runs for [k0, k1], merged where key gens are equal.
     pub fn runs(&self, file: i64, k0: i64, k1: i64, gen: i64) -> Option<Vec<(i64, i64, i64)>> {
         if self.base < 0 || gen < self.base || gen > self.upto {
             return None;
@@ -445,11 +551,8 @@ pub async fn open_version(
     path: &str,
 ) -> Result<Option<Version>> {
     check_suffix(path)?;
-    // One round trip, with index scans on for the newest row of the path (the
-    // pool's sessions turn them off), so the lookup costs the same however
-    // many versions are kept. A multi-statement simple query is one implicit
-    // transaction: SET LOCAL ends with it, and an error leaves no state behind.
-    // Simple-query text: every value is an integer or one of SUFFIXES.
+    // One implicit transaction; simple-query text: every value is an integer
+    // or one of SUFFIXES.
     let gen_sql = gen.map_or("d.committed_gen".to_owned(), |g| g.to_string());
     let sql = format!(
         "SET LOCAL enable_indexscan = on; \
@@ -505,6 +608,51 @@ pub async fn open_version(
 /// version of each chunk at or below it, zeros where none is. Fails (with
 /// EXPIRED) unless the reap horizon is at most `check`: versions superseded
 /// above `check` may be gone.
+/// A read with readahead (see `Readahead`).
+pub async fn read_with_readahead(
+    db: &Db,
+    pool: &Pool,
+    file_id: i64,
+    gen: i64,
+    pos: i64,
+    buf: &mut [u8],
+) -> Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let key = (file_id, gen);
+    let plan = db
+        .readahead
+        .lock()
+        .unwrap()
+        .plan(key, pos, buf.len() as i64);
+    match plan {
+        Plan::Hit { skip, index } => {
+            let cache = db.readahead.lock().unwrap();
+            let e = &cache.extents[&key][index];
+            buf.copy_from_slice(&e.data[skip..skip + buf.len()]);
+            store::STATS
+                .db_readahead_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Plan::Fetch { len, widen } => {
+            let mut fetched = vec![0u8; len as usize];
+            read_versions(pool, db.db_id, file_id, gen, gen, pos, &mut fetched).await?;
+            buf.copy_from_slice(&fetched[..buf.len()]);
+            let mut cache = db.readahead.lock().unwrap();
+            if widen {
+                let extra = fetched.len() as u64 - buf.len() as u64;
+                cache.put(key, pos, fetched.into());
+                store::STATS
+                    .db_readahead_bytes
+                    .fetch_add(extra, Ordering::Relaxed);
+            }
+            cache.done(key, pos, buf.len() as i64);
+        }
+    }
+    Ok(())
+}
+
 pub async fn read_versions(
     pool: &Pool,
     db_id: i32,
@@ -676,7 +824,7 @@ struct Out {
     no: i32,
     data: Vec<u8>,
     cov: Option<Vec<(u32, u32)>>,
-    /// No row for this chunk in this gen yet: plain COPY, no upsert.
+    /// Nothing for this chunk in this gen yet: plain COPY, no upsert.
     fresh: bool,
 }
 
@@ -739,10 +887,8 @@ struct WState {
     unsent: usize,
     /// The batch `prune` last pruned up to.
     pruned: u64,
-    /// Chunks sent in this gen: writing one again needs an upsert.
     sent: std::collections::HashSet<(i64, i64)>,
-    /// Known content of recently sent chunks (file tails), so appending to a
-    /// partial chunk needs no read of it.
+    /// Recently sent chunks' content (file tails): appending needs no read.
     clean: HashMap<(i64, i64), Vec<u8>>,
     next_seq: u64,
 }
@@ -760,16 +906,14 @@ pub struct Writer {
     failed: Arc<Mutex<Option<String>>>,
     state: Mutex<WState>,
     last_reap: AtomicU64,
-    /// The attach whose main file this writer has open (its path token, -1
-    /// for none): that attach's read-only opens see the writer's files.
+    /// The token of the attach whose main file this writer has open.
     main: Mutex<Option<i64>>,
 }
 
 impl Writer {
     async fn open(rt: tokio::runtime::Handle, pool: Pool, db: Arc<Db>) -> Result<Arc<Writer>> {
         let client = pool.dedicated().await?;
-        // Point lookups on this connection; the pool's sessions turn index
-        // scans off for range reads.
+        // Point lookups: the pool's sessions scan chunks by range.
         client.batch_execute("SET enable_indexscan = on").await?;
         let locked: bool = client
             .query_typed_one(
@@ -793,7 +937,7 @@ impl Writer {
             .await?;
         let (epoch, committed, was_clean): (i64, i64, bool) = (row.get(0), row.get(1), row.get(2));
         if !was_clean {
-            // A writer died: drop what it wrote but never published.
+            // A dead writer's unpublished writes.
             client
                 .execute_typed(
                     "DELETE FROM pgvfs.dbchunks c USING pgvfs.dbfileids i \
@@ -860,8 +1004,7 @@ impl Writer {
         }))
     }
 
-    /// The database's main file opened for writing by the attach `token`:
-    /// one per process, as DuckDB allows one read-write attach of a file.
+    /// The attach `token`'s main file: one writer open per process.
     pub fn claim_main(&self, token: i64) -> Result<()> {
         let mut main = self.main.lock().unwrap();
         anyhow::ensure!(
@@ -877,9 +1020,7 @@ impl Writer {
         *self.main.lock().unwrap() = None;
     }
 
-    /// Whether a read-only open from the attach `token` (< 0: none) with
-    /// version `gen` (< 0: none) is the writer's own: a plain path, or its
-    /// attach. Anything else reads a published version.
+    /// The writer's own open (a plain path or its attach), not a published version.
     pub fn owns(&self, gen: i64, token: i64) -> bool {
         gen < 0 || (token >= 0 && *self.main.lock().unwrap() == Some(token))
     }
@@ -906,7 +1047,7 @@ impl Writer {
             .map_err(|_| anyhow!("{} writer stopped", self.db.label))?
     }
 
-    /// Forget staged chunks whose batch has committed.
+    /// Forget staged chunks whose batch committed.
     fn prune(&self, st: &mut WState) {
         let done = self.done.load(Ordering::Acquire);
         if done != st.pruned {
@@ -932,7 +1073,7 @@ impl Writer {
             .map(|f| f.file_id)
     }
 
-    /// Make sure `path` exists (empty if new); `overwrite` replaces it.
+    /// Create `path` if missing; `overwrite` replaces it.
     pub fn create(&self, path: &str, overwrite: bool) -> Result<()> {
         check_suffix(path)?;
         self.check()?;
@@ -999,7 +1140,7 @@ impl Writer {
             let a = pos.max(k * CHUNK);
             let b = end.min((k + 1) * CHUNK);
             if !matches!(st.staged.get(&key), Some(s) if s.seq == 0) {
-                // Sent (or never staged): stage a copy to write over.
+                // Sent or never staged: stage a copy to write over.
                 let mut s = Staged::new();
                 if let Some(old) = st.staged.get(&key) {
                     s.data.copy_from_slice(&old.data);
@@ -1029,7 +1170,7 @@ impl Writer {
         Ok(())
     }
 
-    /// Send unsent staged chunks: complete ones, or all with `partial`.
+    /// Send staged chunks: complete ones, or all with `partial`.
     fn flush(&self, st: &mut WState, partial: bool) -> Result<()> {
         let outs = take_outs(st, partial);
         if outs.is_empty() {
@@ -1045,7 +1186,7 @@ impl Writer {
         })
     }
 
-    /// Send everything staged and wait for it to commit.
+    /// Send everything staged and wait for the commit.
     fn drain(&self, st: &mut WState) -> Result<()> {
         self.flush(st, true)?;
         self.call(Msg::Barrier)?;
@@ -1086,9 +1227,7 @@ impl Writer {
             self.drain(st)?;
             all_staged = false;
         }
-        // Staged chunks are newer than anything a read may find: copy them
-        // now, and read the rest without the lock, so DuckDB's threads (an
-        // index build reading the table) read in parallel.
+        // Copy staged chunks under the lock, read the rest without it.
         let mut overlay = Vec::new();
         for k in k0..=k1 {
             if let Some(s) = st.staged.get(&(f.file_id, k)) {
@@ -1160,8 +1299,7 @@ impl Writer {
             return Ok(());
         }
         self.prune(st);
-        // Partial chunks are merged by the task before the publish; whole
-        // ones ride in the publishing statement.
+        // Partials are merged by the task; whole ones ride in the publish.
         let any_partial = st
             .staged
             .iter()
@@ -1225,8 +1363,7 @@ impl Writer {
         Ok(())
     }
 
-    /// The last handle closed: publish what is left, mark the database clean
-    /// and close the connection (releasing the lock).
+    /// Publish what is left, mark the database clean, close the connection.
     fn finish(&self) -> Result<()> {
         let result = self
             .check()
@@ -1236,8 +1373,7 @@ impl Writer {
         result.and(closed)
     }
 
-    /// Reap this database's superseded versions in the background, at most
-    /// once a minute.
+    /// Reap superseded versions in the background, at most once a minute.
     fn maybe_reap(&self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1319,7 +1455,7 @@ fn take_outs(st: &mut WState, partial: bool) -> Vec<Out> {
                 no: k.1 as i32,
                 data: s.data[..n].to_vec(),
                 cov: (!s.covers(n)).then(|| s.cov.clone()),
-                // A truncation in this gen tombstoned chunks past its end.
+                // A truncation tombstoned chunks past its end.
                 fresh: !st.sent.contains(&k)
                     && !st.truncs.iter().any(|&(f, first)| f == k.0 && k.1 >= first),
             }
@@ -1499,7 +1635,7 @@ impl Task<'_> {
         Ok(())
     }
 
-    /// Chunks with a row in this gen already: replace it.
+    /// Chunks that already have a row in this gen.
     async fn upsert(&self, gen: i64, chunks: &[Out]) -> Result<()> {
         let ids: Vec<i64> = chunks.iter().map(|c| c.file_id).collect();
         let nos: Vec<i32> = chunks.iter().map(|c| c.no).collect();
@@ -1528,9 +1664,7 @@ impl Task<'_> {
         Ok(())
     }
 
-    /// Chunks new to this gen: binary COPY (2-3x an upsert's rate), in a
-    /// transaction that holds the database row FOR SHARE, so a new writer's
-    /// epoch bump waits for it and later batches see the bump.
+    /// Chunks new to this gen: COPY under a FOR SHARE fence (see publish).
     async fn copy(&self, gen: i64, chunks: &[Out]) -> Result<()> {
         let result = async {
             let fence = self
@@ -1812,6 +1946,39 @@ pub async fn reap(pool: &Pool, db_id: i32, grace: f64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readahead_widens_only_a_continuation() {
+        let key = (1, 7);
+        let mut ra = Readahead::default();
+        let bytes = ra.bytes();
+        assert!(matches!(
+            ra.plan(key, 0, 100),
+            Plan::Fetch {
+                len: 100,
+                widen: false
+            }
+        ));
+        ra.done(key, 0, 100);
+        assert!(matches!(
+            ra.plan(key, 100, 100),
+            Plan::Fetch { len, widen: true } if len == 100 + bytes
+        ));
+        ra.put(key, 100, vec![7u8; (100 + bytes) as usize].into());
+        assert!(ra.held == 1);
+        ra.done(key, 100, 100);
+        assert!(matches!(
+            ra.plan(key, 150, 100),
+            Plan::Hit { skip: 50, index: 0 }
+        ));
+        assert!(matches!(
+            ra.plan(key, 100 + bytes + 5000, 100),
+            Plan::Fetch {
+                len: 100,
+                widen: false
+            }
+        ));
+    }
 
     /// The key gen of chunk `k` at `gen`, by brute force over the history.
     fn model(history: &[(i64, i64, i64, i64)], base: i64, k: i64, gen: i64) -> i64 {

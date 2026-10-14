@@ -342,7 +342,8 @@ sqllogic PATTERN="test/sql" JOBS="4":
 # readers, on a disposable PostgreSQL pinned to a fifth of the cores (readers on the rest).
 # READERS (default: the reader cores), ROWS (default 30M).
 
-# A pgdb:// database against the same database in a local file.
+# A pgdb:// database against the same database in a local file. BLOCK_SIZE creates it with
+# that block size (see Databases); PGVFS_DB_READAHEAD_KB works here too.
 bench-db *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
