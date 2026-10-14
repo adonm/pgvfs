@@ -37,6 +37,17 @@ def builds(releases: str | None, site: str) -> list[dict]:
     return found
 
 
+def changelog() -> None:
+    gen = os.path.join(DOCS, "generated")
+    os.makedirs(gen, exist_ok=True)
+    root = os.path.join(DOCS, "..")
+    with open(os.path.join(root, "CHANGELOG.md")) as src:
+        lines = src.read().splitlines()
+    if lines and lines[0].startswith("# "):
+        lines = lines[1:]
+    open(os.path.join(gen, "changelog.md"), "w").write("\n".join(lines).lstrip("\n") + "\n")
+
+
 def fragments(found: list[dict], history: list[dict]) -> None:
     gen = os.path.join(DOCS, "generated")
     os.makedirs(gen, exist_ok=True)
@@ -79,6 +90,7 @@ def main() -> None:
     history_path = os.path.join(args.releases or "", "bench", "history.jsonl")
     history = [json.loads(line) for line in open(history_path)] if os.path.exists(history_path) else []
     fragments(found, history)
+    changelog()
     book = os.path.join(DOCS, "book")
     subprocess.run(["mdbook", "build", DOCS, "--dest-dir", book], check=True)
     shutil.copytree(book, args.site, dirs_exist_ok=True)

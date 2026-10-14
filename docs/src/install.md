@@ -158,6 +158,8 @@ signed community binaries. Prefer `FROM community` for stable DuckDB.
 
 {{#include ../generated/builds.md}}
 
+Version history and release notes: [Releases](releases.md).
+
 ## Troubleshooting
 
 - **Extension not found:** check your DuckDB version and platform against

@@ -3,6 +3,7 @@
 [pgvfs](intro.md)
 
 - [Install](install.md)
+- [Releases](releases.md)
 - [Loading data](loading.md)
 - [Databases (pgdb://)](databases.md)
 - [Full-text search](search.md)
